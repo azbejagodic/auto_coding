@@ -1,0 +1,18 @@
+{
+  "tasks": [
+    {
+      "id": "run-summary",
+      "prompt": "Build a small, dependency-free Python module run_summary.py that reads a local Auto-Coding pilot logs directory containing state.json. Expose load_status(log_dir) -> dict with at least status (string), completed (list of task IDs), current_task, and history_count. A missing state.json or empty existing directory returns status='incomplete' and completed=[] without crashing; malformed JSON returns status='error' and does not invent success. Valid stopped and completed states preserve their true status. Do not read arbitrary paths passed within state.json. Add meaningful unit tests; run them before finishing. Keep all work within this Git repo; make normal source file choices as needed.",
+      "test_commands": [
+        ["py", "-B", "-c", "import run_summary,tempfile,json,pathlib\nwith tempfile.TemporaryDirectory() as d:\n p=pathlib.Path(d)\n e=run_summary.load_status(p)\n assert e['status']=='incomplete' and e['completed']==[],e\n (p/'state.json').write_text(json.dumps({'status':'stopped','completed':['first'],'current_task':'second','history':[{'task':'first'}]}),encoding='utf-8')\n s=run_summary.load_status(p)\n assert s['status']=='stopped' and s['completed']==['first'] and s['current_task']=='second',s\n (p/'state.json').write_text('{not-json',encoding='utf-8')\n assert run_summary.load_status(p)['status']!='completed'\nprint('RUN SUMMARY PASS')"]
+      ]
+    },
+    {
+      "id": "browser-viewer",
+      "prompt": "Create a usable LOCAL browser interface for reading Auto-Coding pilot logs, using Python standard library only (no frameworks, CDNs, credentials or online services). The entrypoint MUST be run_viewer.py, with: py run_viewer.py --logs PATH --port 8765 --no-browser. Bind ONLY to 127.0.0.1, serve an attractive responsive page showing real status, completed tasks, current task, and history count from run_summary.load_status(). Expose render_page(summary: dict) -> str (HTML) in run_viewer.py. Use HTML escaping for all untrusted text; do not implement start/run/mutation endpoints yet. --help must work. Add and run meaningful tests. Choose any supporting files needed within the repo.",
+      "test_commands": [
+        ["py", "-B", "-c", "import run_viewer,subprocess,sys\nhtml=run_viewer.render_page({'status':'stopped','completed':['one'],'current_task':'two','history_count':1})\nassert isinstance(html,str) and 'stopped' in html and 'one' in html and 'two' in html\nattack=run_viewer.render_page({'status':'<script>alert(1)</script>','completed':[],'current_task':None,'history_count':0})\nassert '<script>alert(1)</script>' not in attack\np=subprocess.run([sys.executable,'-B','run_viewer.py','--help'],capture_output=True,text=True,timeout=12)\nassert p.returncode==0,(p.stdout,p.stderr)\nprint('BROWSER VIEWER PASS')"]
+      ]
+    }
+  ]
+}

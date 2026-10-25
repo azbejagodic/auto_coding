@@ -1,0 +1,5 @@
+Build a tiny local project to demonstrate that the Auto-Coding backend works.
+Create an index.html with a simple counter: a heading, a number, an Increment button,
+and a Reset button. It should work by opening the HTML file in a browser, with no
+external dependencies. Also add a short README.txt explaining how to open it.
+Test it appropriately and report which files you created. Keep it simple.
