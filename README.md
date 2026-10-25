@@ -50,3 +50,34 @@ With this checkout's `src` directory on `PYTHONPATH`, run `python -m auto_coding
 Closing the window does not terminate the child: it continues in the background. This avoids killing Codex mid-change. The run PID and paths are retained in its logs so a reopened UI can monitor the child; if the child disappears, the controller reports that and leaves runner state untouched for inspection.
 
 When an existing run is reopened with `launching`/`running` metadata but no valid child PID, `job_status()` reports `active: null`, `uncertain: true`, and an actionable `error` rather than incorrectly reporting the run as idle. `reopen()` also returns a warning. Starting or resuming while that run is unresolved is blocked. Stopped metadata never reuses a historical PID as evidence of a live process.
+
+## Desktop bridge API (Slice 2B-1)
+
+The native window now connects its existing `Bridge` to `DesktopController`.
+The dashboard remains the log viewer; this slice supplies the selection and
+launch API for subsequent UI controls. Opening without `--logs` shows a ready
+state. Existing `--logs` runs, including legacy runs without `desktop-run.json`,
+remain available for inspection and confined evidence reads.
+
+The JS API provides `select_repo(path?)`, `select_plan(path?)`, `open_run(path?)`,
+`selected_paths()`, `job_status()`, `start(attempts=3)`, `resume(attempts=3)`,
+`snapshot()`, and `evidence(relative_name)`. Omitting a selection path opens the
+native folder or TXT/MD/JSON file picker. Cancellation preserves selections;
+selection never launches a process. START and RESUME always require a separate
+native confirmation showing the selected paths and attempts, and return the
+controller's launch result. Without a dialog boundary they fail closed.
+
+`snapshot()` preserves the viewer fields and adds `controller`, containing
+selected paths, process status, validation errors, and `resume_ready`.
+Resume readiness requires existing paths, a matching original plan hash and
+repository in a stopped state, and no active or uncertain job. The controller
+still performs its launch-time checks. Opening a different run clears previous
+repository/plan selections; legacy runs need their original paths explicitly
+selected before resume can be considered. Invalid run selection preserves the
+previous run. Selection changes are blocked while a job is active or uncertain
+so its tracking metadata continues to describe the original job.
+
+Headless callers can inject `dialogs`, `controller`, and `controller_factory`
+into `Bridge`. `NativeDialogs` is bound only after the native window is created;
+it supports pywebview's `FileDialog` enum and older dialog constants. Importing
+the module or requesting `--help` does not import pywebview.
