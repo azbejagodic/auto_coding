@@ -15,6 +15,23 @@ This release is the existing **opt-in, local-only** simple runner with a targete
 
 ## Windows installation and resume
 
+## Durable event timeline
+
+The coordinator appends one UTF-8 JSON object per line to `events.jsonl` in the
+external `--logs` directory. Records use schema version 1 and contain `run_id`,
+monotonic per-run `seq`, `timestamp_utc`, `actor`, `event`, `outcome`, and optional
+`task_id`, `attempt`, `evidence`, and nonsecret `metadata`. The adjacent
+`run-manifest.json` captures the plan SHA256, ordered task IDs, initial Git HEAD,
+start time, and target path. On resume, the same run ID and existing records are
+retained. Each torn last line is preserved in a unique `events.incomplete-NNNN`
+sidecar; earlier complete records are retained during atomic recovery. A desktop reader can parse `events.jsonl` directly and
+follow evidence filenames relative to the log directory without launching Codex.
+Structured timeline metadata omits test command arguments; raw test output and
+other diagnostic evidence files retain their original contents and are not
+sanitized. If the log storage itself cannot be written, the runner fails closed
+and can only report the failure on stderr; it cannot guarantee a durable stopped
+event on an unavailable storage device.
+
 1. Extract the ZIP into `Downloads` (resulting folder: `auto_coding_simple_backend_v2_1`).
 2. Back up the existing pilot `Desktop/AutoCoding-Simple-Pilot/src/auto_coding/simple_run.py`, then copy `src/auto_coding/simple_run.py` from the extracted package over it.
 3. Run the tests from the extracted folder, with its `src` directory on `PYTHONPATH`.

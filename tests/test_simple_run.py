@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from auto_coding.simple_run import load_tasks, run, PilotError
+from auto_coding.event_log import EventLog
 
 
 class SimpleRunnerTests(unittest.TestCase):
@@ -39,6 +40,11 @@ class SimpleRunnerTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[1][0][calls[1][0].index('--sandbox') + 1], 'read-only')
         self.assertTrue((self.repo / 'index.html').exists())
+        events = [json.loads(line) for line in (self.logs / 'events.jsonl').read_text(encoding='utf-8').splitlines()]
+        self.assertEqual([event['seq'] for event in events], list(range(1, len(events) + 1)))
+        self.assertEqual(events[-1]['event'], 'run_completed')
+        self.assertEqual(json.loads((self.logs / 'run-manifest.json').read_text())['run_id'], events[0]['run_id'])
+        self.assertFalse((self.repo / 'events.jsonl').exists())
 
     def test_failed_approved_test_then_feedback_and_review(self):
         self.plan = self.root / 'task.json'
@@ -60,6 +66,12 @@ class SimpleRunnerTests(unittest.TestCase):
         self.assertEqual(run(self.plan, self.repo, self.logs, create_repo=True, execute=fake), 0)
         self.assertEqual(len([h for h in json.loads((self.logs / 'state.json').read_text())['history'] if h['task'] == 'one']), 2)
         self.assertTrue(any('AssertionError' in p for a, p in calls if p))
+        events = [json.loads(line) for line in (self.logs / 'events.jsonl').read_text().splitlines()]
+        names = [event['event'] for event in events]
+        self.assertLess(names.index('test_finished'), names.index('correction_requested'))
+        self.assertIn('task_completed', names)
+        failed_test = next(event for event in events if event['event'] == 'test_finished' and event['outcome'] == 'failed')
+        self.assertEqual(failed_test['evidence']['output'], 'one-01-test-1.txt')
 
     def test_rejected_review_returns_feedback_to_coder(self):
         reviews = 0
@@ -79,6 +91,10 @@ class SimpleRunnerTests(unittest.TestCase):
         self.assertEqual(run(self.plan, self.repo, self.logs, create_repo=True, execute=fake), 0)
         self.assertEqual(reviews, 2)
         self.assertIn('No reset button', prompts[-1])
+        events = [json.loads(line) for line in (self.logs / 'events.jsonl').read_text().splitlines()]
+        review_events = [event for event in events if event['event'] == 'review_finished']
+        self.assertEqual([event['outcome'] for event in review_events], ['rejected', 'approved'])
+        self.assertTrue(any(event['event'] == 'correction_requested' and event.get('evidence', {}).get('verdict') == 'task-1-01-b-verdict.json' for event in events))
 
     def test_stop_can_resume_same_repo_without_new_branch(self):
         def fail(argv, cwd, timeout, *, prompt=None):
@@ -95,6 +111,15 @@ class SimpleRunnerTests(unittest.TestCase):
                 out.write_text('Written')
             return 0, 'ok', False
         self.assertEqual(run(self.plan, self.repo, self.logs, resume=True, execute=success), 0)
+        timeline = self.logs / 'events.jsonl'
+        events = [json.loads(line) for line in timeline.read_text(encoding='utf-8').splitlines()]
+        self.assertEqual([event['seq'] for event in events], list(range(1, len(events) + 1)))
+        self.assertEqual(len({event['run_id'] for event in events}), 1)
+        self.assertEqual(json.loads((self.logs / 'run-manifest.json').read_text())['run_id'], events[0]['run_id'])
+        self.assertIn('stopped', [event['event'] for event in events])
+        stopped = next(event for event in events if event['event'] == 'stopped')
+        self.assertEqual(stopped['metadata']['reason'], 'Codex A process failure')
+        self.assertIn('resume_started', [event['event'] for event in events])
 
     def test_existing_run_refuses_dirty_repo(self):
         self.repo.mkdir()
@@ -102,6 +127,91 @@ class SimpleRunnerTests(unittest.TestCase):
         (self.repo / 'surprise.txt').write_text('existing change')
         with self.assertRaises(PilotError):
             run(self.plan, self.repo, self.logs, execute=lambda *a, **k: (1, '', False))
+        events = [json.loads(line) for line in (self.logs / 'events.jsonl').read_text().splitlines()]
+        self.assertEqual(events[-1]['event'], 'stopped')
+        self.assertEqual(events[-1]['metadata']['reason'], 'dirty worktree preflight')
+
+    def test_logs_inside_target_repo_are_rejected_before_creation(self):
+        self.repo.mkdir()
+        subprocess.run(['git', 'init'], cwd=self.repo, stdout=subprocess.PIPE, check=True)
+        nested_logs = self.repo / 'logs'
+        with self.assertRaises(PilotError):
+            run(self.plan, self.repo, nested_logs, execute=lambda *a, **k: (1, '', False))
+        self.assertFalse(nested_logs.exists())
+
+    def test_secret_test_argv_is_absent_from_structured_logs_and_manifest(self):
+        secret = 'secret123'
+        self.plan = self.root / 'task.json'
+        self.plan.write_text(json.dumps({'tasks': [{'id': 'one', 'prompt': 'Build',
+            'test_commands': [['python', 'check.py', '--token=' + secret]]}]}))
+        def fake(argv, cwd, timeout, *, prompt=None):
+            if argv[:2] == ['python', 'check.py']:
+                return 0, 'ok', False
+            out = Path(argv[argv.index('--output-last-message') + 1])
+            if '--output-schema' in argv:
+                out.write_text(json.dumps({'decision': 'APPROVED', 'issues': [], 'summary': 'OK'}))
+            else:
+                (cwd / 'file.txt').write_text('ok')
+            return 0, 'ok', False
+        self.assertEqual(run(self.plan, self.repo, self.logs, create_repo=True, execute=fake), 0)
+        for filename in ('events.jsonl', 'run-manifest.json'):
+            self.assertNotIn(secret, (self.logs / filename).read_text(encoding='utf-8'))
+
+    def test_manifest_creation_failure_never_publishes_running_state_and_retry_succeeds(self):
+        import auto_coding.simple_run as mod
+        original = mod.save_json
+        failed = {'once': False}
+        def flaky(path, value):
+            if path.name == 'run-manifest.json' and not failed['once']:
+                failed['once'] = True
+                raise OSError('simulated manifest storage failure')
+            return original(path, value)
+        with patch.object(mod, 'save_json', side_effect=flaky):
+            with self.assertRaises(OSError):
+                run(self.plan, self.repo, self.logs, create_repo=True, execute=lambda *a, **k: (1, '', False))
+        state_path = self.logs / 'state.json'
+        self.assertFalse(state_path.exists())
+        events = [json.loads(line) for line in (self.logs / 'events.jsonl').read_text().splitlines()]
+        self.assertEqual(events[-1]['event'], 'stopped')
+        self.assertEqual(events[-1]['outcome'], 'failed')
+        def success(argv, cwd, timeout, *, prompt=None):
+            out = Path(argv[argv.index('--output-last-message') + 1])
+            if '--output-schema' in argv:
+                out.write_text(json.dumps({'decision':'APPROVED','issues':[],'summary':'OK'}))
+            else:
+                (cwd/'hello.txt').write_text('ok')
+            return 0, 'ok', False
+        self.assertEqual(run(self.plan, self.repo, self.logs, create_repo=True, execute=success), 0)
+
+    def test_run_started_write_failure_is_retryable_without_running_state(self):
+        import auto_coding.event_log as event_mod
+        original = event_mod.EventLog.emit
+        failed = {'once': False}
+        def fail_once(log, actor, event, outcome, **kwargs):
+            if event == 'run_started' and not failed['once']:
+                failed['once'] = True
+                # Simulate a durable append followed by a caller-visible failure.
+                original(log, actor, event, outcome, **kwargs)
+                raise event_mod.EventLogError('simulated post-write interruption')
+            return original(log, actor, event, outcome, **kwargs)
+        with patch.object(event_mod.EventLog, 'emit', fail_once):
+            with self.assertRaises(event_mod.EventLogError):
+                run(self.plan, self.repo, self.logs, create_repo=True,
+                    execute=lambda *a, **k: (1, '', False))
+        self.assertFalse((self.logs / 'state.json').exists())
+        first = json.loads((self.logs / 'events.jsonl').read_text().splitlines()[0])
+        self.assertEqual(first['event'], 'run_started')
+        def success(argv, cwd, timeout, *, prompt=None):
+            out = Path(argv[argv.index('--output-last-message') + 1])
+            if '--output-schema' in argv:
+                out.write_text(json.dumps({'decision':'APPROVED','issues':[],'summary':'OK'}))
+            else:
+                (cwd/'hello.txt').write_text('ok')
+            return 0, 'ok', False
+        self.assertEqual(run(self.plan, self.repo, self.logs, create_repo=True, execute=success), 0)
+        records = [json.loads(line) for line in (self.logs/'events.jsonl').read_text().splitlines()]
+        self.assertEqual(len({event['run_id'] for event in records}), 1)
+        self.assertEqual([event['seq'] for event in records], list(range(1, len(records)+1)))
 
 if __name__ == '__main__':
     unittest.main()
@@ -162,6 +272,7 @@ class CheckpointAndRecoveryTests(unittest.TestCase):
         self.assertEqual([role for role,p in seen], ['a','b','a','a'])
         self.assertEqual(state['status'], 'stopped')
         self.assertEqual(len(subprocess.check_output(['git','log','--format=%s'],cwd=self.repo,text=True).splitlines()),1)
+
 
     def test_resume_after_stopped_second_task_keeps_first_commit(self):
         calls = {'second':0}
@@ -280,3 +391,213 @@ class CheckpointAndRecoveryTests(unittest.TestCase):
         self.assertEqual(state['completed'],['first'])
         self.assertEqual(len(seen),2)
         self.assertEqual(len(subprocess.check_output(['git','log','--format=%s'],cwd=self.repo,text=True).splitlines()),1)
+        timeline = [json.loads(line) for line in (self.logs/'events.jsonl').read_text().splitlines()]
+        reconciled = [e for e in timeline if e['event'] in {'checkpoint_recovered','checkpoint_committed'}]
+        self.assertEqual([e['event'] for e in reconciled], ['checkpoint_recovered','checkpoint_committed'])
+        self.assertEqual(reconciled[-1]['metadata']['commit'], state['history'][0]['commit'])
+
+    def test_normal_commit_rejects_last_second_unapproved_bytes(self):
+        """Even a successful Git commit cannot bypass the approved diff check."""
+        import auto_coding.simple_run as mod
+        fake, _ = self.make_executor()
+        only = self.root / 'only.json'
+        only.write_text(json.dumps({'tasks': [{'id': 'first', 'prompt': 'Make first file'}]}))
+        original = mod.local_commit
+        def changed_commit(repo, ident):
+            (repo / 'one.txt').write_text('tampered after review')
+            subprocess.run(['git', 'add', '-A'], cwd=repo, check=True)
+            return original(repo, ident)
+        with patch.object(mod, 'local_commit', side_effect=changed_commit):
+            self.assertEqual(run(only, self.repo, self.logs, create_repo=True, execute=fake), 1)
+        state = json.loads((self.logs / 'state.json').read_text())
+        self.assertEqual(state['status'], 'checkpointing')
+        self.assertEqual(state['completed'], [])
+        events = [json.loads(line) for line in (self.logs/'events.jsonl').read_text().splitlines()]
+        self.assertFalse(any(e['event'] == 'checkpoint_committed' for e in events))
+        self.assertTrue(any(e['event'] == 'stopped' for e in events))
+
+    def test_patch_hash_preserves_trailing_whitespace(self):
+        """Do not use .strip() on patches: it can erase a last-line space."""
+        import auto_coding.simple_run as mod
+        self.repo.mkdir()
+        subprocess.run(['git', 'init'], cwd=self.repo, stdout=subprocess.PIPE, check=True)
+        (self.repo / 'one.txt').write_text('some text\n')
+        subprocess.run(['git', 'add', '-A'], cwd=self.repo, check=True)
+        first = mod.git_patch(self.repo, ['diff', '--cached', '--binary', '--no-ext-diff'])
+        (self.repo / 'one.txt').write_text('some text \n')
+        subprocess.run(['git', 'add', '-A'], cwd=self.repo, check=True)
+        second = mod.git_patch(self.repo, ['diff', '--cached', '--binary', '--no-ext-diff'])
+        self.assertNotEqual(first, second)
+
+    def test_resume_rejects_same_subject_with_unapproved_content(self):
+        """A forged local checkpoint must never be certified as Codex B approved."""
+        import auto_coding.simple_run as mod
+        fake, _ = self.make_executor()
+        only = self.root / 'only.json'
+        only.write_text(json.dumps({'tasks': [{'id': 'first', 'prompt': 'Make first file'}]}))
+        with patch.object(mod, 'local_commit', side_effect=mod.PilotError('before commit')):
+            self.assertEqual(run(only, self.repo, self.logs, create_repo=True, execute=fake), 1)
+        original_state = json.loads((self.logs / 'state.json').read_text())
+        self.assertEqual(original_state['status'], 'checkpointing')
+        self.assertIsNone(original_state['pending_checkpoint']['base_head'])
+        (self.repo / 'one.txt').write_text('unapproved bytes')
+        subprocess.run(['git', 'add', '-A'], cwd=self.repo, check=True)
+        subprocess.run(['git', '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+                        'commit', '--no-gpg-sign', '-m', 'auto-coding: first'],
+                       cwd=self.repo, stdout=subprocess.PIPE, check=True)
+        with self.assertRaisesRegex(PilotError, 'does not match the approved parent and diff'):
+            run(only, self.repo, self.logs, resume=True, execute=fake)
+        state = json.loads((self.logs / 'state.json').read_text())
+        self.assertEqual(state['completed'], [])
+        self.assertIsNotNone(state['pending_checkpoint'])
+        events = [json.loads(line) for line in (self.logs/'events.jsonl').read_text().splitlines()]
+        self.assertEqual(events[-1]['event'], 'stopped')
+        self.assertFalse(any(e['event'] == 'checkpoint_committed' for e in events))
+
+    def test_resume_rejects_matching_diff_on_unapproved_parent(self):
+        """A task checkpoint must extend the exact reviewed base HEAD."""
+        import auto_coding.simple_run as mod
+        self.repo.mkdir()
+        subprocess.run(['git', 'init'], cwd=self.repo, stdout=subprocess.PIPE, check=True)
+        (self.repo / 'base.txt').write_text('base')
+        subprocess.run(['git', 'add', '-A'], cwd=self.repo, check=True)
+        subprocess.run(['git', '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+                        'commit', '--no-gpg-sign', '-m', 'base'],
+                       cwd=self.repo, stdout=subprocess.PIPE, check=True)
+        base = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=self.repo, text=True).strip()
+        only = self.root / 'only.json'
+        only.write_text(json.dumps({'tasks': [{'id': 'first', 'prompt': 'Make first file'}]}))
+        fake, _ = self.make_executor()
+        with patch.object(mod, 'local_commit', side_effect=mod.PilotError('before commit')):
+            self.assertEqual(run(only, self.repo, self.logs, execute=fake), 1)
+        state = json.loads((self.logs / 'state.json').read_text())
+        self.assertEqual(state['pending_checkpoint']['base_head'], base)
+        # Reparent to a new unreviewed commit; keep task diff and subject identical.
+        subprocess.run(['git', 'reset', '--mixed', base], cwd=self.repo,
+                       stdout=subprocess.PIPE, check=True)
+        (self.repo / 'one.txt').unlink()
+        (self.repo / 'extra.txt').write_text('unreviewed base change')
+        subprocess.run(['git', 'add', '-A'], cwd=self.repo, check=True)
+        subprocess.run(['git', '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+                        'commit', '--no-gpg-sign', '-m', 'unreviewed'],
+                       cwd=self.repo, stdout=subprocess.PIPE, check=True)
+        (self.repo / 'one.txt').write_text('first')
+        subprocess.run(['git', 'add', '-A'], cwd=self.repo, check=True)
+        subprocess.run(['git', '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+                        'commit', '--no-gpg-sign', '-m', 'auto-coding: first'],
+                       cwd=self.repo, stdout=subprocess.PIPE, check=True)
+        with self.assertRaisesRegex(PilotError, 'does not match the approved parent and diff'):
+            run(only, self.repo, self.logs, resume=True, execute=fake)
+        state = json.loads((self.logs / 'state.json').read_text())
+        self.assertEqual(state['completed'], [])
+        self.assertEqual(state['pending_checkpoint']['base_head'], base)
+        self.assertEqual([e['event'] for e in [json.loads(x) for x in (self.logs/'events.jsonl').read_text().splitlines()][-2:]], ['resume_started', 'stopped'])
+
+    def test_resume_commits_pending_approved_diff_once_and_records_sha(self):
+        import auto_coding.simple_run as mod
+        fake, _ = self.make_executor()
+        only = self.root/'only.json'
+        only.write_text(json.dumps({'tasks':[{'id':'first','prompt':'Make first file'}]}))
+        original = mod.local_commit
+        with patch.object(mod, 'local_commit', side_effect=mod.PilotError('before commit')):
+            self.assertEqual(run(only, self.repo, self.logs, create_repo=True, execute=fake), 1)
+        self.assertEqual(run(only, self.repo, self.logs, resume=True, execute=fake), 0)
+        state = json.loads((self.logs/'state.json').read_text())
+        self.assertEqual(len(subprocess.check_output(['git','log','--format=%H'],cwd=self.repo,text=True).splitlines()), 1)
+        timeline = [json.loads(line) for line in (self.logs/'events.jsonl').read_text().splitlines()]
+        events = [e for e in timeline if e['event'] in {'checkpoint_started','checkpoint_committed'}]
+        self.assertEqual([e['event'] for e in events], ['checkpoint_started','checkpoint_started','checkpoint_committed'])
+        self.assertEqual(events[-1]['metadata']['commit'], state['history'][0]['commit'])
+        self.assertLess(events[-2]['seq'], events[-1]['seq'])
+
+
+class EventLogRecoveryTests(unittest.TestCase):
+    def test_torn_final_line_is_preserved_and_sequence_continues(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'events.jsonl'
+            log = EventLog(path, 'run-1')
+            log.emit('controller', 'run_started', 'started')
+            with path.open('ab') as stream:
+                stream.write(b'{"partial":')
+            resumed = EventLog(path, 'run-1')
+            resumed.emit('controller', 'resume_started', 'started')
+            records = [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()]
+            self.assertEqual([record['seq'] for record in records], [1, 2])
+            self.assertEqual((Path(directory) / 'events.incomplete-0001').read_bytes(), b'{"partial":')
+            with path.open('ab') as stream:
+                stream.write(b'{"partial-again":')
+            (Path(directory) / 'events.jsonl.recovery-tmp').write_text('stale')
+            EventLog(path, 'run-1')
+            self.assertEqual((Path(directory) / 'events.incomplete-0002').read_bytes(), b'{"partial-again":')
+
+    def test_legacy_resume_uses_existing_timeline_id_before_creating_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, logs = root / 'repo', root / 'logs'
+            plan = root / 'plan.json'
+            plan.write_text(json.dumps({'tasks': [{'id': 'one', 'prompt': 'Build'}]}))
+            def fail(argv, cwd, timeout, *, prompt=None):
+                return 1, 'failure', False
+            self.assertEqual(run(plan, repo, logs, create_repo=True, execute=fail), 1)
+            timeline = logs / 'events.jsonl'
+            records = [json.loads(line) for line in timeline.read_text().splitlines()]
+            expected_id = records[0]['run_id']
+            # Simulate a legacy stopped state with no manifest and a different
+            # state run_id. Existing event identity must win without reset.
+            (logs / 'run-manifest.json').unlink()
+            state_path = logs / 'state.json'
+            state = json.loads(state_path.read_text())
+            state['run_id'] = 'legacy-state-id'
+            state_path.write_text(json.dumps(state))
+            self.assertEqual(run(plan, repo, logs, resume=True, execute=fail), 1)
+            manifest = json.loads((logs / 'run-manifest.json').read_text())
+            self.assertEqual(manifest['run_id'], expected_id)
+            records = [json.loads(line) for line in timeline.read_text().splitlines()]
+            self.assertTrue(all(record['run_id'] == expected_id for record in records))
+            self.assertEqual([record['seq'] for record in records], list(range(1, len(records) + 1)))
+
+    def test_manifest_mismatch_does_not_rewrite_manifest_or_timeline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = root/'plan.txt'; plan.write_text('Build')
+            repo, logs = root/'repo', root/'logs'
+            self.assertEqual(run(plan, repo, logs, create_repo=True, execute=lambda *a, **k: (1, 'x', False)), 1)
+            manifest_path, timeline_path = logs/'run-manifest.json', logs/'events.jsonl'
+            manifest_before = manifest_path.read_bytes()
+            timeline_before = timeline_path.read_bytes()
+            manifest = json.loads(manifest_before); manifest['task_ids'] = ['different']
+            manifest_path.write_text(json.dumps(manifest))
+            mismatch = manifest_path.read_bytes()
+            with self.assertRaises(PilotError):
+                run(plan, repo, logs, resume=True, execute=lambda *a, **k: (1, 'x', False))
+            self.assertEqual(manifest_path.read_bytes(), mismatch)
+            self.assertEqual(timeline_path.read_bytes(), timeline_before)
+
+    def test_resume_safety_failure_is_recorded_as_stopped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = root / 'plan.json'; plan.write_text(json.dumps({'tasks': [
+                {'id': 'first', 'prompt': 'First'}, {'id': 'second', 'prompt': 'Second'}]}))
+            repo = root / 'repo'; logs = root / 'logs'
+            calls = {'a': 0}
+            def fails(argv, cwd, timeout, *, prompt=None):
+                out = Path(argv[argv.index('--output-last-message') + 1])
+                if '--output-schema' in argv:
+                    out.write_text(json.dumps({'decision':'APPROVED','issues':[],'summary':'OK'}))
+                    return 0, 'ok', False
+                calls['a'] += 1
+                if calls['a'] == 1:
+                    (cwd / 'first.txt').write_text('first')
+                    out.write_text('ok')
+                    return 0, 'ok', False
+                return 1, 'failed', False
+            self.assertEqual(run(plan, repo, logs, create_repo=True, execute=fails), 1)
+            state_path = logs / 'state.json'
+            state = json.loads(state_path.read_text())
+            state['pending_checkpoint'] = {'task': 'broken'}
+            state_path.write_text(json.dumps(state))
+            with self.assertRaises(PilotError):
+                run(plan, repo, logs, resume=True, execute=fails)
+            events = [json.loads(line) for line in (logs / 'events.jsonl').read_text().splitlines()]
+            self.assertEqual(events[-1]['event'], 'stopped')
+            self.assertEqual(events[-1]['metadata']['reason'], 'resume reconciliation failed')
