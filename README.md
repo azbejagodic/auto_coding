@@ -38,3 +38,7 @@ event on an unavailable storage device.
 4. Resume the prior viewer run using the **same exact V2** `first_ui_slice.json`, target `AutoCoding-Viewer-Test`, and logs `AutoCoding-Viewer-Logs`, with `--resume --attempts 3` and **without** `--create-repo`.
 
 The original stopped attempt already committed `run-summary`. It must not be recreated or reset.
+
+## Read-only desktop log viewer (Slice 1)
+
+With this checkout's `src` directory on `PYTHONPATH`, run `python -m auto_coding.desktop_app --help` for options. Install the optional native window dependency on Windows with `python -m pip install "pywebview[winforms]"`; Windows also needs the Microsoft Edge WebView2 Runtime. Then open an existing external run with `python -m auto_coding.desktop_app --logs C:\path\to\run-logs`. Without `--logs`, the dashboard shows that no run directory is selected. The viewer only reads the selected logs, refreshes periodically, and never starts or controls Codex. Raw evidence is read only after selecting a listed evidence file and may contain sensitive data.
