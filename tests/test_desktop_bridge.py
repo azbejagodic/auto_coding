@@ -24,6 +24,9 @@ class FakeController:
         return {key: str(getattr(self, key)) if getattr(self, key) else None
                 for key in ("repo", "plan", "logs")}
 
+    def preflight(self):
+        return {"branch": "feature/test", "clean": True, "errors": []}
+
     def select_repo(self, path):
         self.repo = Path(path)
         return {"ok": True, "path": path, "error": None}
@@ -158,7 +161,8 @@ class DesktopBridgeTests(unittest.TestCase):
         self.assertFalse(self.bridge.job_status()["resume_ready"])
 
     @patch("auto_coding.desktop_control.Popen")
-    def test_reopen_desktop_metadata_recovers_original_paths_without_launch(self, popen):
+    @patch.object(DesktopController, "preflight", return_value={"branch": "feature/test", "clean": True, "errors": []})
+    def test_reopen_desktop_metadata_recovers_original_paths_without_launch(self, preflight, popen):
         (self.logs / "desktop-run.json").write_text(json.dumps({
             "repo": str(self.root), "plan": str(self.plan), "status": "stopped"}))
         state = {"status": "stopped", "repo": str(self.root),
@@ -176,6 +180,44 @@ class DesktopBridgeTests(unittest.TestCase):
         self.assertIsNone(bridge.job_status()["active"])
         self.assertFalse(bridge.job_status()["resume_ready"])
         popen.assert_not_called()
+
+    def test_confirmation_names_branch_paths_and_local_only_policy(self):
+        self.bridge.select_repo(str(self.root))
+        self.bridge.select_plan(str(self.plan))
+        self.bridge.start(5)
+        text = self.dialogs.confirm.call_args.args[0]
+        for value in (str(self.root), str(self.plan), "feature/test", "Attempts: 5",
+                      "No automatic push", "authentication is required", "leaves the runner alive"):
+            self.assertIn(value, text)
+
+    def test_changed_branch_after_confirmation_requires_new_confirmation(self):
+        self.controller.preflight = Mock(side_effect=[{"branch":"feature/one"}, {"branch":"feature/two"}])
+        self.assertIn("branch changed", self.bridge.start()["error"])
+        self.controller.start.assert_not_called()
+
+    def test_concurrent_launch_is_rejected_while_confirmation_is_open(self):
+        import threading
+        entered, release = threading.Event(), threading.Event()
+
+        def confirm(message):
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError("test confirmation timed out")
+            return False
+
+        self.dialogs.confirm.side_effect = confirm
+        worker = threading.Thread(target=self.bridge.start)
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(3))
+            self.assertIn("already in progress", self.bridge.start()["error"])
+            self.assertIn("already in progress", self.bridge.resume()["error"])
+        finally:
+            release.set()
+            worker.join(3)
+        self.assertFalse(worker.is_alive())
+        self.controller.start.assert_not_called()
+        self.assertEqual(self.dialogs.confirm.call_count, 1)
 
     def test_resume_readiness_requires_matching_stopped_state_and_live_paths(self):
         self.bridge.open_run(str(self.logs))
@@ -199,6 +241,22 @@ class DesktopBridgeTests(unittest.TestCase):
         bridge = Bridge(self.root / "missing")
         self.assertFalse(bridge.snapshot()["exists"])
         self.assertIn("selection failed", bridge.job_status()["selection_error"])
+
+    @patch("auto_coding.desktop_control.Popen")
+    def test_corrupt_desktop_metadata_is_inspectable_but_cannot_launch(self, popen):
+        (self.logs / "desktop-run.json").write_text("{torn")
+        (self.logs / "state.json").write_text('{"status":"stopped"}')
+        bridge = Bridge(self.logs, dialogs=self.dialogs)
+        status = bridge.job_status()
+        self.assertIsNone(status["active"])
+        self.assertTrue(status["uncertain"])
+        self.assertIn("corrupt", status["error"])
+        self.assertFalse(status["resume_ready"])
+        self.assertEqual(bridge.evidence("desktop-run.json")["text"], "{torn")
+        self.assertEqual(bridge.snapshot()["state"]["status"], "stopped")
+        self.assertFalse(bridge.start()["ok"])
+        self.assertFalse(bridge.resume()["ok"])
+        popen.assert_not_called()
 
     def test_native_enum_and_legacy_constants(self):
         for module in (SimpleNamespace(FileDialog=SimpleNamespace(OPEN=10, FOLDER=20)),

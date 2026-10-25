@@ -46,6 +46,11 @@ class DesktopControlTests(unittest.TestCase):
                                    "--repo", str(self.repo), "--logs", str(self.controller.logs),
                                    "--attempts", "3", str(self.plan)])
         self.assertFalse(kwargs["shell"])
+        self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(kwargs["stderr"], subprocess.STDOUT)
+        self.assertEqual(Path(kwargs["stdout"].name), self.controller.logs / "runner-output.txt")
+        if __import__("os").name == "nt":
+            self.assertEqual(kwargs["creationflags"], subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)
         self.assertEqual(kwargs["cwd"], src)
         self.assertIn(src, kwargs["env"]["PYTHONPATH"])
         self.assertFalse(self.controller.logs.is_relative_to(self.repo))
@@ -66,6 +71,53 @@ class DesktopControlTests(unittest.TestCase):
         self.assertIn("main/master", self.controller.start()["error"])
         self.assertFalse(popen.called)
 
+    @patch("auto_coding.desktop_control.Popen")
+    def test_detached_head_is_blocked_and_preflight_is_read_only(self, popen):
+        subprocess.run(["git", "checkout", "--detach"], cwd=self.repo, check=True, capture_output=True)
+        check = self.controller.preflight()
+        self.assertFalse(check["branch"])
+        self.assertIn("detached HEAD", " ".join(check["errors"]))
+        self.assertFalse(self.controller.start()["ok"])
+        self.assertFalse(self.runs.exists())
+        popen.assert_not_called()
+
+    @patch("auto_coding.desktop_control.Popen")
+    def test_resume_rejects_different_exact_plan_even_if_hash_matches(self, popen):
+        popen.side_effect = lambda argv, **kw: FakeProcess(argv, **kw)
+        self.assertTrue(self.controller.start()["ok"])
+        logs = self.controller.logs
+        self.controller.process.code = 1
+        self.controller.poll()
+        import hashlib
+        (logs / "state.json").write_text(json.dumps({"status":"stopped", "repo":str(self.repo),
+            "plan_sha256":hashlib.sha256(self.plan.read_bytes()).hexdigest()}))
+        copy = self.root / "same-content.txt"
+        copy.write_bytes(self.plan.read_bytes())
+        self.controller.select_plan(copy)
+        self.assertIn("original exact", self.controller.resume()["error"])
+        self.assertEqual(popen.call_count, 1)
+        self.assertEqual(json.loads((logs / "desktop-run.json").read_text())["plan"], str(self.plan))
+
+    @unittest.skipUnless(__import__("os").name == "nt", "Windows PID query")
+    def test_windows_pid_probe_queries_without_os_kill(self):
+        import ctypes
+        from unittest.mock import Mock
+        kernel = Mock()
+        kernel.OpenProcess.return_value = 123
+        def alive(handle, code):
+            code._obj.value = 259
+            return 1
+        kernel.GetExitCodeProcess.side_effect = alive
+        with patch("ctypes.WinDLL", return_value=kernel), patch("os.kill") as kill:
+            self.assertTrue(self.controller._pid_active(424242))
+            kernel.OpenProcess.assert_called_once_with(0x1000, False, 424242)
+            kernel.CloseHandle.assert_called_once_with(123)
+            kill.assert_not_called()
+            kernel.OpenProcess.return_value = None
+            with patch("ctypes.get_last_error", return_value=87):
+                self.assertFalse(self.controller._pid_active(424242))
+            with patch("ctypes.get_last_error", return_value=5):
+                self.assertTrue(self.controller._pid_active(424242))
     @patch("auto_coding.desktop_control.Popen")
     def test_nested_missing_run_storage_is_rejected_without_creating_it(self, popen):
         nested = self.repo / "not-created" / "runs"
@@ -128,6 +180,20 @@ class DesktopControlTests(unittest.TestCase):
         result = self.controller.start()
         self.assertFalse(result["ok"])
         self.assertIn("Could not start", result["error"])
+
+    @patch("auto_coding.desktop_control.Popen")
+    def test_zero_child_exit_preserves_running_state_and_selected_logs(self, popen):
+        popen.side_effect = lambda argv, **kw: FakeProcess(argv, **kw)
+        self.assertTrue(self.controller.start()["ok"])
+        logs = self.controller.logs
+        (logs / "state.json").write_text('{"status":"running","current_task":"one","completed":[]}')
+        self.controller.process.code = 0
+        data = self.controller.snapshot()
+        self.assertFalse(data["controller"]["active"])
+        self.assertEqual(data["controller"]["exit_code"], 0)
+        self.assertEqual(data["state"]["status"], "running")
+        self.assertEqual(data["state"]["completed"], [])
+        self.assertEqual(self.controller.logs, logs)
 
     @patch("auto_coding.desktop_control.Popen")
     def test_reopen_metadata_and_exit_status(self, popen):

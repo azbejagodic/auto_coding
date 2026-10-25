@@ -47,10 +47,33 @@ def read_run(log_root: str | Path) -> dict:
     """Return a JSON-safe snapshot; malformed sources are reported as plain text."""
     root = Path(log_root).expanduser()
     result = {"root": str(root), "exists": root.is_dir(), "state": None,
-              "state_error": None, "events": [], "event_errors": [], "empty": True}
+              "state_error": None, "events": [], "event_errors": [], "empty": True,
+              "files": [], "task_count": None}
     if not root.is_dir():
         result["state_error"] = "Log directory is missing or unavailable."
         return result
+    try:
+        manifest = root / "run-manifest.json"
+        if manifest.exists() or manifest.is_symlink():
+            value = _json_file(_confined_log_file(root, "run-manifest.json"))
+            if not isinstance(value, dict) or not isinstance(value.get("task_ids"), list):
+                raise ValueError("manifest must contain task_ids")
+            result["task_count"] = len(value["task_ids"])
+    except (OSError, UnicodeError, ValueError) as exc:
+        result["event_errors"].append(f"run-manifest.json is corrupt or unreadable: {exc}")
+    try:
+        # Legacy runs have no event links. List names only, never read bodies
+        # until the user selects a confined file. Runner evidence is flat.
+        for path in root.iterdir():
+            if len(result["files"]) >= 500:
+                result["event_errors"].append("File list limited to 500 entries; event evidence links remain available.")
+                break
+            if path.is_file() or path.is_symlink():
+                result["files"].append({"label": "File", "path": path.name,
+                                        "status": evidence_status(root, path.name)})
+        result["files"].sort(key=lambda item: item["path"])
+    except OSError as exc:
+        result["event_errors"].append(f"Could not list evidence files: {exc}")
     state_path = root / "state.json"
     if state_path.exists() or state_path.is_symlink():
         try:

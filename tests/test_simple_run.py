@@ -39,6 +39,11 @@ class SimpleRunnerTests(unittest.TestCase):
         self.assertEqual(state['status'], 'completed')
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[1][0][calls[1][0].index('--sandbox') + 1], 'read-only')
+        for policy in ('substantive, reproducible blockers', 'CURRENT task/slice',
+                       'List ALL such blockers', 'optional polish', 'non-blocking suggestions'):
+            self.assertIn(policy, calls[1][1])
+        self.assertNotIn('--model', calls[0][0])
+        self.assertNotIn('--model', calls[1][0])
         self.assertTrue((self.repo / 'index.html').exists())
         events = [json.loads(line) for line in (self.logs / 'events.jsonl').read_text(encoding='utf-8').splitlines()]
         self.assertEqual([event['seq'] for event in events], list(range(1, len(events) + 1)))

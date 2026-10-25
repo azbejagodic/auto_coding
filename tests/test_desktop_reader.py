@@ -80,11 +80,14 @@ const context = { document, window: {addEventListener() {}, pywebview: {api: {
 vm.createContext(context);
 vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), context);
 vm.runInContext('render(' + JSON.stringify(snapshot) + ')', context);
+vm.runInContext("navigate('tasks')", context);
 const contents = app.textContent;
 for (const text of ['Current task: desktop-readonly-logs', 'Attempt 2', 'REJECTED',
-  'Fix a real issue', 'gone.txt (missing)', 'Line 3: corrupt event']) {
+  'Fix a real issue', 'Line 3: corrupt event']) {
   assert(contents.includes(text), 'Missing UI text: ' + text);
 }
+vm.runInContext("navigate('logs')", context);
+assert(app.textContent.includes('gone.txt (missing)'));
 assert(!contents.includes('Raw evidence'), 'Evidence must be opened explicitly');
 const walk = node => [node, ...(node.children || []).flatMap(walk)];
 const available = walk(app).find(node => node.textContent === 'log.txt (available)');
@@ -118,6 +121,21 @@ assert(missing && typeof missing.onclick !== 'function', 'Missing evidence must 
             data = read_run(root)
             self.assertFalse(data["empty"])
             self.assertEqual(data["events"], [])
+
+    def test_legacy_files_are_listed_without_reading_bodies_and_manifest_counts(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "original-answer.txt").write_text("body is not loaded by polling")
+            (root / "run-manifest.json").write_text('{"task_ids":["one","two"]}')
+            data = read_run(root)
+            self.assertEqual(data["task_count"], 2)
+            self.assertIn({"label":"File", "path":"original-answer.txt", "status":"available"}, data["files"])
+            self.assertNotIn("body is not loaded", json.dumps(data))
+            self.assertEqual(read_evidence(root, "original-answer.txt")["text"], "body is not loaded by polling")
+            (root / "run-manifest.json").write_text("{bad")
+            data = read_run(root)
+            self.assertIsNone(data["task_count"])
+            self.assertIn("manifest.json is corrupt", data["event_errors"][0])
 
     def test_corrupt_state_and_event_line_reported(self):
         with tempfile.TemporaryDirectory() as td:

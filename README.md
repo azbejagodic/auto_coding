@@ -39,13 +39,43 @@ event on an unavailable storage device.
 
 The original stopped attempt already committed `run-summary`. It must not be recreated or reset.
 
-## Read-only desktop log viewer (Slice 1)
+## Native Windows dashboard (Slice 2B-2)
 
-With this checkout's `src` directory on `PYTHONPATH`, run `python -m auto_coding.desktop_app --help` for options. Install the optional native window dependency on Windows with `python -m pip install "pywebview[winforms]"`; Windows also needs the Microsoft Edge WebView2 Runtime. Then open an existing external run with `python -m auto_coding.desktop_app --logs C:\path\to\run-logs`. Without `--logs`, the dashboard shows that no run directory is selected. The viewer only reads the selected logs, refreshes periodically, and never starts or controls Codex. Raw evidence is read only after selecting a listed evidence file and may contain sensitive data.
+From this checkout, install the optional UI dependency and launch with the source directory on `PYTHONPATH`. Windows also needs Microsoft Edge WebView2 Runtime:
+
+```powershell
+$env:PYTHONPATH = (Join-Path (Get-Location) "src")
+py -m pip install "pywebview[winforms]"
+py -B -m auto_coding.desktop_app
+# Optional: reopen a particular run immediately
+py -B -m auto_coding.desktop_app --logs "C:\Users\you\AutoCoding-Runs\run-<id>"
+```
+
+Local Codex CLI authentication is required before starting. The runner inherits the currently configured CLI model and reasoning settings; the dashboard has no model override controls. Git and Codex CLI must be available to the launched Python process.
+
+1. In the target project's Git client, choose an existing feature branch, or create one yourself (for example `git switch -c feature/my-task` in that project). Commit or discard outstanding changes before START. The dashboard never creates branches and blocks main, master and detached HEAD.
+2. Click **Browse Project** and select that project's Git root. Click **Browse Plan** and select the intended TXT, MD or JSON plan. TXT/MD represents one task; JSON can include ordered tasks and explicit test command argv arrays (see `examples`). Keep the plan outside the target checkout, or commit it before starting. Browsing, opening and cancelling selection never launch work. Full paths, branch, working tree and validation errors appear in the dashboard.
+3. Leave the total attempt limit at **3**, or choose **5**. Click **START** and review the native confirmation containing the repo, branch, plan and local-only policy. Cancelling does not launch anything. Approved task checkpoints are local commits. There is no automatic push, merge or force-push.
+4. **Overview** shows recorded state, current task, task counts, child activity/errors and recent events. **Tasks** shows each attempt, test results and Codex B verdicts, with original feedback and summaries in expandable details. **Logs** shows timestamped actors/outcomes and evidence links. Its raw file list also supports legacy runs with no event timeline. Files are loaded only when selected, as text, confined to the chosen logs directory and capped at 1 MB. Missing/corrupt sources produce warnings. The UI polls every four seconds and preserves opened evidence and expanded details.
+5. New logs live in `%USERPROFILE%\AutoCoding-Runs\run-<id>` outside the project; the full selected log path remains visible after the child exits. Logs include `desktop-run.json`, `state.json`, `events.jsonl`, evidence files and `runner-output.txt` (including launch/initialization diagnostics). A child exit code is never treated as task approval; only durable runner state supplies completion.
+6. To resume, click **Open Existing Run** and choose its log directory. Desktop runs restore the original exact repo and plan paths. RESUME is enabled only for matching stopped state and inactive, known child status; the controller checks again at launch. Keep the original plan bytes and paths. Legacy runs without desktop metadata require selecting their original repo and plan explicitly. Choose **5** if the original total attempt limit of 3 was exhausted, then click **RESUME** and confirm. Staged work is reconciled by the existing runner. Running, missing-state or uncertain launches cannot be resumed through this UI; inspect the visible diagnostics instead of launching duplicate work.
+
+Closing the window leaves the Windows child process alive in the background. Open its saved log directory in another window to inspect progress. If its PID cannot be saved or its launch status is uncertain, the dashboard blocks START/RESUME and explains the error. An interrupted child whose durable state still says running is shown as unknown, rather than invented completion or approval. There is no stop/kill button in this slice.
+
+Debug export, per-task model selection and `.exe` packaging remain unimplemented. No web server, remote assets or additional model controls are included. Imports and `--help` stay GUI-free; pywebview is loaded only when opening a native window.
+
+Run the headless regressions without Codex, a native window or network calls:
+
+```powershell
+$env:PYTHONPATH = (Join-Path (Get-Location) "src")
+py -B -m unittest discover -s tests -v
+```
+
+When Node.js is on PATH, this suite also checks JavaScript syntax and exercises the actual UI script with a fake DOM/bridge, including button dispatch, cancellation, navigation, polling, duplicate clicks and state transitions. Only JavaScript-specific checks are skipped if Node is absent. The filesystem symlink test skips on Windows installations without symlink privileges.
 
 ## Desktop run controller (Slice 2A)
 
-`auto_coding.desktop_control.DesktopController` is the headless controller API for the next desktop UI slice. Select paths with `select_repo(path)`, `select_plan(path)`, and `select_logs(path)`; `start()` creates a unique directory under `~/AutoCoding-Runs`, while `resume()` requires the original repo, plan, and an existing run directory. Each new run stores `desktop-run.json` with those paths and its child PID. `snapshot()` combines the read-only durable log snapshot with controller activity, exit code, and any readable error. `selected_paths()` and `job_status()` provide small UI-facing accessors, and `poll()` can be called on a UI timer. The controller writes launch intent before creating a child; if saving its PID fails after launch, it keeps the child observable in the current window and blocks resume from a reopened window while the metadata says the child status is unknown. Runs use the current Python interpreter with `-B -m auto_coding.simple_run`. START blocks default branches and dirty worktrees. RESUME only accepts a stopped state and leaves reconciliation of staged edits to the runner.
+`auto_coding.desktop_control.DesktopController` is the headless controller API used by the desktop dashboard. Select paths with `select_repo(path)`, `select_plan(path)`, and `select_logs(path)`; `start()` creates a unique directory under `~/AutoCoding-Runs`, while `resume()` requires the original repo, plan, and an existing run directory. Each new run stores `desktop-run.json` with those paths and its child PID. `snapshot()` combines the read-only durable log snapshot with controller activity, exit code, and any readable error. `selected_paths()` and `job_status()` provide small UI-facing accessors, and `poll()` can be called on a UI timer. The controller writes launch intent before creating a child; if saving its PID fails after launch, it keeps the child observable in the current window and blocks resume from a reopened window while the metadata says the child status is unknown. Runs use the current Python interpreter with `-B -m auto_coding.simple_run`. START blocks default branches and dirty worktrees. RESUME only accepts a stopped state and leaves reconciliation of staged edits to the runner.
 
 Closing the window does not terminate the child: it continues in the background. This avoids killing Codex mid-change. The run PID and paths are retained in its logs so a reopened UI can monitor the child; if the child disappears, the controller reports that and leaves runner state untouched for inspection.
 
@@ -54,8 +84,7 @@ When an existing run is reopened with `launching`/`running` metadata but no vali
 ## Desktop bridge API (Slice 2B-1)
 
 The native window now connects its existing `Bridge` to `DesktopController`.
-The dashboard remains the log viewer; this slice supplies the selection and
-launch API for subsequent UI controls. Opening without `--logs` shows a ready
+The Slice 2B-2 dashboard uses this approved selection and launch API for its native controls. Opening without `--logs` shows a ready
 state. Existing `--logs` runs, including legacy runs without `desktop-run.json`,
 remain available for inspection and confined evidence reads.
 
@@ -64,7 +93,7 @@ The JS API provides `select_repo(path?)`, `select_plan(path?)`, `open_run(path?)
 `snapshot()`, and `evidence(relative_name)`. Omitting a selection path opens the
 native folder or TXT/MD/JSON file picker. Cancellation preserves selections;
 selection never launches a process. START and RESUME always require a separate
-native confirmation showing the selected paths and attempts, and return the
+native confirmation showing the selected paths, current branch, attempts and no-auto-push policy, and return the
 controller's launch result. Without a dialog boundary they fail closed.
 
 `snapshot()` preserves the viewer fields and adds `controller`, containing

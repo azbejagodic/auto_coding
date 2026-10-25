@@ -532,8 +532,12 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
             print(f"[{ident}] Codex B — independent review", flush=True)
             review_prompt = ("You are Codex B, an independent READ-ONLY reviewer. Inspect the current "
                 "task's STAGED diff, all relevant project files, and tests. Previous tasks are locally "
-                "committed. Do not blindly trust implementer claims or test results; reject with "
-                "specific reproducible issues. Do not change files.\n\nTASK:\n" + task["prompt"] +
+                "committed. Do not blindly trust implementer claims or test results. Reject only for "
+                "substantive, reproducible blockers in the CURRENT task/slice. List ALL such blockers "
+                "together in one verdict, with reproduction evidence. Do not block approval for "
+                "optional polish, hypothetical risks, unrelated pre-existing issues or future slices. "
+                "If no current blockers remain, return APPROVED with an empty issues list; put any "
+                "optional polish in summary as non-blocking suggestions. Do not change files.\n\nTASK:\n" + task["prompt"] +
                 "\n\nCURRENT TASK CHANGES:\n" + stat + "\n\nDIFF (truncated; inspect repository for full):\n" + diff[:35000] +
                 "\n\nTEST RESULTS:\n" + json.dumps(record["tests"]))
             (logs / f"{base}-b-prompt.txt").write_text(review_prompt, encoding="utf-8")

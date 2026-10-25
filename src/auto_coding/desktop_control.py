@@ -15,7 +15,7 @@ import sys
 import threading
 import uuid
 
-from auto_coding.desktop_reader import read_run
+from auto_coding.desktop_reader import read_run, read_evidence
 from auto_coding.simple_run import PilotError, load_tasks
 
 
@@ -30,6 +30,7 @@ class DesktopController:
         self.exit_code: int | None = None
         self.error: str | None = None
         self._launch_uncertain = False
+        self._metadata_error = None
         self._lock = threading.Lock()
 
     def select_repo(self, path: str | Path) -> dict:
@@ -40,6 +41,7 @@ class DesktopController:
             if top.returncode or Path(top.stdout.strip()).resolve() != repo:
                 raise ValueError("Select the Git repository root, not a subdirectory.")
             self.repo = repo
+            self.error = None
             return {"ok": True, "path": str(repo), "error": None}
         except (OSError, ValueError) as exc:
             self.repo = None
@@ -53,6 +55,7 @@ class DesktopController:
                 raise ValueError("Select an existing .json, .txt, or .md plan file.")
             load_tasks(plan)
             self.plan = plan
+            self.error = None
             return {"ok": True, "path": str(plan), "error": None}
         except (OSError, UnicodeError, ValueError, PilotError, json.JSONDecodeError) as exc:
             self.plan = None
@@ -70,18 +73,40 @@ class DesktopController:
             self.error = f"Run logs selection failed: {exc}"
             return {"ok": False, "path": None, "error": self.error}
 
+    def preflight(self) -> dict:
+        """Read-only Git checks for display and launch confirmation."""
+        result = {"branch": None, "clean": None, "errors": [], "resume_error": None}
+        metadata = self._read_metadata()
+        if metadata and (metadata.get("repo") != str(self.repo) or metadata.get("plan") != str(self.plan)):
+            result["resume_error"] = "Resume requires the original exact repository and plan paths saved in desktop-run.json."
+        if self.repo is None:
+            result["errors"].append("Select a Git repository root.")
+            return result
+        try:
+            branch = subprocess.run(["git", "branch", "--show-current"], cwd=self.repo,
+                                    capture_output=True, text=True, shell=False, timeout=10)
+            result["branch"] = branch.stdout.strip() if not branch.returncode else None
+            if not result["branch"]:
+                result["errors"].append("Select a feature branch; detached HEAD or unavailable Git branch.")
+            elif result["branch"].lower() in {"main", "master"}:
+                result["errors"].append("Runs are blocked on main/master. Switch to a feature branch first.")
+            status = subprocess.run(["git", "status", "--porcelain", "--untracked-files=all"],
+                                    cwd=self.repo, capture_output=True, text=True, shell=False, timeout=10)
+            result["clean"] = not status.stdout.strip() if not status.returncode else None
+            if status.returncode:
+                result["errors"].append("Could not check Git working tree.")
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            result["errors"].append(f"Git preflight failed: {exc}")
+        return result
+
     def _validate(self):
         if self.repo is None or self.plan is None:
             raise ValueError("Select and validate a repository and plan first.")
         # Revalidate plan on launch; never trust stale UI validation.
         load_tasks(self.plan)
-        branch = subprocess.run(["git", "branch", "--show-current"], cwd=self.repo, capture_output=True, text=True, shell=False)
-        if branch.returncode: raise ValueError("Could not determine the current Git branch.")
-        if branch.stdout.strip().lower() in {"main", "master"}:
-            raise ValueError("Runs are blocked on main/master. Switch to a feature branch first.")
-        status = subprocess.run(["git", "status", "--porcelain", "--untracked-files=all"], cwd=self.repo, capture_output=True, text=True, shell=False)
-        if status.returncode: raise ValueError("Could not check Git working tree.")
-        if status.stdout.strip(): raise ValueError("Working tree has staged or unstaged changes. Commit or discard them, then use a feature branch.")
+        check = self.preflight()
+        if check["errors"]: raise ValueError(" ".join(check["errors"]))
+        if check["clean"] is not True: raise ValueError("Working tree has staged or unstaged changes. Commit or discard them, then use a feature branch.")
 
     @staticmethod
     def _valid_pid(pid) -> bool:
@@ -91,6 +116,24 @@ class DesktopController:
     @staticmethod
     def _pid_active(pid) -> bool:
         if not DesktopController._valid_pid(pid): return False
+        if os.name == "nt":
+            # os.kill(pid, 0) uses TerminateProcess on Windows. Query only.
+            import ctypes
+            from ctypes import wintypes
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel.OpenProcess.restype = wintypes.HANDLE
+            kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+            kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+            handle = kernel.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+            if not handle:
+                # Access denied is uncertain; conservatively block duplicates.
+                return ctypes.get_last_error() != 87  # ERROR_INVALID_PARAMETER: PID absent
+            try:
+                code = wintypes.DWORD()
+                return not kernel.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value == 259
+            finally:
+                kernel.CloseHandle(handle)
         try:
             os.kill(pid, 0)
             return True
@@ -117,7 +160,8 @@ class DesktopController:
                     return True
                 if self._pid_active(pid) and pid != getattr(self.process, "pid", None): return True
             except (OSError, ValueError, TypeError):
-                continue
+                # A damaged launch record cannot establish that the child is idle.
+                return True
         return False
 
     def _selected_run_active(self) -> bool:
@@ -142,8 +186,8 @@ class DesktopController:
     def _selected_run_unknown(self) -> bool:
         """An active launch record without a valid PID must not be treated as idle."""
         item = self._read_metadata()
-        return bool(item and item.get("status") in {"launching", "running"}
-                    and not self._valid_pid(item.get("pid")))
+        return bool(self._metadata_error or (item and item.get("status") in {"launching", "running"}
+                    and not self._valid_pid(item.get("pid"))))
 
     def start(self, attempts: int = 3) -> dict:
         with self._lock:
@@ -178,6 +222,8 @@ class DesktopController:
             try:
                 if self._selected_run_active():
                     raise ValueError("The selected run's child process is still active. Wait for it to stop before resuming.")
+                if self._selected_run_unknown() and not self._launch_uncertain:
+                    raise ValueError("Run launch status is unknown or desktop-run.json is corrupt. Inspect the process and logs before resuming.")
                 if self._other_active_run(): raise ValueError("An earlier desktop run is still active. Reopen its logs and wait for it to stop.")
                 if self.repo is None or self.plan is None or self.logs is None:
                     raise ValueError("Select the original repository, plan, and existing run logs first.")
@@ -185,14 +231,14 @@ class DesktopController:
                     raise ValueError("Attempts must be between 1 and 10.")
                 _, plan_sha = load_tasks(self.plan)
                 # Resume permits dirty/staged work for runner reconciliation, but keeps branch gate.
-                branch = subprocess.run(["git", "branch", "--show-current"], cwd=self.repo, capture_output=True, text=True, shell=False)
-                if branch.returncode or branch.stdout.strip().lower() in {"main", "master"}:
-                    raise ValueError("Resume is blocked on main/master. Switch to the original feature branch first.")
+                check = self.preflight()
+                if check["errors"]: raise ValueError(" ".join(check["errors"]))
                 snapshot = read_run(self.logs)
                 state = snapshot.get("state")
                 if self._launch_uncertain:
                     raise ValueError("The previous launch could not persist its child PID. Check whether the runner is still active before retrying; automatic resume is blocked.")
                 metadata = self._read_metadata()
+                if check["resume_error"]: raise ValueError(check["resume_error"])
                 if metadata and metadata.get("status") in {"launching", "running"} and not self._pid_active(metadata.get("pid")):
                     raise ValueError("Run metadata indicates a launch whose child status is unknown. Inspect the run before resuming.")
                 if not state or state.get("status") != "stopped":
@@ -215,7 +261,18 @@ class DesktopController:
             # Persist intent before creating a child. If PID persistence then fails,
             # reopen can still refuse an unsafe duplicate resume.
             self._metadata(self.logs, status="launching")
-            self.process = Popen(argv, cwd=src, env=env, shell=False)
+            options = {}
+            if os.name == "nt":
+                options["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            # Do not inherit the dashboard console or pipes. Diagnostic output
+            # remains available even if initialization fails before state.json.
+            output_path = self.logs / "runner-output.txt"
+            if not output_path.resolve().is_relative_to(self.logs.resolve()):
+                raise OSError("Runner output path escapes the selected logs directory.")
+            with output_path.open("ab") as output:
+                self.process = Popen(argv, cwd=src, env=env, shell=False,
+                                     stdin=subprocess.DEVNULL, stdout=output,
+                                     stderr=subprocess.STDOUT, **options)
             self.exit_code = None
             self.error = None
             try:
@@ -236,12 +293,20 @@ class DesktopController:
             return self._fail(f"Could not start the local runner: {type(exc).__name__}: {exc}")
 
     def _read_metadata(self):
+        self._metadata_error = None
         if self.logs is None:
             return None
         try:
-            value = json.loads((self.logs / "desktop-run.json").read_text(encoding="utf-8"))
-            return value if isinstance(value, dict) else None
-        except (OSError, ValueError):
+            path = self.logs / "desktop-run.json"
+            if not path.exists() and not path.is_symlink():
+                return None  # Legacy runs legitimately have no desktop metadata.
+            raw = read_evidence(self.logs, "desktop-run.json")
+            if not raw["ok"]: raise ValueError(raw["text"])
+            value = json.loads(raw["text"])
+            if not isinstance(value, dict): raise ValueError("metadata must be an object")
+            return value
+        except (OSError, ValueError) as exc:
+            self._metadata_error = f"desktop-run.json is corrupt or unreadable: {exc}"
             return None
 
     def _metadata(self, logs: Path, pid: int | None = None, status: str = "stopped"):
@@ -285,7 +350,7 @@ class DesktopController:
         if uncertain and self.process is None and self._detached_pid is None:
             active = None
             if not self.error:
-                self.error = ("Run launch status is unknown: metadata says launching/running "
+                self.error = self._metadata_error or ("Run launch status is unknown: metadata says launching/running "
                               "without a valid child PID. The runner may still be active. "
                               "Inspect the process and logs before starting or resuming.")
         else:
@@ -313,9 +378,12 @@ class DesktopController:
     def reopen(self, logs: str | Path) -> dict:
         result = self.select_logs(logs)
         if not result["ok"]: return result
-        meta = self.logs / "desktop-run.json"
         try:
-            value = json.loads(meta.read_text(encoding="utf-8"))
+            value = self._read_metadata()
+            if self._metadata_error:
+                self._launch_uncertain = True
+                self.error = self._metadata_error + ". Child status is unknown; inspect before retrying."
+            if value is None: raise ValueError("No usable desktop metadata")
             self.repo, self.plan = Path(value["repo"]), Path(value["plan"])
             in_flight = value.get("status") in {"launching", "running"}
             pid = value.get("pid")
