@@ -46,7 +46,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const assert = require('node:assert/strict');
 class Element {
-  constructor(tag) { this.tag = tag; this.children = []; this._text = ''; }
+  constructor(tag) { this.tag = tag; this.children = []; this._text = ''; this.value = tag === 'attempts' ? '3' : ''; }
   set textContent(value) { this._text = String(value); this.children = []; }
   get textContent() { return this._text + this.children.map(child => child.textContent).join(''); }
   append(...items) { this.children.push(...items); }

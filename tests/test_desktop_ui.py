@@ -26,11 +26,10 @@ class DesktopUITests(unittest.TestCase):
         for name in ("browse-project", "browse-plan", "open-run", "start", "resume",
                      "nav-overview", "nav-tasks", "nav-logs"):
             self.assertEqual(parser.ids[name], "button")
-        self.assertEqual(parser.ids["attempts"], "select")
+        self.assertEqual(parser.ids["attempts"], "input")
         for method in ("select_repo", "select_plan", "open_run", "start", "resume"):
             self.assertIn(method, HTML)
-        self.assertIn('value="3" selected', HTML)
-        self.assertIn('value="5"', HTML)
+        self.assertIn('min="1" max="10" step="1" value="3" required', HTML)
         self.assertIn("Local Codex CLI authentication is required", HTML)
         self.assertIn("Closing this window leaves the runner alive", HTML)
         self.assertNotIn("innerHTML", HTML)
@@ -41,7 +40,7 @@ class DesktopUITests(unittest.TestCase):
                       'overflow-wrap:anywhere', ':focus-visible',
                       'prefers-reduced-motion:reduce', 'grid-template-columns:minmax(0,1fr)',
                       'aria-label="Main navigation"', 'aria-labelledby="project-label"',
-                      'aria-labelledby="plan-label"', 'aria-describedby="preflight"',
+                      'aria-labelledby="plan-label"', 'aria-describedby="preflight attempts-error"',
                       'id="project-path"', 'id="plan-path"', 'id="run-setup"',
                       'Project folder', 'Task plan', 'Run setup', 'Open Run',
                       "'Awaiting recovery'", "'Completed', color:'green'",
@@ -52,6 +51,38 @@ class DesktopUITests(unittest.TestCase):
         for unsafe in ('innerHTML', 'outerHTML', 'insertAdjacentHTML', '<script src=',
                        'https://', 'Unknown / Unknown'):
             self.assertNotIn(unsafe, HTML)
+
+    def test_numeric_keyboard_and_compact_overview_contract(self):
+        class Markup(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.nodes = {}
+                self.labels = []
+
+            def handle_starttag(self, tag, attrs):
+                attrs = dict(attrs)
+                if "id" in attrs:
+                    self.nodes[attrs["id"]] = (tag, attrs)
+                if tag == "label":
+                    self.labels.append(attrs)
+
+        markup = Markup()
+        markup.feed(HTML)
+        number = markup.nodes["attempts"][1]
+        self.assertEqual(number["type"], "number")
+        self.assertIn({"for": "attempts"}, markup.labels)
+        self.assertEqual(number["aria-describedby"], "attempts-hint attempts-error")
+        for name in ("attempts", "start", "resume", "nav-overview", "nav-tasks", "nav-logs"):
+            tag, attrs = markup.nodes[name]
+            self.assertIn(tag, ("input", "button"))  # Native Tab/Enter/Space semantics.
+            self.assertNotIn("tabindex", attrs)  # No positive or negative tab-order overrides.
+        for name in ("header-state", "attempts-error"):
+            self.assertEqual(markup.nodes[name][1]["role"], "status")
+            self.assertEqual(markup.nodes[name][1]["aria-live"], "polite")
+        self.assertNotIn('open', markup.nodes["launch-details"][1])
+        self.assertNotIn("Ready for your first run", HTML)
+        self.assertNotIn("const steps", HTML)
+        self.assertEqual(HTML.count('requires native confirmation.'), 1)
 
     def test_actual_ui_buttons_navigation_polling_and_state_transitions(self):
         node = shutil.which("node")

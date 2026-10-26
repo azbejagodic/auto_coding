@@ -138,10 +138,23 @@ class DesktopBridgeTests(unittest.TestCase):
         self.assertTrue(self.bridge.resume()["cancelled"])
         self.bridge._dialogs = None
         self.assertIn("confirmation", self.bridge.start()["error"])
-        for attempts in (True, "3", 0, 11, None):
+        for attempts in (True, "3", 0, 11, -1, 2.5, "", None, float('nan')):
             self.assertFalse(self.bridge.resume(attempts)["ok"])
         self.controller.start.assert_not_called()
         self.controller.resume.assert_not_called()
+
+    def test_numeric_attempt_range_and_cancel_never_launches(self):
+        for name in ("start", "resume"):
+            method = getattr(self.controller, name)
+            for attempts in (1, 3, 5, 10):
+                with self.subTest(action=name, attempts=attempts):
+                    self.dialogs.confirm.return_value = False
+                    self.assertTrue(getattr(self.bridge, name)(attempts)["cancelled"])
+                    method.assert_not_called()
+                    self.dialogs.confirm.return_value = True
+                    self.assertTrue(getattr(self.bridge, name)(attempts)["ok"])
+                    method.assert_called_once_with(attempts=attempts)
+                    method.reset_mock()
 
     def test_controller_dialog_and_poll_errors_are_json_safe(self):
         self.dialogs.choose.side_effect = RuntimeError("picker unavailable")
