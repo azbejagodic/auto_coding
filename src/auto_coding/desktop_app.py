@@ -12,9 +12,159 @@ from auto_coding.simple_run import load_tasks
 
 
 HTML = r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Auto-Coding</title><style>
-*{box-sizing:border-box}body{margin:0;background:#101214;color:#edf1f5;font:14px Segoe UI,Arial,sans-serif}.shell{display:flex;min-height:100vh}.side{width:210px;padding:28px 18px;background:#15181b;border-right:1px solid #282d32}.brand{font-size:18px;font-weight:700;margin:0 0 34px}.nav{padding:12px;border-radius:9px;color:#aeb7c0;margin:5px 0}.nav.active{background:#222a31;color:#fff}.main{padding:32px;flex:1;min-width:0}.top{display:flex;justify-content:space-between;align-items:center}.muted{color:#89949e}.grid{display:grid;grid-template-columns:repeat(3,minmax(150px,1fr));gap:14px;margin:24px 0}.card,.panel{background:#191d21;border:1px solid #2a3036;border-radius:14px;padding:18px}.label{color:#89949e;font-size:12px;text-transform:uppercase;letter-spacing:.08em}.value{font-size:20px;margin-top:9px;font-weight:650}.blue{color:#61a9ff}.green{color:#59d68b}.amber{color:#f3bd58}.red{color:#ff7272}.panel{margin-top:16px}.events{width:100%;border-collapse:collapse;margin-top:12px}th{text-align:left;color:#89949e;font-size:11px;text-transform:uppercase}td,th{padding:11px 9px;border-bottom:1px solid #292f35;vertical-align:top}td{color:#d8dee5;overflow-wrap:anywhere}button{background:#26323e;border:1px solid #384958;color:#dcecff;border-radius:8px;padding:8px 13px;cursor:pointer}button:hover{background:#314253}.evidence{color:#75b8ff;cursor:pointer;text-decoration:underline}.empty{padding:24px;color:#aeb7c0;background:#191d21;border-radius:12px}.tasks{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.pill{background:#252b30;padding:7px 10px;border-radius:20px}.warning{color:#f3bd58;margin:7px 0}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#101214;border-radius:9px;padding:14px;max-height:50vh;overflow:auto}
-button:disabled{opacity:.45;cursor:default}.nav{display:block;width:100%;text-align:left;border:0;background:transparent}.controls{display:flex;gap:9px;flex-wrap:wrap;align-items:center}.path{overflow-wrap:anywhere;margin:8px 0}.notice{white-space:pre-wrap;overflow-wrap:anywhere}select{background:#101214;color:#edf1f5;padding:8px;border:1px solid #384958;border-radius:8px}details{margin:10px 0}summary{cursor:pointer;color:#aeb7c0}h2{font-size:17px}h3{font-size:14px}.side p{line-height:1.6}.events{font-size:12px}
-</style></head><body><div class="shell"><aside class="side"><div class="brand">Auto-Coding</div><button class="nav active" id="nav-overview">Overview</button><button class="nav" id="nav-tasks">Tasks</button><button class="nav" id="nav-logs">Logs</button><p class="muted" style="margin-top:38px">Local Codex CLI authentication is required.<br>No model or token usage is inferred.</p><p class="muted">Closing this window leaves the runner alive. Reopen its logs to inspect progress.</p></aside><main class="main"><div class="top"><div><div class="label">Desktop dashboard</div><h1 style="margin:8px 0" id="page-title">Run overview</h1></div><button id="refresh">Refresh</button></div><section class="panel"><h2>Choose a project and task plan</h2><p class="muted">Select your Git project folder and a plan describing the work. Then review readiness and confirm START. To inspect earlier work, open its run folder.</p><div class="controls"><button id="browse-project">Browse Project</button><button id="browse-plan">Browse Plan</button><button id="open-run">Open Existing Run</button><label>Attempt limit <select id="attempts"><option value="3" selected>3</option><option value="5">5</option></select></label><button id="start">START</button><button id="resume">RESUME</button></div><div id="paths"></div><div id="preflight" class="notice muted"></div><div id="message" class="notice" role="status" aria-live="polite"></div><details><summary>Launch safeguards</summary><p class="muted">Selection never starts work. Launch requires confirmation. Checkpoints stay local; no automatic push, merge, force-push or branch creation. START requires a clean feature branch. RESUME requires a stopped run and its original plan, repository and logs. Attempts is the total limit per task; choose 5 if 3 were exhausted.</p></details></section><div id="app"></div><div id="evidence-viewer"></div></main></div><script>
+*{box-sizing:border-box}
+body{margin:0;background:#0e1115;color:#f0f3f7;font:15px/1.5 "Segoe UI",system-ui,sans-serif}
+button,input,select{font:inherit}
+button,select,input{border:1px solid #475361;border-radius:10px;background:#222b36;color:#f0f3f7;padding:10px 16px}
+button{cursor:pointer;transition:background .15s}
+button:hover{background:#303e4f}
+button:disabled{color:#abb5c2;background:#1d232b;cursor:not-allowed}
+button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible,pre:focus-visible,.selected-path:focus-visible{outline:3px solid #74b6ff;outline-offset:3px}
+[hidden]{display:none!important}
+.shell{display:flex;min-height:100vh}
+.side{position:fixed;inset:0 auto 0 0;width:210px;padding:24px 16px;background:#14181e;border-right:1px solid #2c333e;overflow:auto}
+.brand{font-size:21px;font-weight:700;margin:0 0 32px}
+.nav{display:block;width:100%;text-align:left;background:transparent;border:1px solid transparent;margin:8px 0;padding:12px 16px;color:#bdc7d4}
+.nav.active{background:#1e3149;border-color:#3d6490;color:#fff}
+.side p{font-size:14px;margin-top:24px}
+.main{margin-left:210px;padding:24px;flex:1;min-width:0;max-width:1700px}
+.top{display:flex;justify-content:space-between;gap:16px;align-items:center;margin-bottom:24px}
+.top>div:first-child{min-width:0}
+.top>div:last-child{flex-shrink:0}
+.top h1{font-size:26px;margin:4px 0}
+.muted{color:#b0bccb}
+.label{color:#b0bccb;font-size:13px;font-weight:600;letter-spacing:.06em;text-transform:uppercase}
+.panel,.card{background:#191f27;border:1px solid #303946;border-radius:16px;padding:24px}
+.panel{margin:0 0 16px}
+.panel h2{font-size:19px;margin:0 0 16px}
+.panel h3{font-size:16px;margin:0 0 12px}
+.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;margin:16px 0}
+.card{padding:20px}
+.value{font-size:22px;font-weight:650;margin-top:8px;overflow-wrap:anywhere}
+.blue{color:#81baff}
+.green{color:#7be4a5}
+.amber,.warning{color:#f5ca7b}
+.red{color:#ff9494}
+.warning{margin:12px 0}
+.setup-fields{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr) 110px;gap:16px}
+.field label{display:block;font-weight:600;margin-bottom:8px}
+.field-line{display:flex;align-items:flex-start;gap:8px}
+.selected-path{margin:0;min-height:46px;flex:1;min-width:0;white-space:pre-wrap;overflow-wrap:anywhere;user-select:text;color:#dbe4ef;padding:10px 12px;background:#0e1115;border-radius:8px}
+.controls{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin-top:16px}
+#start{background:#3578ce;border-color:#67a7f3;color:white;font-weight:650;min-width:130px}
+#start:hover:enabled{background:#4388df}
+#start:disabled{background:#253547;color:#b3c0d1;border-color:#475361}
+#resume{border-color:#6f9ac9}
+.notice,.path{white-space:pre-wrap;overflow-wrap:anywhere}
+.notice p{margin:12px 0}
+.empty{padding:24px;background:#191f27;border:1px solid #303946;border-radius:16px}
+.empty h2{margin-top:0}
+.empty li{margin:12px 0}
+details{margin:12px 0}
+summary{cursor:pointer;color:#c0d4eb;padding:6px 0}
+pre{font:14px/1.6 Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere;background:#0e1115;border:1px solid #303946;border-radius:10px;padding:16px;max-height:320px;overflow:auto}
+.events{width:100%;border-collapse:collapse;table-layout:fixed}
+.events th{text-align:left;color:#b0bccb;font-size:13px}
+.events th,.events td{padding:12px 8px;border-bottom:1px solid #303946;vertical-align:top;overflow-wrap:anywhere}
+.events th:first-child{width:20%}
+.events th:last-child{width:32%}
+.table-scroll{overflow-x:auto}
+.evidence{display:inline-block;color:#99caff;background:transparent;text-align:left;padding:4px 8px;margin:4px 0;overflow-wrap:anywhere;max-width:100%}
+.tasks{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}
+.pill{background:#252f3b;border-radius:16px;padding:6px 12px}
+.attempt{border-left:4px solid #7b8b9e;margin-top:16px;padding:16px;background:#141a22;border-radius:12px}
+.attempt.approved{border-color:#7be4a5}
+.attempt.rejected{border-color:#ff9494}
+.filters{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px}
+.filters label{flex:1;min-width:180px}
+.filters input{display:block;width:100%;margin-top:8px;background:#0e1115}
+progress{width:100%;height:12px;accent-color:#72adf9}
+.project-heading{overflow-wrap:anywhere;max-width:650px}
+#header-state{white-space:nowrap}
+#evidence-viewer:empty{display:none}
+@media(max-width:1100px){.setup-fields{grid-template-columns:minmax(0,1fr)}
+.field-line{align-items:center}
+.main{padding:20px}
+.grid{grid-template-columns:1fr 1fr}
+.grid .card:first-child{grid-column:1/-1}
+.events{font-size:14px}
+}
+@media(prefers-reduced-motion:reduce){button{transition:none}
+}
+
+</style></head><body>
+<div class="shell">
+<aside class="side">
+<div class="brand">Auto-Coding</div>
+<nav aria-label="Main navigation">
+<button class="nav active" id="nav-overview" aria-current="page">Overview</button>
+<button class="nav" id="nav-tasks">Tasks</button>
+<button class="nav" id="nav-logs">Logs</button>
+</nav>
+<p class="muted">Local Codex CLI authentication is required.</p>
+<p class="muted">Closing this window leaves the runner alive. Reopen its logs to inspect progress.</p>
+</aside>
+<main class="main">
+<header class="top">
+<div>
+<div class="label">Local developer workspace</div>
+<h1 id="page-title">Run overview</h1>
+<div class="muted project-heading" id="selected-project">No project selected</div>
+</div>
+<div>
+<div id="header-state" class="pill">Idle</div>
+<button id="refresh" style="margin-top:12px">Refresh</button>
+</div>
+</header>
+<section class="panel" id="run-setup" aria-labelledby="setup-title">
+<h2 id="setup-title">Run setup</h2>
+<p class="muted">Choose your project and work plan. Selection never starts work.</p>
+<div class="setup-fields">
+<div class="field">
+<label id="project-label">Project folder</label>
+<div class="field-line">
+<div id="project-path" class="selected-path" tabindex="0" role="textbox" aria-readonly="true" aria-labelledby="project-label">No project selected</div>
+<button id="browse-project" aria-label="Browse project folder">Browse</button>
+</div>
+</div>
+<div class="field">
+<label id="plan-label">Task plan</label>
+<div class="field-line">
+<div id="plan-path" class="selected-path" tabindex="0" role="textbox" aria-readonly="true" aria-labelledby="plan-label">No plan selected</div>
+<button id="browse-plan" aria-label="Browse task plan">Browse</button>
+</div>
+</div>
+<div class="field">
+<label for="attempts">Attempts</label>
+<select id="attempts">
+<option value="3" selected>3</option>
+<option value="5">5</option>
+</select>
+</div>
+</div>
+<div class="controls">
+<button id="start" aria-describedby="preflight">Start</button>
+<button id="resume" aria-describedby="resume-reason">Resume</button>
+<button id="open-run">Open Run</button>
+<span id="resume-reason" class="muted">Open a matching stopped run to resume.</span>
+</div>
+<div id="paths">
+</div>
+<div id="preflight" class="notice muted">
+</div>
+<details>
+<summary>Launch safeguards</summary>
+<p class="muted">Every launch requires native confirmation. START requires a clean feature branch. RESUME requires a stopped run and its original plan, repository and logs. Attempts is the total limit per task; choose 5 if 3 were exhausted. Checkpoints stay local; no automatic push, merge, force-push or branch creation. Model and reasoning settings come from your local Codex CLI.</p>
+</details>
+</section>
+<div id="message" class="notice" role="status" aria-live="polite">
+</div>
+<div id="evidence-viewer">
+</div>
+<div id="app">
+</div>
+</main>
+</div><script>
 const app = document.getElementById('app');
 const evidenceViewer = document.getElementById('evidence-viewer');
 
@@ -29,6 +179,17 @@ function panel(title) {
   p.append(el('h2', title));
   return p;
 }
+let logQuery = '';
+function runPresentation(data) {
+  const c = data.controller || {}, state = data.state || {};
+  if (c.uncertain || (c.active !== false && c.active !== true)) return {label:'Unknown child status', color:'amber'};
+  if (c.active) return {label:'Running', color:'blue'};
+  if (state.status === 'completed') return {label:'Completed', color:'green'};
+  if (state.status === 'checkpointing' || state.pending_checkpoint) return {label:'Awaiting recovery', color:'amber'};
+  if (state.status === 'stopped') return {label:'Stopped', color:'amber'};
+  if (c.logs || data.root) return {label:state.status ? 'Unknown run state' : 'Awaiting recorded state', color:'amber'};
+  return {label:'Idle', color:'muted'};
+}
 let page = 'overview';
 let latest = null;
 let busy = false;
@@ -42,7 +203,9 @@ function detail(title, text, key) {
   const box = el('details');
   box.open = expanded.has(key);
   box.ontoggle = () => { if (box.open) expanded.add(key); else expanded.delete(key); };
-  box.append(el('summary', title), el('pre', text));
+  const content = el('pre', text);
+  content.setAttribute('tabindex', '0');
+  box.append(el('summary', title), content);
   return box;
 }
 function message(text, error = false) {
@@ -62,12 +225,9 @@ function filesInto(parent, files) {
   if (!files.length) parent.append(el('span', 'None listed', 'muted'));
   files.forEach(file => {
     const available = file.status === 'available';
-    const info = el('span', file.path + ' (' + file.status + ')', available ? 'evidence' : 'warning');
+    const info = el(available ? 'button' : 'span', file.path + ' (' + file.status + ')', available ? 'evidence' : 'warning');
     if (available) {
-      info.setAttribute('role', 'button');
-      info.setAttribute('tabindex', '0');
       info.onclick = () => showEvidence(file.path);
-      info.onkeydown = key => { if (key.key === 'Enter' || key.key === ' ') return showEvidence(file.path); };
     }
     parent.append(el('span', file.label + ': '), info, document.createTextNode(' '));
   });
@@ -93,20 +253,30 @@ function timelineInto(parent, events) {
     body.append(line);
   });
   table.append(body);
-  parent.append(table);
+  const scroll = el('div', undefined, 'table-scroll');
+  scroll.append(table);
+  parent.append(scroll);
 }
 function render(data) {
+  const searchFocused = document.activeElement?.id === 'log-search';
+  const searchCursor = searchFocused ? document.activeElement.selectionStart : null;
   latest = data;
   const c = data.controller || {};
+  const key = page + JSON.stringify(data);
+  updateControls();
+  if (runPresentation(data).label === 'Completed' && document.getElementById('message').textContent.startsWith('Launch accepted.')) message('');
+  if (renderKey === key) return;
+  renderKey = key;
   const paths = document.getElementById('paths');
   paths.replaceChildren();
-  const basename = path => path.split(/[\\/]/).filter(Boolean).pop();
-  ['repo', 'plan', 'logs'].forEach(name => {
-    if (c[name]) paths.append(el('div', {repo:'Project', plan:'Plan', logs:'Run'}[name] + ': ' + basename(c[name]), 'path'));
+  [['project-path', c.repo || 'No project selected'], ['plan-path', c.plan || 'No plan selected']].forEach(([id, value]) => {
+    const field = document.getElementById(id);
+    if (field.textContent !== value) field.textContent = value;
   });
+  document.getElementById('selected-project').textContent = c.repo || 'No project selected';
   const git = c.preflight || {};
-  if (c.repo) paths.append(el('div', 'Branch: ' + (git.branch || 'Unavailable'), 'path'));
-  if (c.repo || c.plan || c.logs) paths.append(detail('Full paths', ['repo', 'plan', 'logs'].map(name => name + ': ' + (c[name] || 'Not selected')).join('\n'), 'paths'));
+  if (c.repo) paths.append(el('div', 'Branch: ' + (git.branch || 'Unavailable'), 'path muted'));
+  if (c.logs) paths.append(detail('Run folder (select text to copy)', c.logs, 'paths'));
   const errors = [...(git.errors || []), ...Object.entries(c.validation_errors || {}).map(([k,v]) => k + ': ' + v)];
   if (c.selection_error) errors.push(c.selection_error);
   if (git.resume_error) errors.push(git.resume_error);
@@ -125,18 +295,29 @@ function render(data) {
     : 'Ready to START. Review the confirmation before launching.';
   preflight.append(el('p', (c.active ? 'Running - ' : c.start_ready || c.resume_ready ? 'Ready - ' : 'Action needed - ') + instruction));
   preflight.append(detail('Details - preflight and launch safeguards', JSON.stringify({branch:git.branch, clean:git.clean, start_ready:c.start_ready, resume_ready:c.resume_ready, diagnostics:errors}, null, 2), 'preflight'));
+  document.getElementById('resume-reason').textContent = c.resume_ready ? 'Continue the original stopped run.' : c.active || c.uncertain ? 'Resume unavailable while the runner is active or uncertain.' : 'Resume requires a matching stopped run, original plan and available attempts.';
+  document.getElementById('run-setup').hidden = page !== 'overview';
+  const presentation = runPresentation(data);
+  const badge = document.getElementById('header-state');
+  badge.textContent = presentation.label;
+  badge.className = 'pill ' + presentation.color;
+  if (presentation.label === 'Completed' && document.getElementById('message').textContent.startsWith('Launch accepted.')) message('');
   updateControls();
   if (evidenceRoot !== data.root) {
     evidenceViewer.replaceChildren();
     expanded.clear();
     evidenceRoot = data.root;
   }
-  const key = page + JSON.stringify(data);
-  if (renderKey === key) return;
-  renderKey = key;
   app.replaceChildren();
   if (!c.logs && !data.root) {
-    app.append(el('div', c.start_ready ? 'Ready to begin. Click START to review the project, plan and branch before confirming.' : 'Choose a project and task plan above. Selection does not start work. You can also Open Existing Run to inspect earlier work.', 'empty'));
+    const empty = el('section', undefined, 'empty');
+    empty.append(el('h2', page === 'overview' ? 'Ready for your first run' : page === 'tasks' ? 'Your task history will appear here' : 'Your run evidence will appear here'));
+    empty.append(el('p', c.start_ready ? 'Ready to begin. Click Start to review your launch confirmation.' : 'Start with a project and task plan, or open a saved run to inspect earlier work.'));
+    const steps = el('ol');
+    ['Choose a clean Git project on a feature branch.', 'Select a TXT, MD or JSON task plan and an attempt limit.', 'Review the native confirmation, then follow progress here.'].forEach(text => steps.append(el('li', text)));
+    empty.append(steps);
+    if (page !== 'overview') { const setup = el('button', 'Go to run setup'); setup.onclick = () => navigate('overview'); empty.append(setup); }
+    app.append(empty);
     if (c.error) app.append(el('div', c.error, 'warning'));
     return;
   }
@@ -144,7 +325,7 @@ function render(data) {
   const events = data.events || [];
   const history = Array.isArray(state.history) ? state.history.filter(item => item && typeof item === 'object') : [];
   const completed = Array.isArray(state.completed) ? state.completed : null;
-  const status = c.uncertain || (c.active !== false && c.active !== true) ? 'Unknown child status' : c.active === true ? 'Active' : state.status === 'completed' ? 'Completed (recorded)' : state.status === 'checkpointing' ? 'Recovery pending (checkpointing)' : state.status === 'stopped' ? 'Stopped (recorded)' : state.status ? 'Unknown / child inactive; recorded: ' + state.status : c.logs ? 'Awaiting recorded run state' : 'Choose a project and plan';
+  const status = presentation.label;
   const reconciled = c.active === false && !c.uncertain && ['completed', 'checkpointing'].includes(state.status);
   if (c.error && !reconciled) app.append(el('div', c.error, 'notice warning'));
   if (data.state_error) app.append(el('div', data.state_error, 'warning'));
@@ -157,10 +338,16 @@ function render(data) {
     const count = data.task_count ?? c.task_count;
     [['Run status', status], ['Completed tasks', count != null ? (completed ? completed.length : '--') + ' / ' + count : c.logs ? 'Not recorded' : 'Select a plan'], ['Child process', c.active === true ? 'Running' : c.active === false ? 'Inactive' : 'Unknown']].forEach(([label,value]) => {
       const card = el('div', undefined, 'card');
-      card.append(el('div', label, 'label'), el('div', value, 'value blue'));
+      card.append(el('div', label, 'label'), el('div', value, 'value ' + (label === 'Run status' ? presentation.color : '')));
       summary.append(card);
     });
     app.append(summary);
+    if (count > 0 && completed) {
+      const progress = el('progress');
+      progress.setAttribute('max', count); progress.setAttribute('value', completed.length);
+      progress.setAttribute('aria-label', 'Completed tasks');
+      app.append(progress);
+    }
     const current = panel('Current task');
     current.append(el('div', 'Current task: ' + (state.current_task || 'No task in progress'), 'value'));
     if (state.status === 'checkpointing') current.append(el('p', 'Checkpoint recovery is pending. Inspect the logs; RESUME remains subject to controller safety checks.', 'warning'));
@@ -170,7 +357,11 @@ function render(data) {
     if (history.length) current.append(detail('Latest attempt details', JSON.stringify(history[history.length - 1], null, 2), 'latest-attempt'));
     app.append(current);
     const recent = panel('Recent activity');
-    timelineInto(recent, events.slice(-5));
+    events.slice(-5).reverse().forEach(event => {
+      recent.append(el('p', [event.timestamp_utc || 'Time not recorded', event.actor, event.event, event.outcome].filter(Boolean).join(' | ')));
+    });
+    if (!events.length) recent.append(el('p', 'No events recorded yet. Full evidence is available in Logs.', 'muted'));
+    const logs = el('button', 'View all activity'); logs.onclick = () => navigate('logs'); recent.append(logs);
     app.append(recent);
   } else if (page === 'tasks') {
     const tasks = panel('Tasks and attempt history');
@@ -181,8 +372,12 @@ function render(data) {
     tasks.append(row);
     if (!history.length) tasks.append(el('p', 'No completed attempts recorded yet. Live test/review activity appears in Logs.', 'muted'));
     history.forEach((item, index) => {
-      const attempt = el('section', undefined, 'panel');
       const decision = item.review && item.review.decision;
+      const outcome = String(decision || '').toLowerCase();
+      const attempt = el('section', undefined, 'attempt ' + (outcome === 'approved' ? 'approved' : outcome === 'rejected' ? 'rejected' : ''));
+      const verdict = el('div', decision || 'Review not recorded', 'pill ' + (outcome === 'approved' ? 'green' : outcome === 'rejected' ? 'red' : 'muted'));
+      attempt.append(verdict);
+      if (item.commit) attempt.append(el('p', 'Local commit: ' + item.commit, 'path green'));
       attempt.append(el('h3', (item.task || 'Unknown task') + ' | Attempt ' + (item.attempt ?? 'unknown') + ' | Codex B: ' + (decision || 'No verdict recorded')));
       (Array.isArray(item.tests) ? item.tests : []).filter(test => test && typeof test === 'object').forEach(test => attempt.append(el('p', 'Test ' + test.index + ': exit ' + (test.exit_code ?? 'unknown') + ', timed out: ' + (test.timed_out ?? 'unknown'))));
       if (item.feedback) attempt.append(detail('Feedback (original)', item.feedback, 'feedback-' + index));
@@ -194,17 +389,33 @@ function render(data) {
     app.append(tasks);
   } else {
     const timeline = panel('Durable event timeline');
-    timelineInto(timeline, events);
+    const filters = el('div', undefined, 'filters');
+    const label = el('label', 'Search actor, outcome or event');
+    const search = el('input'); search.id = 'log-search'; search.setAttribute('type', 'search'); search.setAttribute('aria-label', 'Search actor, outcome or event');
+    search.value = logQuery;
+    label.append(search); filters.append(label); timeline.append(filters);
+    const results = el('div');
+    const draw = () => {
+      results.replaceChildren();
+      const query = logQuery.toLowerCase();
+      const filtered = events.filter(event => JSON.stringify(event).toLowerCase().includes(query));
+      results.append(el('p', filtered.length + ' of ' + events.length + ' events', 'muted'));
+      timelineInto(results, filtered);
+    };
+    search.oninput = () => { logQuery = search.value; draw(); };
+    draw(); timeline.append(results);
     app.append(timeline);
-    const files = panel('Raw files (on demand)');
+    const files = panel('Raw evidence files');
+    files.append(el('p', 'Select a file to read its original text below. Display is bounded to 1 MB per file.', 'muted'));
     (data.files || []).forEach(file => { const row = el('p'); filesInto(row, [file]); files.append(row); });
     if (!data.files?.length) files.append(el('p', 'No raw files listed.', 'muted'));
     app.append(files);
+    if (searchFocused) { search.focus(); search.setSelectionRange(searchCursor, searchCursor); }
   }
 }
 function navigate(name) {
   page = name;
-  ['overview', 'tasks', 'logs'].forEach(view => { document.getElementById('nav-' + view).className = 'nav' + (view === page ? ' active' : ''); });
+  ['overview', 'tasks', 'logs'].forEach(view => { const nav = document.getElementById('nav-' + view); nav.className = 'nav' + (view === page ? ' active' : ''); nav.setAttribute('aria-current', view === page ? 'page' : 'false'); });
   document.getElementById('page-title').textContent = {overview:'Run overview', tasks:'Tasks', logs:'Logs'}[page];
   if (latest) render(latest);
 }
@@ -215,7 +426,7 @@ async function refresh(clearMessage = true) {
     try { const data = await window.pywebview.api.snapshot(); if (clearMessage) message(''); render(data); }
     catch (error) {
       latest = {...(latest || {}), controller: {...(latest?.controller || {}), active: null, uncertain: true}};
-      updateControls();
+      render(latest);
       message('Could not load status: ' + error, true);
     }
   })();
@@ -253,9 +464,13 @@ async function showEvidence(name) {
   box.append(close);
   box.append(el('div', 'This file is displayed only because you selected it. Treat contents as potentially sensitive.', 'warning'));
   const content = el('pre', 'Loading...');
+  content.setAttribute('tabindex', '0');
+  content.setAttribute('aria-label', 'Raw evidence text');
   box.append(content);
   // Keep selected evidence visible while the timeline periodically refreshes.
   evidenceViewer.replaceChildren(box);
+  box.scrollIntoView?.({block:'nearest'});
+  content.focus?.({preventScroll:true});
   try {
     const result = await window.pywebview.api.evidence(name);
     if (evidenceViewer.contains(content)) content.textContent = result.text;
@@ -478,7 +693,7 @@ def main(argv=None) -> int:
         return 2
     try:
         api = Bridge(args.logs)
-        window = webview.create_window("Auto-Coding - Run Dashboard", html=HTML, js_api=api, width=1180, height=780, min_size=(800, 600))
+        window = webview.create_window("Auto-Coding - Run Dashboard", html=HTML, js_api=api, width=1280, height=800, min_size=(1000, 600))
         api._dialogs = NativeDialogs(webview, window)
         webview.start()
         return 0

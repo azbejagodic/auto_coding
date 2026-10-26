@@ -62,6 +62,7 @@ const document = {
   createTextNode: value => ({textContent: String(value)})
 };
 const snapshot = {
+  root: 'mock-run', controller: {logs: 'mock-run', active: false, uncertain: false},
   exists: true, empty: false, state_error: null,
   state: {status: 'running', completed: [], current_task: 'desktop-readonly-logs', history: [
     {task: 'desktop-readonly-logs', attempt: 2, review: {decision: 'REJECTED'}, feedback: 'Fix a real issue'}

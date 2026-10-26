@@ -54,11 +54,11 @@ py -B -m auto_coding.desktop_app --logs "C:\Users\you\AutoCoding-Runs\run-<id>"
 Local Codex CLI authentication is required before starting. The runner inherits the currently configured CLI model and reasoning settings; the dashboard has no model override controls. Git and Codex CLI must be available to the launched Python process.
 
 1. In the target project's Git client, choose an existing feature branch, or create one yourself (for example `git switch -c feature/my-task` in that project). Commit or discard outstanding changes before START. The dashboard never creates branches and blocks main, master and detached HEAD.
-2. Click **Browse Project** and select that project's Git root. Click **Browse Plan** and select the intended TXT, MD or JSON plan. TXT/MD represents one task; JSON can include ordered tasks and explicit test command argv arrays (see `examples`). Keep the plan outside the target checkout, or commit it before starting. Browsing, opening and cancelling selection never launch work. Full paths, branch, working tree and validation errors appear in the dashboard.
+2. Click **Browse** beside Project folder and select that project's Git root. Click **Browse** beside Task plan and select the intended TXT, MD or JSON plan. TXT/MD represents one task; JSON can include ordered tasks and explicit test command argv arrays (see `examples`). Keep the plan outside the target checkout, or commit it before starting. Browsing, opening and cancelling selection never launch work. Full paths, branch, working tree and validation errors appear in the dashboard.
 3. Leave the total attempt limit at **3**, or choose **5**. Click **START** and review the native confirmation containing the repo, branch, plan and local-only policy. Cancelling does not launch anything. Approved task checkpoints are local commits. There is no automatic push, merge or force-push.
 4. **Overview** shows recorded state, current task, task counts, child activity/errors and recent events. **Tasks** shows each attempt, test results and Codex B verdicts, with original feedback and summaries in expandable details. **Logs** shows timestamped actors/outcomes and evidence links. Its raw file list also supports legacy runs with no event timeline. Files are loaded only when selected, as text, confined to the chosen logs directory and capped at 1 MB. Missing/corrupt sources produce warnings. The UI polls every four seconds and preserves opened evidence and expanded details.
 5. New logs live in `%USERPROFILE%\AutoCoding-Runs\run-<id>` outside the project; the full selected log path remains visible after the child exits. Logs include `desktop-run.json`, `state.json`, `events.jsonl`, evidence files and `runner-output.txt` (including launch/initialization diagnostics). A child exit code is never treated as task approval; only durable runner state supplies completion.
-6. To resume, click **Open Existing Run** and choose its log directory. Desktop runs restore the original exact repo and plan paths. RESUME is enabled only for matching stopped state and inactive, known child status; the controller checks again at launch. Keep the original plan bytes and paths. Legacy runs without desktop metadata require selecting their original repo and plan explicitly. Choose **5** if the original total attempt limit of 3 was exhausted, then click **RESUME** and confirm. Staged work is reconciled by the existing runner. Running, missing-state or uncertain launches cannot be resumed through this UI; inspect the visible diagnostics instead of launching duplicate work.
+6. To resume, click **Open Run** and choose its log directory. Desktop runs restore the original exact repo and plan paths. RESUME is enabled only for matching stopped state and inactive, known child status; the controller checks again at launch. Keep the original plan bytes and paths. Legacy runs without desktop metadata require selecting their original repo and plan explicitly. Choose **5** if the original total attempt limit of 3 was exhausted, then click **RESUME** and confirm. Staged work is reconciled by the existing runner. Running, missing-state or uncertain launches cannot be resumed through this UI; inspect the visible diagnostics instead of launching duplicate work.
 
 Closing the window leaves the Windows child process alive in the background. Open its saved log directory in another window to inspect progress. If its PID cannot be saved or its launch status is uncertain, the dashboard blocks START/RESUME and explains the error. An interrupted child whose durable state still says running is shown as unknown, rather than invented completion or approval. There is no stop/kill button in this slice.
 
@@ -111,38 +111,88 @@ into `Bridge`. `NativeDialogs` is bound only after the native window is created;
 it supports pywebview's `FileDialog` enum and older dialog constants. Importing
 the module or requesting `--help` does not import pywebview.
 
-## Desktop usability pass: Windows smoke check
+## Desktop visual polish: launch and manual smoke checklist
 
-Automated tests use fake processes, dialogs and webview; they never start Codex,
-access the network or open a GUI. A real Windows check is separate and manual:
+With the optional pywebview dependency and Edge WebView2 Runtime already installed,
+run this single command from the checkout root in PowerShell:
 
-1. Create a disposable Git project with an initial commit and switch it to
-   `feature/ui-smoke`. Keep a one-task plan outside that project, asking for
-   `greet.py` to print `Hello, Auto-Coding!` and a Python test of that output.
-   Ask Codex B to enumerate concrete, reproducible blockers in this task and
-   approve with no issues when acceptance passes; visual polish belongs to the
-   next task. Authenticate the local Codex CLI before launching the dashboard.
-2. Open the dashboard without logs. Check the project/plan onboarding, select
-   both using native dialogs, reselect without launching, and inspect names,
-   full paths and the actual branch. Main/master, dirty trees and invalid plans
-   must block START with instructions. Details contains technical diagnostics.
-3. Cancel START's native summary once; no run should appear. Confirm it once,
-   then check the selected run, live current task, and Tasks/Logs. Open evidence
-   and leave it open through a polling update. Inspect any authentication failure
-   in `runner-output.txt`; sign in through the local CLI before retrying.
-4. Close and reopen the app, then Open Existing Run using the saved external log
-   folder. Closing must leave a live runner alone. Completion must come from
-   `state.json`; an exited child alone cannot approve the task. Inspect the exact
-   result, checkpoint SHA and raw logs; verify the greeting and Git status in the
-   disposable project. A stopped run may resume only through the existing exact
-   path/hash/branch/process checks. Do not force a Git lock conflict for this test.
-5. For the 26 October regression, an inactive child with prior exit 1 followed by
-   durable `completed` must show **Completed (recorded)** as the primary outcome.
-   **Process history** retains the failed exit and original diagnostic, including
-   after reopening. `checkpointing` means recovery pending; it does not make
-   RESUME eligible. Active or unknown children keep their safety priority.
-   Refresh and Open Existing Run clear transient launch messages. Raw files and
-   events remain unchanged; no successful child exit is inferred from recovery.
+```powershell
+py -B -c "import sys; sys.path.insert(0, 'src'); from auto_coding.desktop_app import main; raise SystemExit(main())"
+```
+
+The dashboard uses a fixed 210px navigation sidebar, a project/state header and
+readable system fonts on charcoal panels. Overview owns Run setup, full selectable
+project/plan paths, branch/readiness diagnostics, onboarding or progress/current
+task, and five recent events. Tasks owns attempt/test/commit rows with distinct
+approved/rejected labels and collapsed original Codex B feedback. Logs owns the
+UTC event timeline, local actor/outcome/event search, missing/corrupt warnings,
+and selectable raw evidence above the timeline (text only, maximum 1 MB).
+Original event, attempt, verdict and process diagnostics remain expandable.
+No coordinator/controller rules or stored evidence are changed. Debug ZIP export,
+model/reasoning dropdowns and standalone `.exe` packaging are not implemented.
+
+Automated tests use mocked processes, dialogs, pywebview and DOM; they never start
+Codex or open a GUI. Perform this separate manual check on Windows:
+
+1. Launch without `--logs`. At **1280x720**, then **1600x900**, check the fixed
+   sidebar, readable labels, normal vertical scrolling and no page/toolbar
+   horizontal overflow. Tab through navigation, Browse, Attempts, Start, Resume,
+   Open Run and details. Verify visible focus, hover and selected navigation;
+   Enter/Space must activate buttons. Overview shows **Idle** and onboarding;
+   Tasks/Logs show their own empty state and a working **Go to run setup** button.
+2. Use a disposable Git project with an initial commit on `feature/ui-smoke`.
+   Keep a one-task plan outside it asking for `greet.py` to print
+   `Hello, Auto-Coding!` and a Python test of that output. Authenticate the local
+   Codex CLI. In the review instructions ask Codex B to reject only reproducible
+   in-scope functional, regression, accessibility or security issues; personal
+   color/style preferences and optional redesign notes are nonblocking.
+3. Browse for the project and plan, including a long path with spaces. Read and
+   select/copy the entire paths; confirm branch and readiness. Cancel a picker
+   and verify selections remain. Main/master, dirty trees and invalid plans
+   must disable Start with an understandable reason. Resume explains its matching
+   stopped-run requirement. Selecting files must never launch work.
+4. Cancel Start's native confirmation once; verify no run launches. Confirm it
+   once with Attempts **3**; verify **Running**, protected disabled controls,
+   progress/current task and recent activity. Follow Tasks/Logs without a repeated
+   setup block. Inspect test exits, approved versus rejected rows, commit SHA,
+   and collapsed full feedback/attempt/verdict details. Long rejection text must
+   remain in details rather than filling the main view.
+5. In Logs, search an actor, outcome and nonexistent term; confirm matching counts
+   and clearing search restores events. Select evidence: it must appear above the
+   timeline, remain selectable/scrollable through polling, and close correctly.
+   Literal `<script>`/`<img>` text must never execute. Inspect missing/corrupt
+   warnings and the 1 MB cap using saved disposable log fixtures. Inspect CLI
+   authentication or initialization failures in `runner-output.txt` if present.
+6. Close and reopen the app and **Open Run** with its saved external log folder.
+   Closing must leave a live runner alone. A known inactive completed run must
+   show calm green **Completed**, including when historical child exit is **1**.
+   Expand **Process history** to find that exact failure. No stale launch-accepted
+   message or historical orange failure headline should remain. Verify actual
+   result/checkpoint SHA and Git status in the disposable project.
+7. Inspect saved stopped, checkpointing, missing-state and uncertain-process runs:
+   labels must read **Stopped**, **Awaiting recovery**, **Awaiting recorded state**
+   or **Unknown child status** as appropriate. Inactive state still recorded as
+   running must show **Unknown run state**. No child exit alone implies approval;
+   a live/unknown child retains priority over recorded completion. Resume enables
+   only with the original matching repo/plan and a known inactive stopped run;
+   choose Attempts **5** if the original total of 3 was exhausted, then cancel
+   once and confirm once. Do not force a Git lock conflict or edit evidence to
+   obtain a preferred display.
+
+Run the scoped headless desktop checks and GUI-free help from PowerShell:
+
+```powershell
+$env:PYTHONPATH = (Join-Path (Get-Location) "src")
+py -B -m unittest discover -s tests -p "test_desktop*.py" -v
+py -B -m auto_coding.desktop_app --help
+```
+
+Node.js on PATH enables actual script syntax and mocked DOM interaction checks,
+including navigation, launch cancellation/locking, status transitions, search,
+expandable reviews, text-safe evidence and completion after historical exit 1.
+Without Node those checks explicitly skip; no runtime is installed by the app.
+The filesystem symlink test skips when Windows does not grant symlink privileges.
+Manual native-window/resolution checks are not implied by these headless tests.
 
 Process exits observed by the controller are saved in `desktop-run.json` as
 `process_history` for later inspection. Older runs without that field remain

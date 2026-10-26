@@ -36,6 +36,23 @@ class DesktopUITests(unittest.TestCase):
         self.assertNotIn("innerHTML", HTML)
         self.assertNotIn("Read-only viewer", HTML)
 
+    def test_layout_accessibility_and_text_safety_contract(self):
+        for token in ('width:210px', 'margin-left:210px', 'font:15px/1.5',
+                      'overflow-wrap:anywhere', ':focus-visible',
+                      'prefers-reduced-motion:reduce', 'grid-template-columns:minmax(0,1fr)',
+                      'aria-label="Main navigation"', 'aria-labelledby="project-label"',
+                      'aria-labelledby="plan-label"', 'aria-describedby="preflight"',
+                      'id="project-path"', 'id="plan-path"', 'id="run-setup"',
+                      'Project folder', 'Task plan', 'Run setup', 'Open Run',
+                      "'Awaiting recovery'", "'Completed', color:'green'",
+                      "'Idle', color:'muted'", "'Unknown run state'",
+                      'Search actor, outcome or event', '1 MB per file',
+                      "content.setAttribute('tabindex', '0')"):
+            self.assertIn(token, HTML)
+        for unsafe in ('innerHTML', 'outerHTML', 'insertAdjacentHTML', '<script src=',
+                       'https://', 'Unknown / Unknown'):
+            self.assertNotIn(unsafe, HTML)
+
     def test_actual_ui_buttons_navigation_polling_and_state_transitions(self):
         node = shutil.which("node")
         if not node:
@@ -45,6 +62,9 @@ class DesktopUITests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             js = Path(td) / "dashboard.js"
             js.write_text(script, encoding="utf-8")
+            syntax = subprocess.run([node, "--check", str(js)], capture_output=True,
+                                    text=True, timeout=20)
+            self.assertEqual(syntax.returncode, 0, syntax.stderr)
             result = subprocess.run([node, str(fixture), str(js)], capture_output=True,
                                     text=True, encoding="utf-8", errors="replace", timeout=20)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
