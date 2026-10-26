@@ -589,6 +589,7 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                     events.emit("controller", "stopped", "failed", task_id=ident, attempt=attempt, metadata={"reason": "worktree changed after review"})
                     print("STOPPED: worktree changed after Codex B review")
                     return 1
+                record.update(base_head=head(repo), diff_sha256=diff_sha)
                 state["pending_checkpoint"] = {"task": ident, "base_head": head(repo),
                                                 "diff_sha256": diff_sha, "record": record}
                 state["status"] = "checkpointing"

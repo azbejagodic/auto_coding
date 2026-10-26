@@ -24,8 +24,17 @@ class DesktopUITests(unittest.TestCase):
         parser = Controls()
         parser.feed(HTML)
         for name in ("browse-project", "browse-plan", "open-run", "start", "resume",
+                     "connect-github", "list-github", "select-branch", "new-branch",
+                     "create-branch", "cancel-branch", "fetch-github", "push-approved",
                      "nav-overview", "nav-tasks", "nav-logs"):
             self.assertEqual(parser.ids[name], "button")
+        self.assertEqual(parser.ids["github-repo"], "input")
+        self.assertEqual(parser.ids["github-branch"], "select")
+        self.assertEqual(parser.ids["branch-base"], "select")
+        self.assertEqual(parser.ids["branch-base-confirm"], "input")
+        self.assertIn('Advanced / Local Project', HTML)
+        self.assertIn('Push Approved Commits', HTML)
+        self.assertNotIn('Merge to main</button>', HTML)
         self.assertEqual(parser.ids["attempts"], "input")
         for method in ("select_repo", "select_plan", "open_run", "start", "resume"):
             self.assertIn(method, HTML)

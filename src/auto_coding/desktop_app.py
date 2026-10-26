@@ -46,9 +46,10 @@ button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visi
 .amber,.warning{color:#f5ca7b}
 .red{color:#ff9494}
 .warning{margin:12px 0}
-.setup-fields{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr) 110px;gap:16px}
+.setup-fields{display:grid;grid-template-columns:minmax(0,1fr) 110px;gap:16px}
 .field label{display:block;font-weight:600;margin-bottom:8px}
 #attempts{width:100%;padding:10px}
+#github-repo{flex:1;min-width:180px}
 #attempts[aria-invalid="true"]{border-color:#ff9494}
 .field-line{display:flex;align-items:flex-start;gap:8px}
 .selected-path{margin:0;min-height:46px;flex:1;min-width:0;white-space:pre-wrap;overflow-wrap:anywhere;user-select:text;color:#dbe4ef;padding:10px 12px;background:#0e1115;border-radius:8px}
@@ -117,14 +118,29 @@ progress{width:100%;height:12px;accent-color:#72adf9}
 </header>
 <section class="panel" id="run-setup" aria-labelledby="setup-title">
 <h2 id="setup-title">Run setup</h2>
+<label for="github-repo">GitHub repository (OWNER/REPO or GitHub URL)</label>
+<div class="controls">
+<input id="github-repo" aria-label="GitHub repository" placeholder="OWNER/REPO">
+<button id="connect-github">Connect repository</button>
+<button id="list-github">My repositories</button>
+<select id="github-repositories" aria-label="Authenticated repositories" hidden></select>
+</div>
+<p id="github-state" class="muted">Enter a repository. GitHub CLI is optional; Git authentication is used for checkout.</p>
+<div class="controls">
+<select id="github-branch" aria-label="Feature branch"></select>
+<button id="select-branch">Select branch</button>
+<button id="new-branch">New Branch</button>
+<button id="fetch-github">Fetch branches</button>
+</div>
+<div id="branch-form" class="controls" hidden>
+<label for="branch-name">New feature branch</label>
+<input id="branch-name">
+<label for="branch-base">Remote base</label>
+<select id="branch-base" aria-describedby="branch-base-confirm-label"></select>
+<label id="branch-base-confirm-label" hidden><input id="branch-base-confirm" type="checkbox"> I confirm creating this feature branch from the selected alternate remote base instead of origin/main.</label>
+<button id="create-branch">Create branch</button><button id="cancel-branch">Cancel</button>
+</div>
 <div class="setup-fields">
-<div class="field">
-<label id="project-label">Project folder</label>
-<div class="field-line">
-<div id="project-path" class="selected-path" tabindex="0" role="textbox" aria-readonly="true" aria-labelledby="project-label">No project selected</div>
-<button id="browse-project" aria-label="Browse project folder">Browse</button>
-</div>
-</div>
 <div class="field">
 <label id="plan-label">Task plan</label>
 <div class="field-line">
@@ -145,6 +161,17 @@ progress{width:100%;height:12px;accent-color:#72adf9}
 <button id="open-run">Open Run</button>
 <span id="resume-reason" class="muted">Open a matching stopped run to resume.</span>
 </div>
+<div class="controls"><button id="push-approved">Push Approved Commits</button>
+<span id="push-reason" class="muted"></span></div>
+<details id="local-project"><summary>Advanced / Local Project</summary>
+<div class="field">
+<label id="project-label">Project folder</label>
+<div class="field-line">
+<div id="project-path" class="selected-path" tabindex="0" role="textbox" aria-readonly="true" aria-labelledby="project-label">No project selected</div>
+<button id="browse-project" aria-label="Browse project folder">Browse</button>
+</div>
+</div>
+</details>
 <div id="paths">
 </div>
 <div id="preflight" class="notice muted">
@@ -198,7 +225,7 @@ let refreshing = null;
 let evidenceRoot = null;
 let renderKey = null;
 const expanded = new Set();
-const controls = ['browse-project', 'browse-plan', 'open-run', 'start', 'resume', 'attempts'];
+const controls = ['github-repo', 'connect-github', 'list-github', 'github-repositories', 'github-branch', 'select-branch', 'new-branch', 'fetch-github', 'branch-name', 'branch-base', 'branch-base-confirm', 'create-branch', 'cancel-branch', 'push-approved', 'browse-project', 'browse-plan', 'open-run', 'start', 'resume', 'attempts'];
 function detail(title, text, key) {
   const box = el('details');
   box.open = expanded.has(key);
@@ -217,6 +244,14 @@ function updateControls() {
   const c = latest?.controller || {};
   const locked = busy || !ready || c.active !== false || c.uncertain;
   controls.forEach(id => { document.getElementById(id).disabled = locked; });
+  ['github-branch', 'select-branch', 'new-branch', 'fetch-github', 'branch-base', 'branch-base-confirm', 'create-branch'].forEach(id => {
+    document.getElementById(id).disabled = locked || !c.repository || c.preflight?.clean !== true;
+  });
+  const base = document.getElementById('branch-base').value;
+  document.getElementById('branch-base-confirm-label').hidden = !base || base === 'main';
+  document.getElementById('create-branch').disabled ||= !base || (base !== 'main' && !document.getElementById('branch-base-confirm').checked);
+  document.getElementById('push-approved').disabled = locked || !c.push?.eligible;
+  document.getElementById('push-reason').textContent = c.push?.reason || 'Select a managed repository to publish approved local checkpoints.';
   const validAttempts = validateAttempts();
   document.getElementById('start').disabled = locked || !c.start_ready || !validAttempts;
   document.getElementById('resume').disabled = locked || !c.resume_ready || !validAttempts;
@@ -283,7 +318,31 @@ function render(data) {
     const field = document.getElementById(id);
     if (field.textContent !== value) field.textContent = value;
   });
-  document.getElementById('selected-project').textContent = c.repo || 'No project selected';
+  document.getElementById('selected-project').textContent = c.repository || c.repo || 'No project selected';
+  const connection = document.getElementById('github-state');
+  connection.textContent = c.repository ? c.repository + ' | GitHub origin verified locally | Branch: ' + (c.preflight?.branch || 'Detached HEAD') + ' | ' + (c.preflight?.clean === true ? 'Clean' : 'Changes or unavailable status') + (c.github?.error ? ' | ' + c.github.error : '') : 'No GitHub repository selected. Enter OWNER/REPO or a GitHub URL; GitHub CLI is optional.';
+  const branches = document.getElementById('github-branch');
+  const bases = document.getElementById('branch-base');
+  const remoteBases = [...new Set((c.github?.remote || []).filter(name => name.startsWith('origin/') && name !== 'origin/HEAD').map(name => name.slice(7)))];
+  const baseSignature = JSON.stringify([c.repository, remoteBases]);
+  if (bases.datasetSignature !== baseSignature) {
+    bases.replaceChildren();
+    remoteBases.forEach(name => { const option = el('option', 'origin/' + name); option.value = name; bases.append(option); });
+    bases.value = remoteBases.includes('main') ? 'main' : remoteBases.includes('master') ? 'master' : remoteBases[0] || '';
+    bases.datasetSignature = baseSignature;
+    document.getElementById('branch-base-confirm').checked = false;
+    document.getElementById('branch-form').hidden = true;
+  }
+  updateControls();
+  const names = [...new Set([...(c.github?.local || []), ...(c.github?.remote || []).filter(name => name.startsWith('origin/') && name !== 'origin/HEAD').map(name => name.slice(7))])].filter(name => !['main', 'master'].includes(name.toLowerCase()));
+  const signature = JSON.stringify([c.repository, c.preflight?.branch, names]);
+  if (branches.datasetSignature !== signature) {
+    branches.replaceChildren();
+    const placeholder = el('option', 'Choose a feature branch'); placeholder.value = ''; branches.append(placeholder);
+    names.forEach(name => { const option = el('option', name); option.value = name; branches.append(option); });
+    branches.value = names.includes(c.preflight?.branch) ? c.preflight.branch : '';
+    branches.datasetSignature = signature;
+  }
   const git = c.preflight || {};
   if (c.repo) paths.append(el('div', 'Branch: ' + (git.branch || 'Unavailable'), 'path muted'));
   document.getElementById('run-folder').textContent = c.logs ? 'Run folder: ' + c.logs : '';
@@ -480,6 +539,39 @@ async function showEvidence(name) {
   }
 }
 
+
+async function workspaceAction(method, args, button) {
+  if (busy || !ready || document.getElementById(button).disabled) return;
+  busy = true; updateControls();
+  try {
+    if (refreshing) await refreshing;
+    const result = await window.pywebview.api[method](...args);
+    if (method === 'github_repositories') {
+      const list = document.getElementById('github-repositories'); list.replaceChildren();
+      const placeholder = el('option', 'Choose repository'); placeholder.value = ''; list.append(placeholder);
+      (result.repositories || []).forEach(name => { const option = el('option', name); option.value = name; list.append(option); });
+      list.hidden = !result.available;
+    }
+    if (result.ok && method === 'create_github_branch') document.getElementById('branch-form').hidden = true;
+    message(result.error || result.message || (result.ok ? (method === 'push_approved_commits' ? 'Approved checkpoints remotely published. No merge to main.' : 'Selection updated. No work launched.') : 'Action failed.'), !result.ok);
+  } catch (error) { message('Workspace action failed: ' + error, true); }
+  finally { busy = false; updateControls(); await refresh(false); }
+}
+document.getElementById('connect-github').onclick = () => workspaceAction('connect_github', [document.getElementById('github-repo').value.trim()], 'connect-github');
+document.getElementById('list-github').onclick = () => workspaceAction('github_repositories', [], 'list-github');
+document.getElementById('github-repositories').onchange = () => {
+  const value = document.getElementById('github-repositories').value;
+  if (value) { document.getElementById('github-repo').value = value; return workspaceAction('connect_github', [value], 'connect-github'); }
+};
+document.getElementById('select-branch').onclick = () => workspaceAction('checkout_github_branch', [latest?.controller?.repository, document.getElementById('github-branch').value], 'select-branch');
+document.getElementById('fetch-github').onclick = () => workspaceAction('fetch_github', [latest?.controller?.repository], 'fetch-github');
+document.getElementById('new-branch').onclick = () => { if (!document.getElementById('new-branch').disabled) { document.getElementById('branch-base-confirm').checked = false; document.getElementById('branch-form').hidden = false; updateControls(); document.getElementById('branch-name').focus(); } };
+document.getElementById('cancel-branch').onclick = () => { document.getElementById('branch-form').hidden = true; document.getElementById('branch-name').value = ''; };
+document.getElementById('branch-base').onchange = () => { document.getElementById('branch-base-confirm').checked = false; updateControls(); };
+document.getElementById('branch-base-confirm').onchange = updateControls;
+document.getElementById('create-branch').onclick = () => workspaceAction('create_github_branch', [latest?.controller?.repository, document.getElementById('branch-name').value.trim(), document.getElementById('branch-base').value, document.getElementById('branch-base-confirm').checked === true], 'create-branch');
+document.getElementById('push-approved').onclick = () => workspaceAction('push_approved_commits', [], 'push-approved');
+
 document.getElementById('refresh').onclick = refresh;
 document.getElementById('attempts').oninput = updateControls;
 ['overview', 'tasks', 'logs'].forEach(name => { document.getElementById('nav-' + name).onclick = () => navigate(name); });
@@ -566,30 +658,43 @@ class Bridge:
     def select_repo(self, path=None):
         return self._select("repo", path)
 
+    def _github(self, action, *args, **kwargs):
+        try:
+            result = self._controller.github(action, *args, **kwargs)
+            self._selection_error = result.get("error")
+            return result
+        except Exception:
+            self._selection_error = "Workspace operation failed. Check Git availability and repository access, then retry."
+            return {"ok": False, "error": self._selection_error}
+
     def connect_github(self, repository):
         with self._lock:
-            return self._controller.github("connect", repository)
+            return self._github("connect", repository)
 
     def github_repositories(self):
         with self._lock:
-            return self._controller.github("list_repositories")
+            return self._github("list_repositories")
 
     def github_branches(self, repository):
         with self._lock:
-            return self._controller.github("branches", repository)
+            return self._github("branches", repository)
 
     def fetch_github(self, repository):
         with self._lock:
-            return self._controller.github("fetch", repository)
+            return self._github("fetch", repository)
 
     def create_github_branch(self, repository, name, base="main", confirmed_base=False):
         with self._lock:
-            return self._controller.github("create_branch", repository, name=name,
+            return self._github("create_branch", repository, name=name,
                                            base=base, confirmed_base=confirmed_base)
 
     def checkout_github_branch(self, repository, name):
         with self._lock:
-            return self._controller.github("checkout_branch", repository, name=name)
+            return self._github("checkout_branch", repository, name=name)
+
+    def push_approved_commits(self):
+        with self._lock:
+            return self._github("push_approved", getattr(self._controller, "repository", None))
 
     def select_plan(self, path=None):
         return self._select("plan", path)
@@ -641,6 +746,14 @@ class Bridge:
                     and not status["preflight"].get("errors")
                     and not status["preflight"].get("resume_error"))
                 status["selection_error"] = self._selection_error
+                repository = getattr(self._controller, "repository", None)
+                status["repository"] = repository
+                if repository:
+                    status["github"] = self._controller.github("branches", repository)
+                    push = self._controller.github("push_eligibility", repository)
+                    status["push"] = {"eligible": push.get("eligible", False), "reason": push.get("reason") or push.get("error")}
+                else:
+                    status["push"] = {"eligible": False, "reason": "Connect a managed GitHub repository with approved local checkpoints to publish."}
                 return status
             except Exception as exc:
                 return {"active": None, "uncertain": True, "exit_code": None,
@@ -661,11 +774,12 @@ class Bridge:
                     raise ValueError("Attempts must be an integer between 1 and 10.")
                 paths = self._controller.selected_paths()
                 branch = self._controller.preflight()["branch"]
-                message = (f"{action.upper()} the local runner?\nRepository: {paths['repo']}"
+                message = (f"{action.upper()} the local runner?\nRepository: {getattr(self._controller, 'repository', None) or paths['repo']}"
                            f"\nBranch: {branch or 'Unknown (launch will be blocked)'}"
                            f"\nPlan: {paths['plan']}\nSelected logs: {paths['logs']}"
                            f"\nAttempts: {attempts}\nThe runner may modify and commit project files."
                            "\nCheckpoints remain local. No automatic push, merge, force-push or branch creation."
+                           "\nNO automatic main merge. Publication requires Push Approved Commits."
                            "\nLocal Codex CLI authentication is required."
                            "\nClosing the window leaves the runner alive in the background.")
                 if self._dialogs is None:

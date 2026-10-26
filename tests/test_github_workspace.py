@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -60,6 +61,190 @@ class WorkspaceTests(unittest.TestCase):
         with self.assertRaises(WorkspaceError) as caught:
             fn()
         self.assertEqual(caught.exception.code, code)
+
+    def checkpoint(self, repo, filename="approved.txt"):
+        parent = self.git(repo, "rev-parse", "HEAD")
+        (repo / filename).write_text("approved change", encoding="utf-8")
+        self.git(repo, "config", "user.name", "Test")
+        self.git(repo, "config", "user.email", "test@example.invalid")
+        self.git(repo, "add", "--", filename)
+        patch_text = subprocess.run(["git", "diff", "--cached", "--binary", "--no-ext-diff"], cwd=repo,
+                                    capture_output=True, text=True, encoding="utf-8", check=True).stdout
+        self.git(repo, "commit", "-m", "approved checkpoint")
+        commit = self.git(repo, "rev-parse", "HEAD")
+        return {commit: {"commit": commit, "base_head": parent,
+                         "diff_sha256": hashlib.sha256(patch_text.encode()).hexdigest(),
+                         "review": {"decision": "APPROVED", "issues": []}}}
+
+    def test_push_new_branch_and_non_force_explicit_destination(self):
+        repo = self.connect()
+        self.manager.create_branch("owner/repo", "feature/publish")
+        approved = self.checkpoint(repo)
+        self.git(repo, "config", "push.followTags", "true")
+        self.git(repo, "config", "remote.origin.mirror", "true")
+        self.git(repo, "tag", "-a", "local-only", "-m", "must remain local")
+        self.assertTrue(self.manager.push_eligibility("owner/repo", approved)["eligible"])
+        result = self.manager.push_approved("owner/repo", approved)
+        self.assertTrue(result["published"])
+        self.assertEqual(self.git(self.remote, "rev-parse", "feature/publish"), next(iter(approved)))
+        pushes = [argv for argv in self.calls if "push" in argv]
+        self.assertEqual(pushes, [["git", "-c", "core.hooksPath=" + os.devnull,
+                                  "-c", "push.followTags=false", "-c", "push.recurseSubmodules=no",
+                                  "-c", "remote.origin.mirror=false", "-c", "push.gpgSign=false",
+                                  "push", "origin", "HEAD:refs/heads/feature/publish"]])
+        self.assertEqual(self.git(self.remote, "for-each-ref", "refs/tags/"), "")
+        self.assertEqual(self.git(self.remote, "rev-parse", "main"), self.git(self.seed, "rev-parse", "main"))
+        self.assert_error("approval", lambda: self.manager.push_eligibility("owner/repo", approved))
+
+    def test_push_blocks_dirty_active_main_origin_unapproved_and_changed_bytes(self):
+        repo = self.connect()
+        self.assert_error("invalid_branch", lambda: self.manager.push_eligibility("owner/repo", {}))
+        self.manager.create_branch("owner/repo", "feature/publish")
+        approved = self.checkpoint(repo)
+        self.assert_error("approval", lambda: self.manager.push_approved("owner/repo", {}))
+        record = next(iter(approved.values()))
+        original = record["diff_sha256"]
+        record["diff_sha256"] = "0" * 64
+        self.assert_error("approval", lambda: self.manager.push_approved("owner/repo", approved))
+        record["diff_sha256"] = original
+        (repo / "dirty.txt").write_text("dirty")
+        self.assert_error("dirty", lambda: self.manager.push_approved("owner/repo", approved))
+        self.git(repo, "add", "dirty.txt")
+        self.assert_error("dirty", lambda: self.manager.push_approved("owner/repo", approved))
+        self.git(repo, "reset", "--", "dirty.txt")
+        (repo / "dirty.txt").unlink()
+        self.manager.active_check = lambda path: None
+        self.assert_error("active_job", lambda: self.manager.push_approved("owner/repo", approved))
+        self.manager.active_check = None
+        self.git(repo, "remote", "set-url", "--push", "origin", "https://github.com/other/repo.git")
+        self.assert_error("origin_mismatch", lambda: self.manager.push_approved("owner/repo", approved))
+        self.assertFalse(any("push" in argv for argv in self.calls))
+
+    def test_push_rechecks_remote_and_rejects_divergence(self):
+        repo = self.connect()
+        self.manager.checkout_branch("owner/repo", "feature/existing")
+        approved = self.checkpoint(repo)
+        self.git(self.seed, "switch", "feature/existing")
+        (self.seed / "remote.txt").write_text("remote change")
+        self.git(self.seed, "add", ".")
+        self.git(self.seed, "commit", "-m", "remote change")
+        self.git(self.seed, "push", str(self.remote), "feature/existing")
+        self.assert_error("non_fast_forward", lambda: self.manager.push_approved("owner/repo", approved))
+        self.assertFalse(any("push" in argv for argv in self.calls))
+        with patch.object(self.manager, "run_command", return_value=subprocess.CompletedProcess([], 1, "", "[rejected] non-fast-forward SECRET")):
+            with self.assertRaises(WorkspaceError) as caught:
+                self.manager._git(repo, "push", "origin", "HEAD:refs/heads/feature/existing")
+            self.assertEqual(caught.exception.code, "non_fast_forward")
+            self.assertNotIn("SECRET", str(caught.exception))
+
+    def test_push_rejects_sensitive_and_generated_checkpoint_names(self):
+        for filename in (".env.production", "credentials.json", "cache.pyc"):
+            repo = self.connect()
+            branch = "feature/" + filename.replace(".", "x")
+            self.manager.create_branch("owner/repo", branch)
+            approved = self.checkpoint(repo, filename)
+            self.assert_error("sensitive", lambda: self.manager.push_approved("owner/repo", approved))
+        self.assertFalse(any("push" in argv for argv in self.calls))
+
+    def test_controller_push_eligibility_uses_durable_approval_and_reopens_identity(self):
+        from unittest.mock import Mock
+        controller = DesktopController(self.manager.runs_dir)
+        self.manager.active_check = controller.checkout_busy
+        controller._workspace_manager = lambda: self.manager
+        bridge = Bridge(controller=controller, dialogs=Mock())
+        self.assertTrue(bridge.connect_github("owner/repo")["ok"])
+        self.assertTrue(bridge.create_github_branch("owner/repo", "feature/checkpoint")["ok"])
+        approved = self.checkpoint(controller.repo)
+        logs = controller.runs_dir / "run-fixture"
+        logs.mkdir(parents=True)
+        state = {"repo": str(controller.repo), "status": "completed", "history": list(approved.values())}
+        (logs / "state.json").write_text(json.dumps(state))
+        plan = self.root / "task.md"
+        plan.write_text("task")
+        (logs / "desktop-run.json").write_text(json.dumps({"repo": str(controller.repo), "plan": str(plan), "status": "stopped"}))
+        self.assertTrue(bridge.job_status()["push"]["eligible"])
+        recovered = DesktopController(controller.runs_dir)
+        recovered._workspace_manager = lambda: self.manager
+        self.assertTrue(recovered.reopen(logs)["ok"])
+        self.assertEqual(recovered.repository, "owner/repo")
+        self.assertTrue(bridge.push_approved_commits()["published"])
+        self.assertFalse(bridge.job_status()["push"]["eligible"])
+        legacy = self.root / "old-logs"
+        legacy.mkdir()
+        self.assertTrue(recovered.reopen(legacy)["ok"])
+        self.assertIsNone(recovered.repository)
+
+    def test_bridge_managed_selection_confirmation_start_and_resume_identity(self):
+        from unittest.mock import Mock
+        controller = DesktopController(self.root / "runs")
+        self.manager.runs_dir = controller.runs_dir
+        self.manager.active_check = controller.checkout_busy
+        controller._workspace_manager = lambda: self.manager
+        dialogs = Mock()
+        bridge = Bridge(controller=controller, dialogs=dialogs)
+        self.assertFalse(bridge.github_repositories()["available"])
+        with patch("auto_coding.desktop_control.Popen") as popen:
+            self.assertTrue(bridge.connect_github("https://github.com/Owner/Repo.git")["ok"])
+            self.assertTrue(bridge.checkout_github_branch("owner/repo", "feature/existing")["ok"])
+            self.assertTrue(bridge.create_github_branch("owner/repo", "feature/desktop")["ok"])
+            self.assertFalse(bridge.checkout_github_branch("other/repo", "feature/existing")["ok"])
+            repo = controller.repo
+            (repo / "dirty").write_text("dirty")
+            self.assertFalse(bridge.checkout_github_branch("owner/repo", "feature/existing")["ok"])
+            (repo / "dirty").unlink()
+            plan = self.root / "task.md"
+            plan.write_text("Implement one task")
+            self.assertTrue(bridge.select_plan(str(plan))["ok"])
+            popen.assert_not_called()
+            dialogs.confirm.return_value = False
+            self.assertTrue(bridge.start(4)["cancelled"])
+            popen.assert_not_called()
+            dialogs.confirm.return_value = True
+            popen.return_value = Mock(pid=424242)
+            popen.return_value.poll.return_value = None
+            self.assertTrue(bridge.start(4)["ok"])
+            argv = popen.call_args.args[0]
+            self.assertEqual(argv[argv.index("--repo") + 1], str(repo))
+            self.assertEqual(argv[-1], str(plan))
+            self.assertEqual(argv[argv.index("--attempts") + 1], "4")
+            confirmation = dialogs.confirm.call_args.args[0]
+            for text in ("owner/repo", "feature/desktop", str(plan), "Attempts: 4", "NO automatic main merge"):
+                self.assertIn(text, confirmation)
+            self.assertFalse(bridge.create_github_branch("owner/repo", "feature/blocked")["ok"])
+            self.assertFalse(bridge.push_approved_commits()["ok"])
+
+    def test_master_only_remote_confirmed_base_reaches_managed_start(self):
+        from unittest.mock import Mock
+        self.git(self.remote, "branch", "-m", "main", "master")
+        self.git(self.remote, "branch", "-D", "feature/existing")
+        controller = DesktopController(self.manager.runs_dir)
+        self.manager.active_check = controller.checkout_busy
+        controller._workspace_manager = lambda: self.manager
+        dialogs = Mock()
+        dialogs.confirm.return_value = True
+        bridge = Bridge(controller=controller, dialogs=dialogs)
+        with patch("auto_coding.desktop_control.Popen") as popen:
+            self.assertTrue(bridge.connect_github("https://github.com/Owner/Repo.git")["ok"])
+            status = bridge.job_status()
+            self.assertEqual(status["github"]["remote"], ["origin/HEAD", "origin/master"])
+            self.assertFalse(status["start_ready"])
+            rejected = bridge.create_github_branch("owner/repo", "feature/master-base", "master", False)
+            self.assertEqual(rejected["code"], "confirmation")
+            self.assertEqual(self.git(controller.repo, "branch", "--show-current"), "master")
+            self.assertTrue(bridge.create_github_branch("owner/repo", "feature/master-base", "master", True)["ok"])
+            self.assertEqual(self.git(controller.repo, "rev-parse", "HEAD"), self.git(self.remote, "rev-parse", "master"))
+            plan = self.root / "master-plan.md"
+            plan.write_text("Implement one task", encoding="utf-8")
+            self.assertTrue(bridge.select_plan(str(plan))["ok"])
+            self.assertTrue(bridge.job_status()["start_ready"])
+            popen.assert_not_called()
+            popen.return_value = Mock(pid=424242)
+            popen.return_value.poll.return_value = None
+            self.assertTrue(bridge.start(2)["ok"])
+            argv = popen.call_args.args[0]
+            self.assertEqual(argv[argv.index("--repo") + 1], str(controller.repo))
+            self.assertEqual(argv[-1], str(plan))
+            self.assertIn("Branch: feature/master-base", dialogs.confirm.call_args.args[0])
 
     def test_clone_reopen_and_safe_metadata(self):
         repo = self.connect()

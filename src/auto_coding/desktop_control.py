@@ -25,6 +25,7 @@ class DesktopController:
     def __init__(self, runs_dir: str | Path | None = None):
         self.runs_dir = Path(runs_dir or (storage_root() / "runs")).expanduser().resolve()
         self.repo: Path | None = None
+        self.repository = None
         self.plan: Path | None = None
         self.logs: Path | None = None
         self.process = None
@@ -73,21 +74,44 @@ class DesktopController:
 
     def github(self, action, repository=None, **kwargs):
         try:
-            if action not in {"list_repositories", "connect", "branches", "fetch", "create_branch", "checkout_branch"}:
+            if action not in {"list_repositories", "connect", "branches", "fetch", "create_branch", "checkout_branch", "push_eligibility", "push_approved"}:
                 raise ValueError("Unsupported workspace operation.")
             manager = self._workspace_manager()
             if action == "list_repositories":
                 return {"ok": True, **manager.list_repositories()}
-            if action == "connect":
+            if action not in {"branches", "push_eligibility"}:
                 status = self.job_status()
                 if status["active"] is not False or status["uncertain"]:
                     raise ValueError("Cannot change projects while a job is active or uncertain.")
+            if action != "connect" and repository != self.repository:
+                raise ValueError("Connect this repository before changing its branches or publishing.")
+            if action.startswith("push_"):
+                kwargs["approved"] = self._approved_checkpoints()
             result = getattr(manager, action)(repository, **kwargs)
             if action == "connect":
                 self.repo = Path(result["path"])
+                self.repository = result["repository"]
             return {"ok": True, **result}
         except (OSError, ValueError) as exc:
             return {"ok": False, "error": str(exc), "code": getattr(exc, "code", "workspace")}
+
+    def _approved_checkpoints(self):
+        approved = {}
+        paths = list(self.runs_dir.glob("run-*/state.json"))
+        if self.logs and self.logs / "state.json" not in paths:
+            paths.append(self.logs / "state.json")
+        for path in paths:
+            try:
+                if path.is_symlink():
+                    continue
+                state = json.loads(path.read_text(encoding="utf-8"))
+                if state.get("repo") == str(self.repo) and state.get("status") in {"completed", "stopped"} and not state.get("pending_checkpoint"):
+                    for record in state.get("history", []):
+                        if isinstance(record, dict) and isinstance(record.get("commit"), str):
+                            approved[record["commit"]] = record
+            except (OSError, ValueError, TypeError, AttributeError):
+                continue
+        return approved
 
     def select_repo(self, path: str | Path) -> dict:
         try:
@@ -98,10 +122,12 @@ class DesktopController:
             if top.returncode or Path(top.stdout.strip()).resolve() != repo:
                 raise ValueError("Select the Git repository root, not a subdirectory.")
             self.repo = repo
+            self.repository = None
             self.error = None
             return {"ok": True, "path": str(repo), "error": None}
         except (OSError, ValueError) as exc:
             self.repo = None
+            self.repository = None
             self.error = f"Repository validation failed: {exc}"
             return {"ok": False, "path": None, "error": self.error}
 
@@ -466,6 +492,7 @@ class DesktopController:
     def reopen(self, logs: str | Path) -> dict:
         result = self.select_logs(logs)
         if not result["ok"]: return result
+        self.repository = None
         try:
             value = self._read_metadata()
             if self._metadata_error:
@@ -477,6 +504,16 @@ class DesktopController:
             self.exit_code = next((item["exit_code"] for item in reversed(self.process_history)
                                    if type(item.get("exit_code")) is int), None)
             self.repo, self.plan = Path(value["repo"]), Path(value["plan"])
+            if managed_lock(self.repo):
+                try:
+                    identity = json.loads(self.repo.with_suffix(".json").read_text(encoding="utf-8"))["repository"]
+                    manager = self._workspace_manager()
+                    _, _, managed_repo, metadata, _ = manager._paths(identity)
+                    if managed_repo == self.repo:
+                        manager._verify(identity, self.repo, metadata)
+                        self.repository = identity
+                except (OSError, ValueError, KeyError, TypeError):
+                    self.repository = None
             in_flight = value.get("status") in {"launching", "running"}
             pid = value.get("pid")
             # Never monitor a historical PID from a stopped run: it may have

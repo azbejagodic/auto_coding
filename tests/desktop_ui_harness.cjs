@@ -29,6 +29,15 @@ let failStatus = false;
 let evidenceReads = 0;
 let snapshotReads = 0;
 const api = {
+  github_repositories: async () => ({ok:true, available:false, repositories:[], message:'Enter OWNER/REPO manually; Git authentication remains available.'}),
+  connect_github: async repository => { calls.push(['connect_github', repository]);
+    if (repository === 'bad/repo') return {ok:false, error:'GitHub authentication failed <img onerror=bad()>; authenticate Git and retry.'};
+    Object.assign(data.controller, {repository:'owner/repo', repo:'managed/checkout', github:{local:['main', 'feature/existing'], remote:['origin/main', 'origin/master', 'origin/feature/remote']}, push:{eligible:false, reason:'No approved checkpoints'}});
+    data.controller.preflight = {branch:'main', clean:true, errors:['Runs are blocked on main/master.']}; return {ok:true}; },
+  checkout_github_branch: async (repository, name) => { calls.push(['checkout_github_branch', repository, name]); data.controller.preflight = {branch:name, clean:true, errors:[]}; return {ok:true}; },
+  create_github_branch: async (repository, name, base, confirmed) => { calls.push(['create_github_branch', repository, name, base, confirmed]); data.controller.github.local.push(name); data.controller.preflight.branch = name; return {ok:true}; },
+  fetch_github: async repository => { calls.push(['fetch_github', repository]); return {ok:true}; },
+  push_approved_commits: async () => { calls.push(['push_approved_commits']); return {ok:false, error:'Remote branch changed. Fetch and review; no force push.'}; },
   snapshot: async () => { snapshotReads++; if (failStatus) throw Error('status unavailable'); return structuredClone(data); },
   select_repo: async (...args) => { calls.push(['select_repo', ...args]); if (pendingSelection) await pendingSelection;
     data.controller.repo = 'C:\\project with spaces'; return {ok:true}; },
@@ -56,6 +65,57 @@ const contents = () => get('app').textContent;
   assert(contents().includes('Select a project and plan, then Start.'));
   assert(!contents().includes('Ready for your first run'));
   assert.equal(get('run-setup').hidden, false);
+  const initial = structuredClone(data);
+  await click('list-github');
+  assert(get('message').textContent.includes('Enter OWNER/REPO manually'));
+  assert(get('github-repositories').hidden);
+  get('github-repo').value = 'bad/repo'; await click('connect-github');
+  assert(get('message').textContent.includes('<img onerror=bad()>'));
+  get('github-repo').value = 'https:' + '//github.com/Owner/Repo.git';
+  await click('connect-github');
+  assert.deepEqual(calls.at(-1), ['connect_github', 'https:' + '//github.com/Owner/Repo.git']);
+  assert(get('selected-project').textContent.includes('owner/repo'));
+  assert(get('github-state').textContent.includes('main | Clean'));
+  assert(get('start').disabled && get('push-approved').disabled);
+  get('github-branch').value = 'feature/remote'; await click('select-branch');
+  assert.deepEqual(calls.at(-1), ['checkout_github_branch', 'owner/repo', 'feature/remote']);
+  await click('new-branch'); get('branch-name').value = 'feature/cancelled';
+  const beforeCancel = calls.length; await click('cancel-branch');
+  assert.equal(calls.length, beforeCancel);
+  assert(get('branch-form').hidden);
+  await click('new-branch'); get('branch-name').value = 'feature/new'; await click('create-branch');
+  assert.deepEqual(calls.at(-1), ['create_github_branch', 'owner/repo', 'feature/new', 'main', false]);
+  assert(get('branch-form').hidden);
+  // A master-only remote still has a dashboard route to a feature branch.
+  data.controller.github.remote = ['origin/master'];
+  data.controller.github.local = ['master'];
+  data.controller.preflight.branch = 'master'; await poll();
+  await click('new-branch'); get('branch-name').value = 'feature/from-master';
+  assert.equal(get('branch-base').value, 'master');
+  assert(!get('branch-base-confirm-label').hidden);
+  assert(get('create-branch').disabled);
+  const beforeUnconfirmed = calls.length; await click('create-branch');
+  assert.equal(calls.length, beforeUnconfirmed);
+  get('branch-base-confirm').checked = true; get('branch-base-confirm').onchange();
+  assert(!get('create-branch').disabled);
+  get('branch-base').onchange();
+  assert(get('create-branch').disabled, 'Changing base resets explicit confirmation');
+  get('branch-base-confirm').checked = true; get('branch-base-confirm').onchange();
+  await click('create-branch');
+  assert.deepEqual(calls.at(-1), ['create_github_branch', 'owner/repo', 'feature/from-master', 'master', true]);
+  await click('new-branch');
+  assert(get('create-branch').disabled, 'Every alternate-base creation needs confirmation');
+  await click('cancel-branch');
+  assert(!calls.some(call => ['start', 'resume'].includes(call[0])));
+  data.controller.preflight.clean = false; await poll();
+  assert(get('new-branch').disabled && get('select-branch').disabled && get('push-approved').disabled);
+  data.controller.preflight.clean = true; data.controller.active = true; await poll();
+  assert(get('connect-github').disabled && get('select-branch').disabled);
+  data.controller.active = false; data.controller.push = {eligible:true, reason:'Approved checkpoints'}; await poll();
+  await click('push-approved');
+  assert.deepEqual(calls.at(-1), ['push_approved_commits']);
+  assert(get('message').textContent.includes('Remote branch changed'));
+  data = initial; calls.length = 0; await poll();
   await click('nav-tasks');
   assert(get('run-setup').hidden);
   assert(contents().includes('No task history yet.'));

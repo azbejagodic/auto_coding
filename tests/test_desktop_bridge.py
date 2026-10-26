@@ -180,7 +180,7 @@ class DesktopBridgeTests(unittest.TestCase):
                          {"select_repo", "select_plan", "open_run", "selected_paths",
                           "job_status", "start", "resume", "snapshot", "evidence",
                           "connect_github", "github_repositories", "github_branches",
-                          "create_github_branch", "checkout_github_branch", "fetch_github"})
+                          "create_github_branch", "checkout_github_branch", "fetch_github", "push_approved_commits"})
 
     @patch("auto_coding.desktop_control.Popen")
     def test_real_controller_invalid_selections_and_launch_failure(self, popen):

@@ -1,6 +1,6 @@
 # Auto-Coding Simple Backend V2.1 — generated-file staging fix
 
-This release is the existing **opt-in, local-only** simple runner with a targeted fix for the Windows `__pycache__/run_summary.cpython-313.pyc` staging stop. It does not change your original Auto-Coding controller and does not push to GitHub.
+This release is the existing **opt-in, local-only** simple runner with a targeted fix for the Windows `__pycache__/run_summary.cpython-313.pyc` staging stop. The runner never pushes automatically. The dashboard supports optional explicit publication of approved feature checkpoints.
 
 ## What changed
 
@@ -53,8 +53,8 @@ py -B -m auto_coding.desktop_app --logs "C:\Users\you\AutoCoding-Runs\run-<id>"
 
 Local Codex CLI authentication is required before starting. The runner inherits the currently configured CLI model and reasoning settings; the dashboard has no model override controls. Git and Codex CLI must be available to the launched Python process.
 
-1. In the target project's Git client, choose an existing feature branch, or create one yourself (for example `git switch -c feature/my-task` in that project). Commit or discard outstanding changes before START. The dashboard never creates branches and blocks main, master and detached HEAD.
-2. Click **Browse** beside Project folder and select that project's Git root. Click **Browse** beside Task plan and select the intended TXT, MD or JSON plan. TXT/MD represents one task; JSON can include ordered tasks and explicit test command argv arrays (see `examples`). Keep the plan outside the target checkout, or commit it before starting. Browsing, opening and cancelling selection never launch work. Full paths, branch, working tree and validation errors appear in the dashboard.
+1. Enter a GitHub **OWNER/REPO** or GitHub URL and click **Connect repository**. The app creates or reopens its managed checkout. **My repositories** optionally lists repositories when `gh` is authenticated; manual entry works without `gh`. Choose a feature branch and click **Select branch**, or use **New Branch**, enter its name, and click **Create branch**. Choose the remote base (normally `origin/main`); an alternate base such as `origin/master` requires the explicit confirmation checkbox. New branches start from that freshly fetched base. Commit or discard outstanding changes before branch changes or START. Main, master and detached HEAD cannot run tasks.
+2. For existing local projects, **Advanced / Local Project** retains Project folder **Browse**. Otherwise the managed checkout is selected automatically. Click **Browse** beside Task plan and select the intended TXT, MD or JSON plan. TXT/MD represents one task; JSON can include ordered tasks and explicit test command argv arrays (see `examples`). Keep the plan outside the target checkout, or commit it before starting. Browsing, opening and cancelling selection never launch work. Full paths, branch, working tree and validation errors appear in the dashboard.
 3. Enter a whole-number total attempt limit from **1 through 10** (default **3**). Invalid or empty entries explain why START and RESUME are disabled. Click **START** and review the native confirmation containing the repo, branch, plan and local-only policy. Cancelling does not launch anything. Approved task checkpoints are local commits. There is no automatic push, merge or force-push. Overview keeps setup compact, with preflight errors visible and safeguards in one expandable **Details** section.
 4. **Overview** shows recorded state, current task, task counts, child activity/errors and recent events. **Tasks** shows each attempt, test results and Codex B verdicts, with original feedback and summaries in expandable details. **Logs** shows timestamped actors/outcomes and evidence links. Its raw file list also supports legacy runs with no event timeline. Files are loaded only when selected, as text, confined to the chosen logs directory and capped at 1 MB. Missing/corrupt sources produce warnings. The UI polls every four seconds and preserves opened evidence and expanded details.
 5. New logs live in `%LOCALAPPDATA%\AutoCoding\runs\run-<id>` outside the project; the full selected log path remains accessible in **Details** after the child exits. Logs include `desktop-run.json`, `state.json`, `events.jsonl`, evidence files and `runner-output.txt` (including launch/initialization diagnostics). Historical process exits and diagnostics are in **Logs**; completed saved state takes priority over past exit warnings. A child exit code is never treated as task approval; only durable runner state supplies completion.
@@ -89,8 +89,11 @@ The existing Bridge exposes `connect_github`, `github_repositories`,
 `github_branches`, `fetch_github`, `create_github_branch`, and
 `checkout_github_branch`. Connection selects the managed project without launching
 a run. Branch creation fetches current origin/main and creates a new feature
-branch from that commit. An alternate remote base requires `confirmed_base=True`
-after the caller obtains explicit user confirmation. Existing local or fetched
+branch from that commit. The New Branch form lists remote bases and defaults to
+main when available (otherwise master or another available remote branch).
+For an alternate base, explicitly select the confirmation checkbox before Create
+branch; the bridge passes `confirmed_base=True` only with that confirmation.
+Existing local or fetched
 remote feature branches can be selected. main/master are protected.
 
 Branch changes require a clean worktree, no unresolved Git operation and no active
@@ -246,3 +249,28 @@ Process exits observed by the controller are saved in `desktop-run.json` as
 readable; absent historical exit codes are not invented. START readiness is an
 eligibility display derived from validated paths and controller preflight;
 launch-time controller checks still make the final decision.
+
+## Dashboard GitHub workflow (Feature 3)
+
+Repository and branch selection never launch Codex. START and RESUME use the same
+DesktopController as local projects, with a native confirmation showing the
+repository, branch, plan and attempts. No terminal, editor, GitHub website or
+project-folder picker is required for the managed workflow. Git authentication
+must already be configured; errors identify access or connectivity problems
+without exposing subprocess diagnostics. Branch changes and publication fail
+closed for dirty, active or uncertain checkouts.
+
+**Push Approved Commits** is optional and explains why it is disabled. It requires
+a clean named feature branch, matching fetch and push origins, no active or
+uncertain run, and approval evidence for every unpublished commit. New checkpoint
+history includes the approved parent and binary patch hash; old checkpoints
+without this evidence remain local and require review. Generated caches and
+sensitive filenames block publication. The app re-fetches and rechecks before
+using a non-force explicit `git push origin HEAD:refs/heads/<branch>` (with local
+push hooks disabled). Divergence stops with a fetch/review warning. A new remote
+feature branch may be published normally. There is no merge-to-main action.
+
+Publication reads structured checkpoint state, never raw evidence files. Existing
+raw logs remain available only through explicit evidence selection. Local commits
+are labelled local; only a successful push reports remote publication. The runner
+and its read-only Codex B blocker-review policy are otherwise unchanged.

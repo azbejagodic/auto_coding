@@ -197,7 +197,7 @@ class GitHubWorkspaceManager:
         self.active_check = active_check
         self.run_command = run_command or subprocess.run
 
-    def _command(self, argv, cwd=None, allowed=(0,)):
+    def _command(self, argv, cwd=None, allowed=(0,), *, preserve=False):
         env = os.environ.copy()
         env.update(GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="never")
         try:
@@ -221,8 +221,12 @@ class GitHubWorkspaceManager:
             code = "authentication" if any(s in diagnostic for s in ("authentication", "permission denied", "could not read username", "repository not found", "403", "401")) else "git"
             if any(s in diagnostic for s in ("resolve host", "connect to", "network", "timed out")):
                 code = "network"
-            raise WorkspaceError(code, "Git operation failed. Check authentication, connectivity and repository access.")
-        return result.stdout.strip()
+            if any(s in diagnostic for s in ("non-fast-forward", "fetch first", "[rejected]")):
+                raise WorkspaceError("non_fast_forward", "Remote branch changed. Fetch and review it before retrying; automatic merge and force push are disabled.")
+            messages = {"authentication": "GitHub access failed. Authenticate Git and check repository permissions, then retry.",
+                        "network": "Cannot reach GitHub. Check your network connection, then retry."}
+            raise WorkspaceError(code, messages.get(code, "Git operation failed. Check authentication, connectivity and repository access."))
+        return result.stdout if preserve else result.stdout.strip()
 
     def _git(self, repo, *args):
         return self._command(["git", *args], repo)
@@ -318,7 +322,7 @@ class GitHubWorkspaceManager:
             if DesktopController(root).checkout_busy(repo):
                 raise WorkspaceError("active_job", "An Auto-Coding job is active or uncertain for this checkout.")
         if not self._status(repo)["clean"]:
-            raise WorkspaceError("dirty", "Commit or discard uncommitted changes before changing branches.")
+            raise WorkspaceError("dirty", "Commit or discard uncommitted changes before changing branches or publishing.")
         for marker in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD", "rebase-merge", "rebase-apply", "sequencer", "BISECT_START", "index.lock", "HEAD.lock"):
             path = Path(self._git(repo, "rev-parse", "--git-path", marker))
             if not path.is_absolute():
@@ -376,3 +380,63 @@ class GitHubWorkspaceManager:
             return {"available": True, "repositories": [normalize_repository(item["nameWithOwner"])[0] for item in json.loads(raw)]}
         except (WorkspaceError, ValueError, TypeError, KeyError):
             return {"available": False, "repositories": [], "message": "Enter OWNER/REPO manually; Git authentication remains available."}
+
+    def _push_check(self, identity, repo, approved):
+        self._idle(repo)
+        branch = self._status(repo)["branch"]
+        self._branch(repo, branch)
+        push_origin, _ = normalize_repository(self._git(repo, "remote", "get-url", "--push", "--all", "origin"))
+        if push_origin != identity:
+            raise WorkspaceError("origin_mismatch", "Push origin does not match the selected GitHub repository.")
+        refs = self._git(repo, "for-each-ref", "--format=%(refname)", "refs/remotes/origin/").splitlines()
+        target = "refs/remotes/origin/" + branch
+        if target not in refs:
+            target = next((ref for ref in ("refs/remotes/origin/main", "refs/remotes/origin/master") if ref in refs), None)
+            if target is None:
+                raise WorkspaceError("approval", "No reviewed remote base is available. Fetch the repository before publishing.")
+            target = self._git(repo, "merge-base", "HEAD", target)
+        if self._git(repo, "merge-base", "HEAD", target) != self._git(repo, "rev-parse", target):
+            raise WorkspaceError("non_fast_forward", "Remote branch diverged. Fetch and review before publishing; no automatic merge.")
+        commits = self._git(repo, "rev-list", "--reverse", target + "..HEAD").splitlines()
+        if not commits:
+            raise WorkspaceError("approval", "No unpublished approved checkpoints on this branch.")
+        from auto_coding.simple_run import is_generated_path
+        for commit in commits:
+            record = approved.get(commit, {})
+            review = record.get("review")
+            if (not isinstance(review, dict) or review.get("decision") != "APPROVED" or review.get("issues") != []
+                    or not record.get("diff_sha256")):
+                raise WorkspaceError("approval", "Every unpublished commit needs a recorded approved checkpoint. Older or manual commits require review.")
+            parents = self._git(repo, "rev-list", "--parents", "-n", "1", commit).split()
+            if parents != [commit, record.get("base_head")]:
+                raise WorkspaceError("approval", "Checkpoint parent differs from its approval; inspect before publishing.")
+            names = self._git(repo, "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", commit).split("\0")
+            for name in filter(None, names):
+                parts = name.replace("\\", "/").lower().split("/")
+                if (is_generated_path(name) or any(p in {".git", ".ssh", ".aws"} for p in parts)
+                        or parts[-1].startswith(".env") or parts[-1] in {"credentials", "credentials.json", "id_rsa", "id_ed25519"}
+                        or parts[-1].endswith((".pem", ".key", ".p12", ".pfx"))):
+                    raise WorkspaceError("sensitive", "Generated or sensitive files block publication. Inspect the checkpoint locally.")
+            patch = self._command(["git", "show", "--format=", "--binary", "--no-ext-diff", commit], repo, preserve=True)
+            if hashlib.sha256(patch.encode("utf-8", errors="replace")).hexdigest() != record["diff_sha256"]:
+                raise WorkspaceError("approval", "Checkpoint bytes differ from the approved patch; inspect before publishing.")
+        return {"eligible": True, "branch": branch, "commits": len(commits), "reason": "Approved local checkpoints can be published. Remote state is rechecked on push."}
+
+    def push_eligibility(self, repository, approved):
+        identity, _, repo, metadata, lock = self._paths(repository)
+        with checkout_lock(lock):
+            self._verify(identity, repo, metadata)
+            return self._push_check(identity, repo, approved)
+
+    def push_approved(self, repository, approved):
+        identity, _, repo, metadata, lock = self._paths(repository)
+        with checkout_lock(lock):
+            self._verify(identity, repo, metadata)
+            self._push_check(identity, repo, approved)
+            self._git(repo, "fetch", "--prune", "--no-tags", "origin", "+refs/heads/*:refs/remotes/origin/*")
+            check = self._push_check(identity, repo, approved)
+            self._git(repo, "-c", "core.hooksPath=" + os.devnull,
+                      "-c", "push.followTags=false", "-c", "push.recurseSubmodules=no",
+                      "-c", "remote.origin.mirror=false", "-c", "push.gpgSign=false",
+                      "push", "origin", "HEAD:refs/heads/" + check["branch"])
+            return {"published": True, "branch": check["branch"], "message": "Approved checkpoints published to the feature branch. No merge to main."}
