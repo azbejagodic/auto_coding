@@ -29,6 +29,8 @@ class DesktopUITests(unittest.TestCase):
                      "nav-overview", "nav-tasks", "nav-logs"):
             self.assertEqual(parser.ids[name], "button")
         self.assertEqual(parser.ids["github-repo"], "input")
+        self.assertEqual(parser.ids["auto-push"], "input")
+        self.assertIn('id="auto-push" type="checkbox"> Automatically push approved tasks', HTML)
         self.assertEqual(parser.ids["github-branch"], "select")
         self.assertEqual(parser.ids["branch-base"], "select")
         self.assertEqual(parser.ids["branch-base-confirm"], "input")

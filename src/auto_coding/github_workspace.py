@@ -321,6 +321,9 @@ class GitHubWorkspaceManager:
         for root in (self.runs_dir, Path.home() / "AutoCoding-Runs"):
             if DesktopController(root).checkout_busy(repo):
                 raise WorkspaceError("active_job", "An Auto-Coding job is active or uncertain for this checkout.")
+        self._publication_tree(repo)
+
+    def _publication_tree(self, repo):
         if not self._status(repo)["clean"]:
             raise WorkspaceError("dirty", "Commit or discard uncommitted changes before changing branches or publishing.")
         for marker in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD", "rebase-merge", "rebase-apply", "sequencer", "BISECT_START", "index.lock", "HEAD.lock"):
@@ -381,8 +384,12 @@ class GitHubWorkspaceManager:
         except (WorkspaceError, ValueError, TypeError, KeyError):
             return {"available": False, "repositories": [], "message": "Enter OWNER/REPO manually; Git authentication remains available."}
 
-    def _push_check(self, identity, repo, approved):
-        self._idle(repo)
+    def _push_check(self, identity, repo, approved, *, runner_owned=False, allow_published=False,
+                    reconcile_only=False):
+        if not runner_owned:
+            self._idle(repo)
+        elif not reconcile_only:
+            self._publication_tree(repo)
         branch = self._status(repo)["branch"]
         self._branch(repo, branch)
         push_origin, _ = normalize_repository(self._git(repo, "remote", "get-url", "--push", "--all", "origin"))
@@ -398,6 +405,8 @@ class GitHubWorkspaceManager:
         if self._git(repo, "merge-base", "HEAD", target) != self._git(repo, "rev-parse", target):
             raise WorkspaceError("non_fast_forward", "Remote branch diverged. Fetch and review before publishing; no automatic merge.")
         commits = self._git(repo, "rev-list", "--reverse", target + "..HEAD").splitlines()
+        if not commits and allow_published:
+            commits = [self._git(repo, "rev-parse", "HEAD")]
         if not commits:
             raise WorkspaceError("approval", "No unpublished approved checkpoints on this branch.")
         from auto_coding.simple_run import is_generated_path
@@ -421,6 +430,33 @@ class GitHubWorkspaceManager:
             if hashlib.sha256(patch.encode("utf-8", errors="replace")).hexdigest() != record["diff_sha256"]:
                 raise WorkspaceError("approval", "Checkpoint bytes differ from the approved patch; inspect before publishing.")
         return {"eligible": True, "branch": branch, "commits": len(commits), "reason": "Approved local checkpoints can be published. Remote state is rechecked on push."}
+
+    def publish_checkpoint(self, repo, identity, branch, sha, approved):
+        """Synchronous publication by the coordinator owning the checkout job gate."""
+        self._branch(repo, branch)
+        if self._status(repo)["branch"] != branch or self._git(repo, "rev-parse", "HEAD") != sha:
+            raise WorkspaceError("checkpoint", "Selected branch or checkpoint changed; inspect before Retry Push.")
+        # Verify origin before making any network request. Never persist URLs or diagnostics.
+        for args in (("remote", "get-url", "--all", "origin"),
+                     ("remote", "get-url", "--push", "--all", "origin")):
+            if normalize_repository(self._git(repo, *args))[0] != identity:
+                raise WorkspaceError("origin_mismatch", "Origin differs from the selected repository.")
+        self._git(repo, "fetch", "--prune", "--no-tags", "origin", "+refs/heads/*:refs/remotes/origin/*")
+        remote = self._git(repo, "ls-remote", "--heads", "origin", "refs/heads/" + branch)
+        # A later unfinished task may have legitimate staged/unstaged changes.
+        # Observing an already published checkpoint must preserve those changes;
+        # approval/origin/lineage checks still apply, and any actual push below
+        # requires the normal clean-tree and Git-operation validation.
+        self._push_check(identity, repo, approved, runner_owned=True, allow_published=True,
+                         reconcile_only=remote.split()[:1] == [sha])
+        if remote.split()[:1] != [sha]:
+            self._git(repo, "-c", "core.hooksPath=" + os.devnull,
+                      "-c", "push.followTags=false", "-c", "push.recurseSubmodules=no",
+                      "-c", "remote.origin.mirror=false", "-c", "push.gpgSign=false",
+                      "push", "origin", sha + ":refs/heads/" + branch)
+            remote = self._git(repo, "ls-remote", "--heads", "origin", "refs/heads/" + branch)
+        if remote.split()[:1] != [sha]:
+            raise WorkspaceError("unconfirmed", "Remote checkpoint could not be confirmed. Retry Push.")
 
     def push_eligibility(self, repository, approved):
         identity, _, repo, metadata, lock = self._paths(repository)

@@ -163,6 +163,8 @@ progress{width:100%;height:12px;accent-color:#72adf9}
 </div>
 <div class="controls"><button id="push-approved">Push Approved Commits</button>
 <span id="push-reason" class="muted"></span></div>
+<label><input id="auto-push" type="checkbox"> Automatically push approved tasks</label>
+<p class="muted">Off by default for each new Start. Confirm at Start for this run. Resume keeps the run's saved setting. If publication fails, Resume is Retry Push for the same approved commit before further tasks.</p>
 <details id="local-project"><summary>Advanced / Local Project</summary>
 <div class="field">
 <label id="project-label">Project folder</label>
@@ -178,7 +180,7 @@ progress{width:100%;height:12px;accent-color:#72adf9}
 </div>
 <details id="launch-details">
 <summary>Details</summary>
-<p class="muted">Every launch requires native confirmation. START requires a clean feature branch. RESUME requires a stopped run and its original plan, repository and logs. Attempts is the total limit per task (1–10); increase it to continue an exhausted run. Checkpoints stay local; no automatic push, merge, force-push or branch creation. Model and reasoning settings come from your local Codex CLI.</p>
+<p class="muted">Every launch requires native confirmation. START requires a clean feature branch. RESUME requires a stopped run and its original plan, repository and logs. Attempts is the total limit per task (1–10); increase it to continue an exhausted run. Checkpoints stay local unless automatic push is explicitly enabled for this run. No automatic merge or force-push. Model and reasoning settings come from your local Codex CLI.</p>
 <p class="muted">Local Codex CLI authentication is required. Closing this window leaves the runner alive. Reopen its logs to inspect progress.</p>
 <pre id="preflight-details" tabindex="0" aria-label="Preflight diagnostics"></pre>
 <div id="run-folder" class="path muted"></div>
@@ -211,6 +213,7 @@ function runPresentation(data) {
   const c = data.controller || {}, state = data.state || {};
   if (c.uncertain || (c.active !== false && c.active !== true)) return {label:'Unknown child status', color:'amber'};
   if (c.active) return {label:'Running', color:'blue'};
+  if (state.publication?.outcome === 'pending') return {label:'Approved locally, push pending', color:'amber'};
   if (state.status === 'completed') return {label:'Completed', color:'green'};
   if (state.status === 'checkpointing' || state.pending_checkpoint) return {label:'Awaiting recovery', color:'amber'};
   if (state.status === 'stopped') return {label:'Stopped', color:'amber'};
@@ -247,6 +250,7 @@ function updateControls() {
   ['github-branch', 'select-branch', 'new-branch', 'fetch-github', 'branch-base', 'branch-base-confirm', 'create-branch'].forEach(id => {
     document.getElementById(id).disabled = locked || !c.repository || c.preflight?.clean !== true;
   });
+  document.getElementById('auto-push').disabled = locked;
   const base = document.getElementById('branch-base').value;
   document.getElementById('branch-base-confirm-label').hidden = !base || base === 'main';
   document.getElementById('create-branch').disabled ||= !base || (base !== 'main' && !document.getElementById('branch-base-confirm').checked);
@@ -255,6 +259,7 @@ function updateControls() {
   const validAttempts = validateAttempts();
   document.getElementById('start').disabled = locked || !c.start_ready || !validAttempts;
   document.getElementById('resume').disabled = locked || !c.resume_ready || !validAttempts;
+  document.getElementById('resume').textContent = latest?.state?.publication?.outcome === 'pending' ? 'Retry Push' : 'Resume';
   document.getElementById('refresh').disabled = busy || !ready;
 }
 function validateAttempts() {
@@ -392,6 +397,8 @@ function render(data) {
   if (data.empty) app.append(el('div', 'No run state or events found. Select a project and plan to START, or inspect available raw files in Logs.', 'empty'));
   if (c.logs && !data.exists && !data.state_error) app.append(el('div', 'Log directory is missing or unavailable.', 'warning'));
   if (state.pending_checkpoint) app.append(el('div', 'A checkpoint is pending reconciliation. No completion is inferred.', 'warning'));
+  if (state.auto_push) app.append(el('div', 'This run automatically pushes approved tasks to origin/' + state.auto_push.branch + '. Resume preserves this setting.', 'notice'));
+  if (state.publication?.outcome === 'pending') app.append(el('div', 'Approved locally, push pending. Resolve connectivity or permissions, then use Resume (Retry Push). The same SHA is retried before any further tasks; Codex is not rerun for the approved task. Remote divergence requires manual review.', 'warning'));
   (data.event_errors || []).forEach(error => app.append(el('div', error, 'warning')));
   if (page === 'overview') {
     const summary = el('div', undefined, 'grid');
@@ -503,8 +510,10 @@ async function act(method) {
   try {
     if (refreshing) await refreshing;
     const args = method === 'start' || method === 'resume' ? [Number(document.getElementById('attempts').value)] : [];
+    if (method === 'start' && document.getElementById('auto-push').checked === true) args.push(true);
     const result = await window.pywebview.api[method](...args);
     accepted = result.ok && !result.cancelled;
+    if (accepted) document.getElementById('auto-push').checked = false;
     if (args.length && accepted) navigate('overview');
     message(result.cancelled ? 'Cancelled. No work launched.' : result.error || result.warning || (result.ok ? (args.length ? 'Launch accepted. Waiting for durable runner progress.' : 'Selection updated. No work launched.') : 'Action failed.'), !result.ok && !result.cancelled);
   } catch (error) { message('Action failed: ' + error, true); }
@@ -739,7 +748,8 @@ class Bridge:
                 # This is eligibility only; the controller revalidates on launch.
                 status["resume_ready"] = bool(
                     not errors and paths["repo"] and plan_sha and state
-                    and state.get("status") == "stopped"
+                    and (state.get("status") == "stopped" or
+                         (state.get("auto_push") and state.get("status") == "checkpointing"))
                     and state.get("repo") == paths["repo"]
                     and state.get("plan_sha256") == plan_sha
                     and status["active"] is False and not status.get("uncertain")
@@ -759,27 +769,32 @@ class Bridge:
                 return {"active": None, "uncertain": True, "exit_code": None,
                         "error": str(exc), "resume_ready": False}
 
-    def _launch(self, action, attempts):
+    def _launch(self, action, attempts, auto_push=False):
         if not self._launch_lock.acquire(blocking=False):
             return {"ok": False, "error": "A launch confirmation is already in progress."}
         try:
-            return self._confirmed_launch(action, attempts)
+            return self._confirmed_launch(action, attempts, auto_push)
         finally:
             self._launch_lock.release()
 
-    def _confirmed_launch(self, action, attempts):
+    def _confirmed_launch(self, action, attempts, auto_push=False):
         with self._lock:
             try:
                 if type(attempts) is not int or not 1 <= attempts <= 10:
                     raise ValueError("Attempts must be an integer between 1 and 10.")
                 paths = self._controller.selected_paths()
+                if type(auto_push) is not bool:
+                    raise ValueError("Auto-push must be explicitly selected.")
+                if action == "resume" and self._controller.logs:
+                    auto_push = bool(read_run(self._controller.logs).get("state", {}).get("auto_push"))
                 branch = self._controller.preflight()["branch"]
                 message = (f"{action.upper()} the local runner?\nRepository: {getattr(self._controller, 'repository', None) or paths['repo']}"
                            f"\nBranch: {branch or 'Unknown (launch will be blocked)'}"
                            f"\nPlan: {paths['plan']}\nSelected logs: {paths['logs']}"
                            f"\nAttempts: {attempts}\nThe runner may modify and commit project files."
-                           "\nCheckpoints remain local. No automatic push, merge, force-push or branch creation."
-                           "\nNO automatic main merge. Publication requires Push Approved Commits."
+                           + ("\nAutomatically push approved tasks: ENABLED for this run to origin/" + str(branch)
+                            if auto_push else "\nCheckpoints remain local. No automatic push, merge, force-push or branch creation.")
+                           + "\nNO automatic main merge or force push."
                            "\nLocal Codex CLI authentication is required."
                            "\nClosing the window leaves the runner alive in the background.")
                 if self._dialogs is None:
@@ -788,7 +803,10 @@ class Bridge:
                     return {"ok": False, "cancelled": True, "error": "Launch cancelled."}
                 if self._controller.preflight()["branch"] != branch:
                     raise ValueError("Git branch changed during confirmation. Inspect the current branch and confirm again.")
-                result = getattr(self._controller, action)(attempts=attempts)
+                options = {"attempts": attempts}
+                if action == "start" and auto_push:
+                    options["auto_push"] = True
+                result = getattr(self._controller, action)(**options)
                 # Even a failed launch may have created useful diagnostic logs.
                 if self._controller.logs is not None:
                     self._root = self._controller.logs
@@ -796,8 +814,8 @@ class Bridge:
             except Exception as exc:
                 return self._failure(exc)
 
-    def start(self, attempts=3):
-        return self._launch("start", attempts)
+    def start(self, attempts=3, auto_push=False):
+        return self._launch("start", attempts, auto_push)
 
     def resume(self, attempts=3):
         return self._launch("resume", attempts)

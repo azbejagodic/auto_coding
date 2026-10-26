@@ -35,6 +35,26 @@ class DesktopControlTests(unittest.TestCase):
 
     def tearDown(self): self.temp.cleanup()
 
+    @patch("auto_coding.desktop_control.Popen", side_effect=FakeProcess)
+    def test_explicit_auto_push_arguments_and_locked_resume_settings(self, popen):
+        self.controller.repository = "owner/repo"
+        self.assertTrue(self.controller.start(auto_push=True)["ok"])
+        argv = popen.call_args.args[0]
+        self.assertEqual(argv[argv.index('--auto-push-repository') + 1], 'owner/repo')
+        self.assertEqual(argv[argv.index('--auto-push-branch') + 1], 'feature/test')
+        self.assertFalse(self.controller.start(auto_push=False)["ok"])
+        from auto_coding.simple_run import load_tasks
+        config = {'repository':'owner/repo', 'branch':'feature/test'}
+        (self.controller.logs / 'state.json').write_text(json.dumps({
+            'status':'stopped', 'repo':str(self.repo), 'plan_sha256':load_tasks(self.plan)[1],
+            'auto_push':config, 'completed':[], 'history':[]}))
+        self.controller.process.code = 1
+        self.controller.job_status()
+        self.assertTrue(self.controller.resume()["ok"])
+        resumed = popen.call_args.args[0]
+        self.assertIn('--resume', resumed)
+        self.assertEqual(resumed[resumed.index('--auto-push-branch') + 1], 'feature/test')
+
     @patch("auto_coding.desktop_control.Popen")
     def test_failed_child_then_durable_recovery_survives_poll_and_reopen(self, popen):
         popen.side_effect = lambda argv, **kw: FakeProcess(argv, **kw)

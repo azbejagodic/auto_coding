@@ -12,6 +12,92 @@ from auto_coding.event_log import EventLog
 
 
 class SimpleRunnerTests(unittest.TestCase):
+    def test_auto_push_failure_stops_before_next_task_and_logs_exact_sha(self):
+        from auto_coding.github_workspace import GitHubWorkspaceManager, WorkspaceError
+        self.repo.mkdir()
+        subprocess.run(['git', 'init', '-b', 'feature/auto'], cwd=self.repo, check=True, capture_output=True)
+        self.plan = self.root / 'tasks.json'
+        self.plan.write_text(json.dumps({'tasks':[{'id':'one', 'prompt':'First'}, {'id':'two', 'prompt':'Second'}]}))
+        calls = []
+        def fake(argv, cwd, timeout, *, prompt=None):
+            calls.append(argv)
+            out = Path(argv[argv.index('--output-last-message') + 1])
+            if '--output-schema' in argv:
+                out.write_text(json.dumps({'decision':'APPROVED', 'issues':[], 'summary':'OK'}))
+            else:
+                (cwd / 'app.txt').write_text('approved')
+                out.write_text('done')
+            return 0, '', False
+        with patch.object(GitHubWorkspaceManager, 'publish_checkpoint', side_effect=WorkspaceError('authentication', 'Access failed')):
+            self.assertEqual(run(self.plan, self.repo, self.logs, execute=fake,
+                                 auto_push={'repository':'owner/repo', 'branch':'feature/auto'}), 1)
+        self.assertEqual(len(calls), 2)
+        state = json.loads((self.logs / 'state.json').read_text())
+        self.assertEqual(state['completed'], ['one'])
+        events = [json.loads(line) for line in (self.logs / 'events.jsonl').read_text().splitlines()]
+        push = [e for e in events if e['event'].startswith('push_')]
+        self.assertEqual([e['event'] for e in push], ['push_started', 'push_finished'])
+        self.assertTrue(all(e['timestamp_utc'] and e['metadata']['commit'] == state['history'][0]['commit'] for e in push))
+        self.assertEqual(push[-1]['metadata']['remote'], 'unconfirmed')
+
+    def test_auto_push_recovers_interrupted_commit_before_publication(self):
+        import auto_coding.simple_run as runner
+        from auto_coding.github_workspace import GitHubWorkspaceManager
+        self.repo.mkdir()
+        subprocess.run(['git', 'init', '-b', 'feature/auto'], cwd=self.repo, check=True, capture_output=True)
+        config = {'repository': 'owner/repo', 'branch': 'feature/auto'}
+        def fake(argv, cwd, timeout, *, prompt=None):
+            out = Path(argv[argv.index('--output-last-message') + 1])
+            if '--output-schema' in argv:
+                out.write_text(json.dumps({'decision': 'APPROVED', 'issues': [], 'summary': 'OK'}))
+            else:
+                (cwd / 'app.txt').write_text('approved')
+                out.write_text('done')
+            return 0, '', False
+        original_commit = runner.local_commit
+        def interrupted(repo, task):
+            original_commit(repo, task)
+            raise PilotError('interrupted after commit')
+        with patch.object(runner, 'local_commit', side_effect=interrupted), patch.object(GitHubWorkspaceManager, 'publish_checkpoint') as publish:
+            self.assertEqual(run(self.plan, self.repo, self.logs, execute=fake, auto_push=config), 1)
+            publish.assert_not_called()
+        sha = runner.head(self.repo)
+        with patch.object(GitHubWorkspaceManager, 'publish_checkpoint') as publish:
+            self.assertEqual(run(self.plan, self.repo, self.logs, resume=True, auto_push=config,
+                                 execute=lambda *a, **kw: self.fail('Codex must not rerun')), 0)
+            self.assertEqual(publish.call_args.args[3], sha)
+        self.assertEqual(runner.head(self.repo), sha)
+
+    def test_auto_push_stops_and_resume_retries_without_codex_or_duplicate_commit(self):
+        from auto_coding.github_workspace import GitHubWorkspaceManager, WorkspaceError
+        self.repo.mkdir()
+        subprocess.run(['git', 'init', '-b', 'feature/auto'], cwd=self.repo, check=True, capture_output=True)
+        config = {'repository': 'owner/repo', 'branch': 'feature/auto'}
+        def fake(argv, cwd, timeout, *, prompt=None):
+            out = Path(argv[argv.index('--output-last-message') + 1])
+            if '--output-schema' in argv:
+                out.write_text(json.dumps({'decision': 'APPROVED', 'issues': [], 'summary': 'OK'}))
+            else:
+                (cwd / 'app.txt').write_text('approved')
+                out.write_text('done')
+            return 0, '', False
+        with patch.object(GitHubWorkspaceManager, 'publish_checkpoint', side_effect=WorkspaceError('network', 'Network unavailable')):
+            self.assertEqual(run(self.plan, self.repo, self.logs, execute=fake, auto_push=config), 1)
+        before = json.loads((self.logs / 'state.json').read_text())
+        self.assertEqual(before['status'], 'stopped')
+        self.assertEqual(before['publication']['outcome'], 'pending')
+        sha = before['history'][0]['commit']
+        with patch.object(GitHubWorkspaceManager, 'publish_checkpoint') as publish:
+            self.assertEqual(run(self.plan, self.repo, self.logs, resume=True, auto_push=config,
+                                 execute=lambda *a, **kw: self.fail('Codex must not rerun')), 0)
+            self.assertEqual(publish.call_args.args[3], sha)
+        after = json.loads((self.logs / 'state.json').read_text())
+        self.assertEqual(after['publication']['outcome'], 'published')
+        self.assertEqual(after['history'], before['history'])
+        with patch.object(GitHubWorkspaceManager, 'publish_checkpoint', side_effect=WorkspaceError('network', 'Offline')):
+            self.assertEqual(run(self.plan, self.repo, self.logs, resume=True, auto_push=config), 1)
+        self.assertEqual(json.loads((self.logs / 'state.json').read_text())['publication']['outcome'], 'pending')
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

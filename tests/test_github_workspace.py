@@ -57,6 +57,160 @@ class WorkspaceTests(unittest.TestCase):
     def connect(self):
         return Path(self.manager.connect("Owner/Repo")["path"])
 
+    def test_coordinator_checkpoint_publish_reconciles_remote_and_retries_identical_sha(self):
+        repo = self.connect()
+        self.manager.create_branch("owner/repo", "feature/auto")
+        approved = self.checkpoint(repo)
+        sha = next(iter(approved))
+        self.manager.publish_checkpoint(repo, "owner/repo", "feature/auto", sha, approved)
+        self.assertEqual(self.git(self.remote, "rev-parse", "feature/auto"), sha)
+        pushes = len([a for a in self.calls if "push" in a])
+        self.manager.publish_checkpoint(repo, "owner/repo", "feature/auto", sha, approved)
+        self.assertEqual(len([a for a in self.calls if "push" in a]), pushes)
+        self.assert_error("checkpoint", lambda: self.manager.publish_checkpoint(
+            repo, "owner/repo", "feature/other", sha, approved))
+
+    def test_coordinator_checkpoint_rejects_unapproved_and_diverged_remote(self):
+        repo = self.connect()
+        self.manager.checkout_branch("owner/repo", "feature/existing")
+        approved = self.checkpoint(repo)
+        sha = next(iter(approved))
+        self.assert_error("approval", lambda: self.manager.publish_checkpoint(
+            repo, "owner/repo", "feature/existing", sha, {}))
+        self.git(self.seed, "checkout", "feature/existing")
+        (self.seed / "remote.txt").write_text("remote change")
+        self.git(self.seed, "add", ".")
+        self.git(self.seed, "commit", "-m", "remote")
+        self.git(self.seed, "push", str(self.remote), "feature/existing")
+        self.assert_error("non_fast_forward", lambda: self.manager.publish_checkpoint(
+            repo, "owner/repo", "feature/existing", sha, approved))
+        self.assertEqual(self.git(repo, "rev-parse", "HEAD"), sha)
+
+    def test_published_checkpoint_reconciles_dirty_tree_without_pushing(self):
+        repo = self.connect()
+        self.manager.create_branch("owner/repo", "feature/auto")
+        approved = self.checkpoint(repo)
+        sha = next(iter(approved))
+        self.manager.publish_checkpoint(repo, "owner/repo", "feature/auto", sha, approved)
+        (repo / "unfinished.txt").write_text("rejected staged changes")
+        self.git(repo, "add", "unfinished.txt")
+        (repo / "file.txt").write_text("unfinished unstaged changes")
+        (repo / "untracked.txt").write_text("unfinished untracked changes")
+        status = self.git(repo, "status", "--porcelain")
+        patch_text = self.git(repo, "diff", "--cached", "--binary")
+        self.calls.clear()
+        self.manager.publish_checkpoint(repo, "owner/repo", "feature/auto", sha, approved)
+        self.assertTrue(any("ls-remote" in argv for argv in self.calls))
+        self.assertFalse(any("push" in argv for argv in self.calls))
+        self.assertEqual(self.git(repo, "status", "--porcelain"), status)
+        self.assertEqual(self.git(repo, "diff", "--cached", "--binary"), patch_text)
+        self.assert_error("approval", lambda: self.manager.publish_checkpoint(
+            repo, "owner/repo", "feature/auto", sha, {}))
+
+    def test_unpublished_checkpoint_still_requires_clean_tree_before_push(self):
+        repo = self.connect()
+        self.manager.create_branch("owner/repo", "feature/auto")
+        approved = self.checkpoint(repo)
+        sha = next(iter(approved))
+        (repo / "unfinished.txt").write_text("unreviewed")
+        self.git(repo, "add", "unfinished.txt")
+        self.calls.clear()
+        self.assert_error("dirty", lambda: self.manager.publish_checkpoint(
+            repo, "owner/repo", "feature/auto", sha, approved))
+        self.assertFalse(any("push" in argv for argv in self.calls))
+        self.assertEqual(self.git(repo, "rev-parse", "HEAD"), sha)
+        self.assertIn("unfinished.txt", self.git(repo, "diff", "--cached", "--name-only"))
+
+    def test_auto_push_resume_repairs_rejected_second_task_after_first_published(self):
+        from auto_coding.simple_run import run
+        repo = self.connect()
+        self.manager.create_branch("owner/repo", "feature/auto")
+        plan, logs = self.root / "plan.json", self.root / "logs"
+        plan.write_text(json.dumps({"tasks": [
+            {"id": "first", "prompt": "Make first file"},
+            {"id": "second", "prompt": "Make second file"}]}))
+        config = {"repository": "owner/repo", "branch": "feature/auto"}
+        repairing = False
+        calls = []
+        def fake(argv, cwd, timeout, *, prompt=None):
+            second = "Make second file" in prompt
+            reviewing = "--output-schema" in argv
+            calls.append((second, reviewing))
+            out = Path(argv[argv.index("--output-last-message") + 1])
+            if reviewing:
+                rejected = second and not repairing
+                out.write_text(json.dumps({
+                    "decision": "REJECTED" if rejected else "APPROVED",
+                    "issues": ["repair second task"] if rejected else [], "summary": "review"}))
+            else:
+                if repairing:
+                    self.assertTrue(second)
+                    self.assertIn("second.txt", self.git(repo, "diff", "--cached", "--name-only"))
+                    self.assertEqual((repo / "second.txt").read_text(), "needs repair")
+                    state = json.loads((logs / "state.json").read_text())
+                    self.assertEqual(state["publication"]["outcome"], "published")
+                    self.assertEqual(state["publication"]["commit"], first_sha)
+                    self.assertEqual(self.git(self.remote, "rev-parse", "feature/auto"), first_sha)
+                (cwd / ("second.txt" if second else "first.txt")).write_text(
+                    "repaired" if repairing else "needs repair")
+                out.write_text("done")
+            return 0, "stub events", False
+
+        with patch("auto_coding.simple_run.GitHubWorkspaceManager", return_value=self.manager):
+            self.assertEqual(run(plan, repo, logs, attempts=1, auto_push=config, execute=fake), 1)
+            before = json.loads((logs / "state.json").read_text())
+            self.assertEqual(before["completed"], ["first"])
+            self.assertEqual(before["publication"]["outcome"], "published")
+            first_sha = before["history"][0]["commit"]
+            self.assertEqual(self.git(self.remote, "rev-parse", "feature/auto"), first_sha)
+            self.assertIn("second.txt", self.git(repo, "diff", "--cached", "--name-only"))
+            repairing = True
+            calls.clear()
+            self.calls.clear()
+            self.assertEqual(run(plan, repo, logs, resume=True, attempts=2,
+                                 auto_push=config, execute=fake), 0)
+        after = json.loads((logs / "state.json").read_text())
+        self.assertEqual(calls, [(True, False), (True, True)])
+        self.assertEqual(after["completed"], ["first", "second"])
+        self.assertEqual(after["history"][0]["commit"], first_sha)
+        self.assertEqual(after["history"][2]["attempt"], 2)
+        self.assertEqual(after["publication"]["outcome"], "published")
+        second_sha = after["history"][2]["commit"]
+        self.assertEqual(self.git(repo, "rev-parse", "HEAD^"), first_sha)
+        self.assertEqual(self.git(self.remote, "rev-parse", "feature/auto"), second_sha)
+        self.assertEqual(len([argv for argv in self.calls if "push" in argv]), 1)
+        self.assertEqual(self.git(repo, "status", "--porcelain"), "")
+        events = [json.loads(line) for line in (logs / "events.jsonl").read_text().splitlines()]
+        pushes = [e for e in events if e["event"] == "push_finished"]
+        self.assertEqual([e["metadata"]["commit"] for e in pushes], [first_sha, first_sha, second_sha])
+        self.assertTrue(all(e["outcome"] == "success" and e["timestamp_utc"]
+                            and e["metadata"]["remote"] == "confirmed" for e in pushes))
+
+    def test_coordinator_transient_authentication_and_rejection_preserve_commit(self):
+        repo = self.connect()
+        self.manager.create_branch("owner/repo", "feature/retry")
+        approved = self.checkpoint(repo)
+        sha = next(iter(approved))
+        for diagnostic, code in (("permission denied SECRET_TOKEN", "authentication"),
+                                 ("[rejected] fetch first SECRET_TOKEN", "non_fast_forward"),
+                                 ("could not resolve host SECRET_TOKEN", "network"),
+                                 (None, "network")):
+            def fail_push(argv, **kwargs):
+                if "push" in argv:
+                    if diagnostic is None:
+                        raise subprocess.TimeoutExpired(argv, 120)
+                    return subprocess.CompletedProcess(argv, 1, "", diagnostic)
+                return self.command(argv, **kwargs)
+            self.manager.run_command = fail_push
+            with self.assertRaises(WorkspaceError) as caught:
+                self.manager.publish_checkpoint(repo, "owner/repo", "feature/retry", sha, approved)
+            self.assertEqual(caught.exception.code, code)
+            self.assertNotIn("SECRET_TOKEN", str(caught.exception))
+            self.assertEqual(self.git(repo, "rev-parse", "HEAD"), sha)
+        self.manager.run_command = self.command
+        self.manager.publish_checkpoint(repo, "owner/repo", "feature/retry", sha, approved)
+        self.assertEqual(self.git(self.remote, "rev-parse", "feature/retry"), sha)
+
     def assert_error(self, code, fn):
         with self.assertRaises(WorkspaceError) as caught:
             fn()

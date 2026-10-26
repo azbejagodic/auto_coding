@@ -132,6 +132,16 @@ class DesktopBridgeTests(unittest.TestCase):
         self.controller.start.return_value = {"ok": False, "error": "already active"}
         self.assertEqual(self.bridge.start(), {"ok": False, "error": "already active"})
 
+    def test_auto_push_requires_native_confirmation_and_is_explicit_in_launch(self):
+        self.dialogs.confirm.return_value = False
+        self.assertTrue(self.bridge.start(auto_push=True)["cancelled"])
+        self.controller.start.assert_not_called()
+        self.assertIn("Automatically push approved tasks: ENABLED", self.dialogs.confirm.call_args.args[0])
+        self.assertIn("origin/feature/test", self.dialogs.confirm.call_args.args[0])
+        self.dialogs.confirm.return_value = True
+        self.assertTrue(self.bridge.start(auto_push=True)["ok"])
+        self.controller.start.assert_called_once_with(attempts=3, auto_push=True)
+
     def test_confirmation_required_and_invalid_attempts_never_launch(self):
         self.dialogs.confirm.return_value = False
         self.assertTrue(self.bridge.start()["cancelled"])

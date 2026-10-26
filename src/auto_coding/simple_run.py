@@ -1,7 +1,6 @@
-"""Opt-in Codex A -> tests -> Codex B coordinator (local-only pilot v2.1).
+"""Codex A -> tests -> Codex B coordinator; local checkpoints by default.
 
-Uses task-specific local Git checkpoints and durable logs. No pushes, no
-file-by-file implementation planning, no mutation of the existing controller.
+Explicit opt-in publication runs synchronously after validated approved commits.
 """
 from __future__ import annotations
 
@@ -20,7 +19,8 @@ import uuid
 from typing import Callable
 from auto_coding.event_log import EventLog, EventLogError
 from auto_coding.github_workspace import (managed_job, WorkspaceError, cancel_reservation,
-                                         mark_process_uncertain)
+                                         mark_process_uncertain, GitHubWorkspaceManager,
+                                         normalize_repository)
 
 
 MAX_PLAN = 512 * 1024
@@ -299,7 +299,7 @@ def recover_checkpoint(repo: Path, state: dict, state_path: Path, events: EventL
         state["completed"].append(task)
         state["history"].append(pending["record"] | {"commit": current})
         state["pending_checkpoint"] = None
-        state["status"] = "running"
+        state["status"] = "stopped" if state.get("auto_push") else "running"
         save_json(state_path, state)
         return
     # Approval exists but a local commit hasn't completed. Only permit recovery
@@ -326,15 +326,59 @@ def recover_checkpoint(repo: Path, state: dict, state_path: Path, events: EventL
     state["completed"].append(task)
     state["history"].append(pending["record"] | {"commit": committed})
     state["pending_checkpoint"] = None
-    state["status"] = "running"
+    state["status"] = "stopped" if state.get("auto_push") else "running"
     save_json(state_path, state)
 
 
+def publish_approved(repo, state, state_path, events):
+    """Reconcile with the remote even when a previous saved result says published."""
+    config = state.get("auto_push")
+    records = [r for r in state["history"] if r.get("commit")]
+    if not config or not records:
+        return True
+    record = records[-1]
+    sha = record["commit"]
+    publication = {"commit": sha, "task": record["task"], "outcome": "pending",
+                   "started_utc": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+    state["publication"] = publication
+    state["status"] = "stopped"  # Durable retry point before any network operation.
+    save_json(state_path, state)
+    events.emit("Git", "push_started", "started", task_id=record["task"],
+                metadata={"commit": sha, "branch": config["branch"], "local": "approved"})
+    manager = GitHubWorkspaceManager(state_path.parent)
+    try:
+        manager.publish_checkpoint(repo, config["repository"], config["branch"], sha,
+                                   {r["commit"]: r for r in records})
+    except WorkspaceError as exc:
+        publication.update(outcome="pending", error_code=exc.code,
+                           finished_utc=datetime.datetime.now(datetime.timezone.utc).isoformat())
+        save_json(state_path, state)
+        events.emit("Git", "push_finished", "failed", task_id=record["task"],
+                    metadata={"commit": sha, "local": "approved", "remote": "unconfirmed", "reason": exc.code})
+        print(f"APPROVED LOCALLY, PUSH PENDING: {exc} Retry Push by resuming this run; the identical SHA is retried without rerunning Codex.")
+        return False
+    publication.update(outcome="published", finished_utc=datetime.datetime.now(datetime.timezone.utc).isoformat())
+    # Remain resumable if interrupted before the next task or final completion save.
+    state["status"] = "stopped"
+    save_json(state_path, state)
+    events.emit("Git", "push_finished", "success", task_id=record["task"],
+                metadata={"commit": sha, "local": "approved", "remote": "confirmed"})
+    return True
+
+
 def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False, attempts=3,
+        auto_push=None,
         model_a=None, model_b=None, timeout=1800,
         execute: Callable = call) -> int:
     tasks, plan_sha = load_tasks(plan)
     repo = safe_repo(repo, create_repo)
+    if auto_push:
+        identity = normalize_repository(auto_push["repository"])[0]
+        branch = auto_push["branch"]
+        if (identity != auto_push["repository"] or branch.lower() in {"main", "master"}
+                or git(repo, ["branch", "--show-current"]) != branch):
+            raise PilotError("Auto-push requires the selected origin feature branch; main/master are protected")
+        git(repo, ["check-ref-format", "refs/heads/" + branch])
     logs = logs.resolve(strict=False)
     if logs == repo or logs.is_relative_to(repo):
         raise PilotError("Log directory must be outside the target project")
@@ -346,10 +390,12 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
         state = json.loads(state_path.read_text(encoding="utf-8"))
         if state.get("plan_sha256") != plan_sha or state.get("repo") != str(repo):
             raise PilotError("Resume plan or repository mismatch")
-        if state.get("status") == "completed":
+        if state.get("auto_push") != auto_push:
+            raise PilotError("Auto-push settings are fixed for this run; use its original repository and branch options")
+        if state.get("status") == "completed" and not auto_push:
             print("Already completed; no Codex invocation needed")
             return 0
-        if state.get("status") not in {"stopped", "checkpointing"}:
+        if state.get("status") not in {"stopped", "checkpointing", "completed"}:
             raise PilotError("Previous run may still be active or interrupted; inspect before resuming")
         manifest_path = logs / "run-manifest.json"
         if manifest_path.exists():
@@ -437,7 +483,7 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
             raise PilotError("New run requires a clean working tree; use a disposable project")
         state = {"repo": str(repo), "plan_sha256": plan_sha, "status": "initializing",
                  "completed": [], "current_task": None, "history": [], "pending_checkpoint": None,
-                 "created_utc": created, "run_id": run_id}
+                 "created_utc": created, "run_id": run_id, "auto_push": auto_push}
         manifest = {"run_id": run_id, "plan_sha256": plan_sha,
                     "task_ids": [t["id"] for t in tasks], "initial_git_head": head(repo),
                     "start_time_utc": created, "target_repo": str(repo)}
@@ -448,6 +494,8 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
             events.emit("controller", "run_started", "started", evidence={"manifest": "run-manifest.json"})
         state["status"] = "running"
         save_json(state_path, state)
+    if not publish_approved(repo, state, state_path, events):
+        return 1
     events.emit("controller", "plan_validated", "success", metadata={"task_count": len(tasks), "plan_sha256": plan_sha})
     schema_path = logs / "review-schema.json"
     if not schema_path.exists():
@@ -544,7 +592,9 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                 "together in one verdict, with reproduction evidence. Do not block approval for "
                 "optional polish, hypothetical risks, unrelated pre-existing issues or future slices. "
                 "If no current blockers remain, return APPROVED with an empty issues list; put any "
-                "optional polish in summary as non-blocking suggestions. Do not change files.\n\nTASK:\n" + task["prompt"] +
+                "optional polish in summary as non-blocking suggestions. Inspect Git/credential safety "
+                "and data-loss risks carefully. Merge to Main and per-task model/reasoning selection "
+                "are deferred and are not approval blockers. Do not change files.\n\nTASK:\n" + task["prompt"] +
                 "\n\nCURRENT TASK CHANGES:\n" + stat + "\n\nDIFF (truncated; inspect repository for full):\n" + diff[:35000] +
                 "\n\nTEST RESULTS:\n" + json.dumps(record["tests"]))
             (logs / f"{base}-b-prompt.txt").write_text(review_prompt, encoding="utf-8")
@@ -607,10 +657,12 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                 state["completed"].append(ident)
                 state["history"].append(record | {"commit": commit})
                 state["pending_checkpoint"] = None
-                state["status"] = "running"
+                state["status"] = "stopped" if auto_push else "running"
                 save_json(state_path, state)
                 events.emit("controller", "task_completed", "success", task_id=ident, attempt=attempt, metadata={"commit": commit})
                 print(f"[{ident}] APPROVED — saved local checkpoint {commit[:8]}", flush=True)
+                if not publish_approved(repo, state, state_path, events):
+                    return 1
                 break
             feedback = "Codex B rejected:\n" + "\n".join(verdict["issues"])
             record["feedback"] = feedback[-14000:]
@@ -628,18 +680,18 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
     state["current_task"] = None
     save_json(state_path, state)
     events.emit("controller", "run_completed", "success", evidence={"state": "state.json"})
-    print(f"COMPLETED: {len(tasks)} task(s). Local checkpoints saved; NO PUSH. Logs: {logs}")
+    print(f"COMPLETED: {len(tasks)} task(s). " + ("Approved checkpoints remotely confirmed. " if auto_push else "Local checkpoints saved; NO PUSH. ") + f"Logs: {logs}")
     return 0
 
 
 @managed_job
 def run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False, attempts=3,
-        model_a=None, model_b=None, timeout=1800, execute: Callable = call) -> int:
+        model_a=None, model_b=None, timeout=1800, execute: Callable = call, auto_push=None) -> int:
     """Run while ensuring controlled exceptions after log creation are recorded."""
     try:
         return _run(plan, repo, logs, create_repo=create_repo, resume=resume,
                     attempts=attempts, model_a=model_a, model_b=model_b,
-                    timeout=timeout, execute=execute)
+                    timeout=timeout, execute=execute, auto_push=auto_push)
     except Exception as exc:
         log_dir = logs.resolve(strict=False)
         state_path = log_dir / "state.json"
@@ -696,7 +748,7 @@ def git_clean_staged(repo: Path) -> bool:
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Simple Codex A/B coordinator v2.1 (local checkpoints, no push)")
+    parser = argparse.ArgumentParser(description="Simple Codex A/B coordinator (local checkpoints; explicit opt-in push)")
     parser.add_argument("plan", type=Path, help="TXT, MD, or simple JSON task file")
     parser.add_argument("--repo", required=True, type=Path, help="Git repository to modify")
     parser.add_argument("--logs", required=True, type=Path, help="Output logs, outside repository")
@@ -706,7 +758,11 @@ def main(argv=None):
     parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument("--model-a")
     parser.add_argument("--model-b")
+    parser.add_argument("--auto-push-repository", help="Explicitly enable auto-push to this GitHub OWNER/REPO")
+    parser.add_argument("--auto-push-branch", help="Fixed origin feature branch for approved checkpoints")
     args = parser.parse_args(argv)
+    if bool(args.auto_push_repository) != bool(args.auto_push_branch):
+        parser.error("Auto-push requires both repository and feature branch")
     if not 1 <= args.attempts <= 10 or not 30 <= args.timeout <= 86400:
         cancel_reservation(args.repo, os.environ.get("AUTOCODING_JOB_RESERVATION"))
         parser.error("invalid attempts or timeout")
@@ -716,7 +772,9 @@ def main(argv=None):
     try:
         return run(args.plan, args.repo, args.logs, create_repo=args.create_repo,
                    resume=args.resume, attempts=args.attempts, timeout=args.timeout,
-                   model_a=args.model_a, model_b=args.model_b)
+                   model_a=args.model_a, model_b=args.model_b,
+                   auto_push=({"repository": normalize_repository(args.auto_push_repository)[0],
+                               "branch": args.auto_push_branch} if args.auto_push_repository else None))
     except (PilotError, WorkspaceError, OSError, UnicodeError, json.JSONDecodeError) as exc:
         print(f"STOPPED: {exc}", file=sys.stderr)
         return 1

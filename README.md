@@ -1,6 +1,6 @@
 # Auto-Coding Simple Backend V2.1 — generated-file staging fix
 
-This release is the existing **opt-in, local-only** simple runner with a targeted fix for the Windows `__pycache__/run_summary.cpython-313.pyc` staging stop. The runner never pushes automatically. The dashboard supports optional explicit publication of approved feature checkpoints.
+The existing simple runner saves approved local checkpoints by default. The dashboard supports one-shot publication and optional, explicitly confirmed automatic publication of approved feature checkpoints.
 
 ## What changed
 
@@ -55,7 +55,7 @@ Local Codex CLI authentication is required before starting. The runner inherits 
 
 1. Enter a GitHub **OWNER/REPO** or GitHub URL and click **Connect repository**. The app creates or reopens its managed checkout. **My repositories** optionally lists repositories when `gh` is authenticated; manual entry works without `gh`. Choose a feature branch and click **Select branch**, or use **New Branch**, enter its name, and click **Create branch**. Choose the remote base (normally `origin/main`); an alternate base such as `origin/master` requires the explicit confirmation checkbox. New branches start from that freshly fetched base. Commit or discard outstanding changes before branch changes or START. Main, master and detached HEAD cannot run tasks.
 2. For existing local projects, **Advanced / Local Project** retains Project folder **Browse**. Otherwise the managed checkout is selected automatically. Click **Browse** beside Task plan and select the intended TXT, MD or JSON plan. TXT/MD represents one task; JSON can include ordered tasks and explicit test command argv arrays (see `examples`). Keep the plan outside the target checkout, or commit it before starting. Browsing, opening and cancelling selection never launch work. Full paths, branch, working tree and validation errors appear in the dashboard.
-3. Enter a whole-number total attempt limit from **1 through 10** (default **3**). Invalid or empty entries explain why START and RESUME are disabled. Click **START** and review the native confirmation containing the repo, branch, plan and local-only policy. Cancelling does not launch anything. Approved task checkpoints are local commits. There is no automatic push, merge or force-push. Overview keeps setup compact, with preflight errors visible and safeguards in one expandable **Details** section.
+3. Enter a whole-number total attempt limit from **1 through 10** (default **3**). Invalid or empty entries explain why START and RESUME are disabled. Optionally select **Automatically push approved tasks** before START. Review the native confirmation containing the repo, branch, plan and publication policy. Cancelling does not launch anything. Approved task checkpoints are committed locally before any optional push. There is no automatic merge or force-push. Overview keeps setup compact, with preflight errors visible and safeguards in one expandable **Details** section.
 4. **Overview** shows recorded state, current task, task counts, child activity/errors and recent events. **Tasks** shows each attempt, test results and Codex B verdicts, with original feedback and summaries in expandable details. **Logs** shows timestamped actors/outcomes and evidence links. Its raw file list also supports legacy runs with no event timeline. Files are loaded only when selected, as text, confined to the chosen logs directory and capped at 1 MB. Missing/corrupt sources produce warnings. The UI polls every four seconds and preserves opened evidence and expanded details.
 5. New logs live in `%LOCALAPPDATA%\AutoCoding\runs\run-<id>` outside the project; the full selected log path remains accessible in **Details** after the child exits. Logs include `desktop-run.json`, `state.json`, `events.jsonl`, evidence files and `runner-output.txt` (including launch/initialization diagnostics). Historical process exits and diagnostics are in **Logs**; completed saved state takes priority over past exit warnings. A child exit code is never treated as task approval; only durable runner state supplies completion.
 6. To resume, click **Open Run** and choose its log directory. Desktop runs restore the original exact repo and plan paths. RESUME is enabled only for matching stopped state and inactive, known child status; the controller checks again at launch. Keep the original plan bytes and paths. Legacy runs without desktop metadata require selecting their original repo and plan explicitly. Choose **5** if the original total attempt limit of 3 was exhausted, then click **RESUME** and confirm. Staged work is reconciled by the existing runner. Running, missing-state or uncertain launches cannot be resumed through this UI; inspect the visible diagnostics instead of launching duplicate work.
@@ -143,7 +143,7 @@ The JS API provides `select_repo(path?)`, `select_plan(path?)`, `open_run(path?)
 `snapshot()`, and `evidence(relative_name)`. Omitting a selection path opens the
 native folder or TXT/MD/JSON file picker. Cancellation preserves selections;
 selection never launches a process. START and RESUME always require a separate
-native confirmation showing the selected paths, current branch, attempts and no-auto-push policy, and return the
+native confirmation showing the selected paths, current branch, attempts and publication policy, and return the
 controller's launch result. Without a dialog boundary they fail closed.
 
 `snapshot()` preserves the viewer fields and adds `controller`, containing
@@ -272,5 +272,27 @@ feature branch may be published normally. There is no merge-to-main action.
 
 Publication reads structured checkpoint state, never raw evidence files. Existing
 raw logs remain available only through explicit evidence selection. Local commits
-are labelled local; only a successful push reports remote publication. The runner
-and its read-only Codex B blocker-review policy are otherwise unchanged.
+are labelled local; remote publication requires confirmation from the remote.
+
+**Automatically push approved tasks** starts unchecked and requires native START
+confirmation for that run. Repository, branch and publication settings are fixed
+for the run. The same coordinator synchronously pushes each independently approved,
+integrity-validated local checkpoint by its exact SHA to the selected origin feature
+branch. It verifies origin identity, all unpublished approvals and sensitive paths;
+main/master, force pushes, tags, hooks and automatic merges are excluded.
+
+On failure, further tasks stop with **Approved locally, push pending**. Local commits
+remain intact. Fix access/connectivity, then use **Resume (Retry Push)** with the
+original plan and logs: the same SHA is reconciled and retried before further tasks,
+without rerunning Codex or creating another checkpoint. Divergence requires manual
+review; the runner never merges it automatically. A timeout or interrupted process
+may retain the existing uncertain-job gate; inspect process/lock status first rather
+than launching a competing writer. Push start/result events include UTC timestamps,
+SHA and confirmed/unconfirmed remote outcome; state.json also records the latest
+publication attempt. Resume checks the actual remote even after saved success.
+
+CLI behavior stays local when the options are omitted. Explicit opt-in uses both
+`--auto-push-repository OWNER/REPO --auto-push-branch feature/name`; resume uses the
+same options plus `--resume`. Old logs without these settings remain local. One-shot
+**Push Approved Commits** remains available. Per-task model/reasoning selection and
+Merge to Main remain deferred.

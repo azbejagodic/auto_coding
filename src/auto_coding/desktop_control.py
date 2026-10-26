@@ -280,7 +280,7 @@ class DesktopController:
                     and not self._valid_pid(item.get("pid"))))
 
     @serialized_launch
-    def start(self, attempts: int = 3) -> dict:
+    def start(self, attempts: int = 3, auto_push: bool = False) -> dict:
         with self._lock:
             if self.process is not None and self.process.poll() is None:
                 return self._fail("A desktop run is already active.")
@@ -291,6 +291,8 @@ class DesktopController:
                     raise ValueError("The selected run's child process is still active. Wait for it to stop before resuming.")
                 if self._other_active_run(): raise ValueError("An earlier desktop run is still active. Reopen its logs and wait for it to stop.")
                 self._validate()
+                if type(auto_push) is not bool or (auto_push and not self.repository):
+                    raise ValueError("Auto-push requires an explicitly selected managed GitHub repository.")
                 if not 1 <= attempts <= 10: raise ValueError("Attempts must be between 1 and 10.")
                 # Reject containment before creation so failed START cannot dirty
                 # the target checkout.
@@ -304,7 +306,7 @@ class DesktopController:
                 self.process_history = []
                 self.exit_code = None
                 self._metadata(logs)
-                return self._launch(attempts, False)
+                return self._launch(attempts, False, auto_push=auto_push)
             except (OSError, ValueError, PilotError) as exc:
                 return self._fail(str(exc))
 
@@ -335,15 +337,16 @@ class DesktopController:
                 if check["resume_error"]: raise ValueError(check["resume_error"])
                 if metadata and metadata.get("status") in {"launching", "running"} and not self._pid_active(metadata.get("pid")):
                     raise ValueError("Run metadata indicates a launch whose child status is unknown. Inspect the run before resuming.")
-                if not state or state.get("status") != "stopped":
-                    raise ValueError("Resume is available only when state.json truthfully records status 'stopped'.")
+                if not state or (state.get("status") != "stopped" and not (
+                        state.get("auto_push") and state.get("status") == "checkpointing")):
+                    raise ValueError("Resume requires a stopped run or an interrupted auto-push checkpoint.")
                 if state.get("plan_sha256") != plan_sha or state.get("repo") != str(self.repo):
                     raise ValueError("Resume plan or repository mismatch; select the original plan and repository.")
                 return self._launch(attempts, True)
             except (OSError, ValueError, PilotError) as exc:
                 return self._fail(str(exc))
 
-    def _launch(self, attempts: int, resume: bool) -> dict:
+    def _launch(self, attempts: int, resume: bool, auto_push: bool = False) -> dict:
         src = str(Path(__file__).resolve().parents[1])
         env = os.environ.copy()
         # A reservation belongs only to this launch, never to a parent runner.
@@ -352,6 +355,13 @@ class DesktopController:
         argv = [sys.executable, "-B", "-m", "auto_coding.simple_run", "--repo", str(self.repo),
                 "--logs", str(self.logs), "--attempts", str(attempts)]
         if resume: argv.append("--resume")
+        config = None
+        if resume:
+            config = read_run(self.logs).get("state", {}).get("auto_push")
+        elif auto_push:
+            config = {"repository": self.repository, "branch": self.preflight()["branch"]}
+        if config:
+            argv.extend(["--auto-push-repository", config["repository"], "--auto-push-branch", config["branch"]])
         argv.append(str(self.plan))
         reservation = None
         spawned = False
