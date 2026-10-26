@@ -55,6 +55,54 @@ class DesktopBridgeTests(unittest.TestCase):
         self.bridge = Bridge(controller=self.controller, dialogs=self.dialogs,
                              controller_factory=FakeController)
 
+    @patch("auto_coding.desktop_control.Popen")
+    @patch.object(DesktopController, "preflight", return_value={"branch":"feature/smoke", "clean":True, "errors":[]})
+    def test_full_lifecycle_confirmation_live_completion_and_existing_run(self, preflight, popen):
+        controller = DesktopController(self.root / "runs")
+        bridge = Bridge(controller=controller, dialogs=self.dialogs)
+        self.assertFalse(bridge.job_status()["start_ready"])
+        # Repository validation is tested separately; all launch/process calls are mocked.
+        controller.repo = self.root / "project"
+        controller.repo.mkdir()
+        bridge.select_plan(str(self.plan))
+        self.assertTrue(bridge.job_status()["start_ready"])
+        preflight.return_value["clean"] = False
+        self.assertFalse(bridge.job_status()["start_ready"])
+        preflight.return_value.update(clean=True, errors=["main/master blocked"])
+        self.assertFalse(bridge.job_status()["start_ready"])
+        preflight.return_value["errors"] = []
+        self.dialogs.confirm.return_value = False
+        self.assertTrue(bridge.start()["cancelled"])
+        popen.assert_not_called()
+        self.dialogs.confirm.return_value = True
+        process = Mock(pid=424242)
+        process.poll.return_value = None
+        popen.return_value = process
+        self.assertTrue(bridge.start()["ok"])
+        logs = controller.logs
+        self.assertEqual(bridge.snapshot()["root"], str(logs))
+        self.assertFalse(bridge.start()["ok"])
+        popen.assert_called_once()
+        webview = Mock()
+        with patch.dict(sys.modules, {"webview": webview}), patch("auto_coding.desktop_app.Bridge", return_value=bridge):
+            self.assertEqual(main([]), 0)  # Mock GUI event loop returns as if the user closed it.
+        process.terminate.assert_not_called()
+        process.kill.assert_not_called()
+        self.assertTrue(bridge.job_status()["active"])
+        (logs / "state.json").write_text('{"status":"running","current_task":"task-1"}')
+        self.assertEqual(bridge.snapshot()["state"]["current_task"], "task-1")
+        process.poll.return_value = 1
+        self.assertNotEqual(bridge.job_status()["outcome"], "completed")
+        (logs / "state.json").write_text('{"status":"completed","completed":["task-1"]}')
+        self.assertEqual(bridge.job_status()["outcome"], "completed")
+        reopened = Bridge(logs)
+        status = reopened.job_status()
+        self.assertEqual(status["outcome"], "completed")
+        self.assertEqual(status["exit_code"], 1)
+        self.assertFalse(status["resume_ready"])
+        process.terminate.assert_not_called()
+        process.kill.assert_not_called()
+
     def test_selections_never_launch_and_cancel_preserves_paths(self):
         self.dialogs.choose.side_effect = [str(self.root), str(self.plan), None, ()]
         self.assertTrue(self.bridge.select_repo()["ok"])

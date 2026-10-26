@@ -36,6 +36,51 @@ class DesktopControlTests(unittest.TestCase):
     def tearDown(self): self.temp.cleanup()
 
     @patch("auto_coding.desktop_control.Popen")
+    def test_failed_child_then_durable_recovery_survives_poll_and_reopen(self, popen):
+        popen.side_effect = lambda argv, **kw: FakeProcess(argv, **kw)
+        self.assertTrue(self.controller.start()["ok"])
+        logs = self.controller.logs
+        raw = logs / "runner-output.txt"
+        raw.write_text("original index.lock interruption; exit 1")
+        state_path = logs / "state.json"
+        state_path.write_text(json.dumps({"status":"checkpointing", "completed":[]}))
+        self.controller.error = "Earlier launch metadata warning"
+        self.controller.process.code = 1
+        status = self.controller.job_status()
+        self.assertEqual(status["outcome"], "checkpointing")
+        self.assertEqual(status["exit_code"], 1)
+        self.assertIn("exit code 1", status["error"])
+        self.assertFalse(self.controller.resume()["ok"])
+        state = {"status":"completed", "completed":["task-1"], "checkpoint":"d836d75"}
+        state_path.write_text(json.dumps(state))
+        status = self.controller.job_status()
+        self.assertEqual(status["outcome"], "completed")
+        self.assertEqual(status["exit_code"], 1)
+        self.assertEqual(status["process_history"][0]["exit_code"], 1)
+        self.assertEqual(status["process_history"][0]["launch_warning"], "Earlier launch metadata warning")
+        reopened = DesktopController(self.runs)
+        self.assertTrue(reopened.reopen(logs)["ok"])
+        self.assertEqual(reopened.job_status()["outcome"], "completed")
+        self.assertEqual(reopened.job_status()["exit_code"], 1)
+        self.assertEqual(reopened.job_status()["process_history"], status["process_history"])
+        self.assertEqual(json.loads(state_path.read_text()), state)
+        self.assertEqual(raw.read_text(), "original index.lock interruption; exit 1")
+        self.assertEqual(popen.call_count, 1)
+
+    @patch("auto_coding.desktop_control.Popen")
+    def test_completed_state_cannot_override_live_or_unknown_process(self, popen):
+        popen.side_effect = lambda argv, **kw: FakeProcess(argv, **kw)
+        self.assertTrue(self.controller.start()["ok"])
+        logs = self.controller.logs
+        (logs / "state.json").write_text('{"status":"completed"}')
+        self.assertEqual(self.controller.job_status()["outcome"], "active")
+        self.controller.process = None
+        (logs / "desktop-run.json").write_text('{"status":"launching"}')
+        self.assertEqual(self.controller.job_status()["outcome"], "unknown")
+        self.assertFalse(self.controller.start()["ok"])
+        self.assertEqual(popen.call_count, 1)
+
+    @patch("auto_coding.desktop_control.Popen")
     def test_exact_argv_cwd_env_and_unique_external_logs(self, popen):
         popen.side_effect = lambda argv, **kw: FakeProcess(argv, **kw)
         result = self.controller.start()

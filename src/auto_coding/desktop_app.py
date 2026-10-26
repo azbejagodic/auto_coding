@@ -14,7 +14,7 @@ from auto_coding.simple_run import load_tasks
 HTML = r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Auto-Coding</title><style>
 *{box-sizing:border-box}body{margin:0;background:#101214;color:#edf1f5;font:14px Segoe UI,Arial,sans-serif}.shell{display:flex;min-height:100vh}.side{width:210px;padding:28px 18px;background:#15181b;border-right:1px solid #282d32}.brand{font-size:18px;font-weight:700;margin:0 0 34px}.nav{padding:12px;border-radius:9px;color:#aeb7c0;margin:5px 0}.nav.active{background:#222a31;color:#fff}.main{padding:32px;flex:1;min-width:0}.top{display:flex;justify-content:space-between;align-items:center}.muted{color:#89949e}.grid{display:grid;grid-template-columns:repeat(3,minmax(150px,1fr));gap:14px;margin:24px 0}.card,.panel{background:#191d21;border:1px solid #2a3036;border-radius:14px;padding:18px}.label{color:#89949e;font-size:12px;text-transform:uppercase;letter-spacing:.08em}.value{font-size:20px;margin-top:9px;font-weight:650}.blue{color:#61a9ff}.green{color:#59d68b}.amber{color:#f3bd58}.red{color:#ff7272}.panel{margin-top:16px}.events{width:100%;border-collapse:collapse;margin-top:12px}th{text-align:left;color:#89949e;font-size:11px;text-transform:uppercase}td,th{padding:11px 9px;border-bottom:1px solid #292f35;vertical-align:top}td{color:#d8dee5;overflow-wrap:anywhere}button{background:#26323e;border:1px solid #384958;color:#dcecff;border-radius:8px;padding:8px 13px;cursor:pointer}button:hover{background:#314253}.evidence{color:#75b8ff;cursor:pointer;text-decoration:underline}.empty{padding:24px;color:#aeb7c0;background:#191d21;border-radius:12px}.tasks{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.pill{background:#252b30;padding:7px 10px;border-radius:20px}.warning{color:#f3bd58;margin:7px 0}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#101214;border-radius:9px;padding:14px;max-height:50vh;overflow:auto}
 button:disabled{opacity:.45;cursor:default}.nav{display:block;width:100%;text-align:left;border:0;background:transparent}.controls{display:flex;gap:9px;flex-wrap:wrap;align-items:center}.path{overflow-wrap:anywhere;margin:8px 0}.notice{white-space:pre-wrap;overflow-wrap:anywhere}select{background:#101214;color:#edf1f5;padding:8px;border:1px solid #384958;border-radius:8px}details{margin:10px 0}summary{cursor:pointer;color:#aeb7c0}h2{font-size:17px}h3{font-size:14px}.side p{line-height:1.6}.events{font-size:12px}
-</style></head><body><div class="shell"><aside class="side"><div class="brand">Auto-Coding</div><button class="nav active" id="nav-overview">Overview</button><button class="nav" id="nav-tasks">Tasks</button><button class="nav" id="nav-logs">Logs</button><p class="muted" style="margin-top:38px">Local Codex CLI authentication is required.<br>Uses your configured CLI model and reasoning.</p><p class="muted">Closing this window leaves the runner alive. Reopen its logs to inspect progress.</p></aside><main class="main"><div class="top"><div><div class="label">Desktop dashboard</div><h1 style="margin:8px 0" id="page-title">Run overview</h1></div><button id="refresh">Refresh</button></div><section class="panel"><div class="controls"><button id="browse-project">Browse Project</button><button id="browse-plan">Browse Plan</button><button id="open-run">Open Existing Run</button><label>Attempt limit <select id="attempts"><option value="3" selected>3</option><option value="5">5</option></select></label><button id="start">START</button><button id="resume">RESUME</button></div><div id="paths"></div><div id="preflight" class="notice muted"></div><div id="message" class="notice" role="status" aria-live="polite"></div><p class="muted">Selection never starts work. Launch requires confirmation. Checkpoints stay local; no automatic push, merge, force-push or branch creation. START requires a clean feature branch. RESUME requires a stopped run and its original plan, repository and logs. Attempts is the total limit per task; choose 5 if 3 were exhausted.</p></section><div id="app"></div><div id="evidence-viewer"></div></main></div><script>
+</style></head><body><div class="shell"><aside class="side"><div class="brand">Auto-Coding</div><button class="nav active" id="nav-overview">Overview</button><button class="nav" id="nav-tasks">Tasks</button><button class="nav" id="nav-logs">Logs</button><p class="muted" style="margin-top:38px">Local Codex CLI authentication is required.<br>No model or token usage is inferred.</p><p class="muted">Closing this window leaves the runner alive. Reopen its logs to inspect progress.</p></aside><main class="main"><div class="top"><div><div class="label">Desktop dashboard</div><h1 style="margin:8px 0" id="page-title">Run overview</h1></div><button id="refresh">Refresh</button></div><section class="panel"><h2>Choose a project and task plan</h2><p class="muted">Select your Git project folder and a plan describing the work. Then review readiness and confirm START. To inspect earlier work, open its run folder.</p><div class="controls"><button id="browse-project">Browse Project</button><button id="browse-plan">Browse Plan</button><button id="open-run">Open Existing Run</button><label>Attempt limit <select id="attempts"><option value="3" selected>3</option><option value="5">5</option></select></label><button id="start">START</button><button id="resume">RESUME</button></div><div id="paths"></div><div id="preflight" class="notice muted"></div><div id="message" class="notice" role="status" aria-live="polite"></div><details><summary>Launch safeguards</summary><p class="muted">Selection never starts work. Launch requires confirmation. Checkpoints stay local; no automatic push, merge, force-push or branch creation. START requires a clean feature branch. RESUME requires a stopped run and its original plan, repository and logs. Attempts is the total limit per task; choose 5 if 3 were exhausted.</p></details></section><div id="app"></div><div id="evidence-viewer"></div></main></div><script>
 const app = document.getElementById('app');
 const evidenceViewer = document.getElementById('evidence-viewer');
 
@@ -54,7 +54,7 @@ function updateControls() {
   const c = latest?.controller || {};
   const locked = busy || !ready || c.active !== false || c.uncertain;
   controls.forEach(id => { document.getElementById(id).disabled = locked; });
-  document.getElementById('start').disabled = locked || !c.repo || !c.plan;
+  document.getElementById('start').disabled = locked || !c.start_ready;
   document.getElementById('resume').disabled = locked || !c.resume_ready;
   document.getElementById('refresh').disabled = busy || !ready;
 }
@@ -100,12 +100,31 @@ function render(data) {
   const c = data.controller || {};
   const paths = document.getElementById('paths');
   paths.replaceChildren();
-  ['repo', 'plan', 'logs'].forEach(name => paths.append(el('div', name.toUpperCase() + ': ' + (c[name] || 'Not selected'), 'path')));
+  const basename = path => path.split(/[\\/]/).filter(Boolean).pop();
+  ['repo', 'plan', 'logs'].forEach(name => {
+    if (c[name]) paths.append(el('div', {repo:'Project', plan:'Plan', logs:'Run'}[name] + ': ' + basename(c[name]), 'path'));
+  });
   const git = c.preflight || {};
+  if (c.repo) paths.append(el('div', 'Branch: ' + (git.branch || 'Unavailable'), 'path'));
+  if (c.repo || c.plan || c.logs) paths.append(detail('Full paths', ['repo', 'plan', 'logs'].map(name => name + ': ' + (c[name] || 'Not selected')).join('\n'), 'paths'));
   const errors = [...(git.errors || []), ...Object.entries(c.validation_errors || {}).map(([k,v]) => k + ': ' + v)];
   if (c.selection_error) errors.push(c.selection_error);
   if (git.resume_error) errors.push(git.resume_error);
-  document.getElementById('preflight').textContent = 'Branch: ' + (git.branch || 'Unknown') + ' | Working tree: ' + (git.clean === true ? 'clean' : git.clean === false ? 'has changes (START blocked; RESUME reconciles)' : 'unknown') + (errors.length ? '\n' + errors.join('\n') : '') + '\n' + (c.resume_ready ? 'Stopped state matches original plan and repo; RESUME eligible for launch-time checks.' : 'RESUME unavailable: requires matching stopped state, original paths and no active or unknown child.');
+  if (git.start_error) errors.push(git.start_error);
+  const preflight = document.getElementById('preflight');
+  preflight.replaceChildren();
+  const instruction = c.uncertain || c.active === null ? 'Child status is unknown. Inspect this run before launching more work.'
+    : c.active ? 'Runner active. Follow progress below.'
+    : c.resume_ready ? 'Ready to RESUME the selected stopped run. START creates a new run.'
+    : c.selection_error ? c.selection_error
+    : Object.keys(c.validation_errors || {}).length ? errors[0]
+    : !c.repo ? 'Choose a project folder to begin.'
+    : !c.plan ? 'Choose a valid task plan next.'
+    : errors.length ? errors[0]
+    : git.clean !== true ? 'Commit or discard project changes before START. A matching stopped run may be eligible for RESUME.'
+    : 'Ready to START. Review the confirmation before launching.';
+  preflight.append(el('p', (c.active ? 'Running - ' : c.start_ready || c.resume_ready ? 'Ready - ' : 'Action needed - ') + instruction));
+  preflight.append(detail('Details - preflight and launch safeguards', JSON.stringify({branch:git.branch, clean:git.clean, start_ready:c.start_ready, resume_ready:c.resume_ready, diagnostics:errors}, null, 2), 'preflight'));
   updateControls();
   if (evidenceRoot !== data.root) {
     evidenceViewer.replaceChildren();
@@ -116,21 +135,27 @@ function render(data) {
   if (renderKey === key) return;
   renderKey = key;
   app.replaceChildren();
+  if (!c.logs && !data.root) {
+    app.append(el('div', c.start_ready ? 'Ready to begin. Click START to review the project, plan and branch before confirming.' : 'Choose a project and task plan above. Selection does not start work. You can also Open Existing Run to inspect earlier work.', 'empty'));
+    if (c.error) app.append(el('div', c.error, 'warning'));
+    return;
+  }
   const state = data.state || {};
   const events = data.events || [];
   const history = Array.isArray(state.history) ? state.history.filter(item => item && typeof item === 'object') : [];
   const completed = Array.isArray(state.completed) ? state.completed : null;
-  const status = c.uncertain || c.active === null ? 'Unknown child status' : c.active === true ? 'Active' : state.status === 'completed' ? 'Completed (recorded)' : state.status === 'stopped' ? 'Stopped (recorded)' : state.status ? 'Unknown / child inactive; recorded: ' + state.status : c.logs ? 'Unknown / no durable state' : 'Ready / no durable state';
-  if (c.error) app.append(el('div', c.error, 'notice warning'));
+  const status = c.uncertain || (c.active !== false && c.active !== true) ? 'Unknown child status' : c.active === true ? 'Active' : state.status === 'completed' ? 'Completed (recorded)' : state.status === 'checkpointing' ? 'Recovery pending (checkpointing)' : state.status === 'stopped' ? 'Stopped (recorded)' : state.status ? 'Unknown / child inactive; recorded: ' + state.status : c.logs ? 'Awaiting recorded run state' : 'Choose a project and plan';
+  const reconciled = c.active === false && !c.uncertain && ['completed', 'checkpointing'].includes(state.status);
+  if (c.error && !reconciled) app.append(el('div', c.error, 'notice warning'));
   if (data.state_error) app.append(el('div', data.state_error, 'warning'));
   if (data.empty) app.append(el('div', 'No run state or events found. Select a project and plan to START, or inspect available raw files in Logs.', 'empty'));
-  if (!data.exists && !data.state_error) app.append(el('div', 'Log directory is missing or unavailable.', 'warning'));
+  if (c.logs && !data.exists && !data.state_error) app.append(el('div', 'Log directory is missing or unavailable.', 'warning'));
   if (state.pending_checkpoint) app.append(el('div', 'A checkpoint is pending reconciliation. No completion is inferred.', 'warning'));
   (data.event_errors || []).forEach(error => app.append(el('div', error, 'warning')));
   if (page === 'overview') {
     const summary = el('div', undefined, 'grid');
     const count = data.task_count ?? c.task_count;
-    [['Run status', status], ['Completed tasks', (completed ? completed.length : 'Unknown') + ' / ' + (count ?? 'Unknown')], ['Child process', c.active === true ? 'Running' : c.active === false ? 'Inactive' : 'Unknown']].forEach(([label,value]) => {
+    [['Run status', status], ['Completed tasks', count != null ? (completed ? completed.length : '--') + ' / ' + count : c.logs ? 'Not recorded' : 'Select a plan'], ['Child process', c.active === true ? 'Running' : c.active === false ? 'Inactive' : 'Unknown']].forEach(([label,value]) => {
       const card = el('div', undefined, 'card');
       card.append(el('div', label, 'label'), el('div', value, 'value blue'));
       summary.append(card);
@@ -138,7 +163,9 @@ function render(data) {
     app.append(summary);
     const current = panel('Current task');
     current.append(el('div', 'Current task: ' + (state.current_task || 'No task in progress'), 'value'));
-    current.append(el('p', 'Recorded state: ' + (state.status || 'Unavailable') + '. Child exit code: ' + (c.exit_code ?? 'Unavailable') + '. A child exit does not approve tasks.', 'muted'));
+    if (state.status === 'checkpointing') current.append(el('p', 'Checkpoint recovery is pending. Inspect the logs; RESUME remains subject to controller safety checks.', 'warning'));
+    if (state.status === 'stopped') current.append(el('p', 'Run stopped. Inspect the recorded attempt and runner-output.txt in Logs. If Codex reports authentication required, sign in through the local Codex CLI before retrying.', 'muted'));
+    if (c.exit_code != null || c.error || c.process_history?.length) current.append(detail('Process history - prior exits and diagnostics', JSON.stringify({previous_child_exit_code:c.exit_code, diagnostic:c.error, history:c.process_history || [], note:'Historical process results do not replace the current durable run outcome.'}, null, 2), 'process-history'));
     if (count != null && completed) current.append(el('p', 'Tasks remaining: ' + Math.max(0, count - completed.length)));
     if (history.length) current.append(detail('Latest attempt details', JSON.stringify(history[history.length - 1], null, 2), 'latest-attempt'));
     app.append(current);
@@ -181,11 +208,11 @@ function navigate(name) {
   document.getElementById('page-title').textContent = {overview:'Run overview', tasks:'Tasks', logs:'Logs'}[page];
   if (latest) render(latest);
 }
-async function refresh() {
+async function refresh(clearMessage = true) {
   if (!ready || busy) return;
   if (refreshing) return refreshing;
   refreshing = (async () => {
-    try { render(await window.pywebview.api.snapshot()); }
+    try { const data = await window.pywebview.api.snapshot(); if (clearMessage) message(''); render(data); }
     catch (error) {
       latest = {...(latest || {}), controller: {...(latest?.controller || {}), active: null, uncertain: true}};
       updateControls();
@@ -200,11 +227,14 @@ async function act(method) {
   if (document.getElementById(button).disabled) return;
   busy = true;
   updateControls();
+  let accepted = false;
   message(method === 'start' || method === 'resume' ? 'Waiting for native launch confirmation...' : 'Waiting for selection...');
   try {
     if (refreshing) await refreshing;
     const args = method === 'start' || method === 'resume' ? [Number(document.getElementById('attempts').value)] : [];
     const result = await window.pywebview.api[method](...args);
+    accepted = result.ok && !result.cancelled;
+    if (args.length && accepted) navigate('overview');
     message(result.cancelled ? 'Cancelled. No work launched.' : result.error || result.warning || (result.ok ? (args.length ? 'Launch accepted. Waiting for durable runner progress.' : 'Selection updated. No work launched.') : 'Action failed.'), !result.ok && !result.cancelled);
   } catch (error) { message('Action failed: ' + error, true); }
   finally {
@@ -212,7 +242,8 @@ async function act(method) {
     ready = false;
     updateControls();
     ready = true;
-    await refresh();
+    await refresh(false);
+    if (accepted && ['start', 'resume', 'open_run'].includes(method)) message('');
   }
 }
 async function showEvidence(name) {
@@ -352,6 +383,12 @@ class Bridge:
                     status.pop("task_count", None)
                 status["validation_errors"] = errors
                 status["preflight"] = self._controller.preflight()
+                status["start_ready"] = bool(
+                    paths["repo"] and plan_sha and not errors
+                    and status["active"] is False and not status.get("uncertain")
+                    and status["preflight"].get("clean") is True
+                    and not status["preflight"].get("start_error")
+                    and not status["preflight"].get("errors"))
                 # This is eligibility only; the controller revalidates on launch.
                 status["resume_ready"] = bool(
                     not errors and paths["repo"] and plan_sha and state

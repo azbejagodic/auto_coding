@@ -18,7 +18,7 @@ get('attempts').value = '3';
 const document = {getElementById: get, createElement: tag => new Element(tag),
   createTextNode: text => ({textContent: String(text)})};
 let data = {root:'', exists:false, empty:true, state:null, events:[], event_errors:[],
-  controller:{active:false, uncertain:false, repo:null, plan:null, logs:null, resume_ready:false,
+  controller:{active:false, uncertain:false, repo:null, plan:null, logs:null, resume_ready:false, start_ready:false,
     preflight:{branch:'feature/ui', clean:true, errors:[]}}};
 const calls = [];
 let launchResult = {ok:false, cancelled:true};
@@ -30,7 +30,7 @@ const api = {
   snapshot: async () => { snapshotReads++; if (failStatus) throw Error('status unavailable'); return structuredClone(data); },
   select_repo: async (...args) => { calls.push(['select_repo', ...args]); if (pendingSelection) await pendingSelection;
     data.controller.repo = 'C:\\project with spaces'; return {ok:true}; },
-  select_plan: async (...args) => { calls.push(['select_plan', ...args]); data.controller.plan = 'C:\\plans\\task.json'; return {ok:true}; },
+  select_plan: async (...args) => { calls.push(['select_plan', ...args]); data.controller.plan = 'C:\\plans\\task.json'; data.controller.start_ready = true; return {ok:true}; },
   open_run: async (...args) => { calls.push(['open_run', ...args]); return {ok:true, cancelled:true}; },
   start: async (...args) => { calls.push(['start', ...args]); if (launchResult.ok) { data.controller.active = true; data.controller.logs = data.root = 'C:\\runs\\one'; data.exists = true; data.empty = false; } return launchResult; },
   resume: async (...args) => { calls.push(['resume', ...args]); data.controller.active = true; return {ok:true}; },
@@ -60,6 +60,14 @@ const contents = () => get('app').textContent;
   assert(get('paths').textContent.includes('C:\\project with spaces'));
   await click('browse-plan');
   assert(!get('start').disabled);
+  for (const error of ['Runs are blocked on main/master. Switch to a feature branch first.', 'Plan validation failed: malformed plan', 'Commit or discard changes before START.']) {
+    data.controller.start_ready = false; data.controller.preflight.errors = [error];
+    await poll();
+    assert(get('start').disabled);
+    assert(get('preflight').textContent.includes(error));
+  }
+  data.controller.start_ready = true; data.controller.preflight.errors = [];
+  await poll();
   await click('open-run');
   assert(get('message').textContent.includes('Cancelled'));
   assert(get('paths').textContent.includes('C:\\plans\\task.json'));
@@ -116,7 +124,35 @@ const contents = () => get('app').textContent;
   data.controller.active = false; data.controller.resume_ready = false;
   data.state.status = 'completed'; data.state.completed = ['task-1'];
   await poll();
+  data.controller.exit_code = 1;
+  data.controller.error = 'Runner stopped with exit code 1; inspect state.json and events.jsonl.';
+  data.controller.process_history = [{exit_code:1, message:'Prior process failure'}];
+  await poll();
   assert(contents().includes('Completed (recorded)'));
+  const primary = walk(get('app')).filter(node => node.className === 'notice warning');
+  assert.equal(primary.length, 0, 'No mixed success/failure headline');
+  const processHistory = walk(get('app')).find(node => node.tag === 'details' && node.textContent.includes('Process history'));
+  assert.equal(processHistory.open, false);
+  assert(processHistory.textContent.includes('exit code 1'));
+  assert(processHistory.textContent.includes('previous_child_exit_code'));
+  get('message').textContent = 'Old launch warning';
+  await click('refresh');
+  assert.equal(get('message').textContent, '');
+  data.state.status = 'checkpointing';
+  await poll();
+  assert(contents().includes('Recovery pending (checkpointing)'));
+  assert(!contents().includes('Completed (recorded)'));
+  assert(get('resume').disabled);
+  data.state.status = 'completed';
+  api.open_run = async () => ({ok:true});
+  get('message').textContent = 'Launch accepted. Old warning';
+  await click('open-run');
+  assert.equal(get('message').textContent, '');
+  assert(contents().includes('Completed (recorded)'));
+  data.controller.active = true;
+  await poll();
+  assert(contents().includes('Active'));
+  assert(!contents().includes('Completed (recorded)'));
   data.controller.active = null; data.controller.uncertain = true; data.controller.error = 'Unknown launch; inspect logs';
   await poll();
   assert(contents().includes('Unknown child status'));

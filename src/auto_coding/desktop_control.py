@@ -31,6 +31,7 @@ class DesktopController:
         self.error: str | None = None
         self._launch_uncertain = False
         self._metadata_error = None
+        self.process_history = []
         self._lock = threading.Lock()
 
     def select_repo(self, path: str | Path) -> dict:
@@ -75,13 +76,17 @@ class DesktopController:
 
     def preflight(self) -> dict:
         """Read-only Git checks for display and launch confirmation."""
-        result = {"branch": None, "clean": None, "errors": [], "resume_error": None}
+        result = {"branch": None, "clean": None, "errors": [], "resume_error": None, "start_error": None}
         metadata = self._read_metadata()
         if metadata and (metadata.get("repo") != str(self.repo) or metadata.get("plan") != str(self.plan)):
             result["resume_error"] = "Resume requires the original exact repository and plan paths saved in desktop-run.json."
         if self.repo is None:
             result["errors"].append("Select a Git repository root.")
             return result
+        if self.runs_dir == self.repo or self.runs_dir.is_relative_to(self.repo):
+            result["start_error"] = "Run storage must be outside the project. Select a different project or configure external run storage."
+        if self._other_active_run():
+            result["errors"].append("An earlier desktop run may still be active. Open its logs and wait for it to stop.")
         try:
             branch = subprocess.run(["git", "branch", "--show-current"], cwd=self.repo,
                                     capture_output=True, text=True, shell=False, timeout=10)
@@ -210,6 +215,8 @@ class DesktopController:
                 logs = runs_dir / ("run-" + uuid.uuid4().hex)
                 logs.mkdir(exist_ok=False)
                 self.logs = logs
+                self.process_history = []
+                self.exit_code = None
                 self._metadata(logs)
                 return self._launch(attempts, False)
             except (OSError, ValueError, PilotError) as exc:
@@ -311,6 +318,8 @@ class DesktopController:
 
     def _metadata(self, logs: Path, pid: int | None = None, status: str = "stopped"):
         value = {"repo": str(self.repo), "plan": str(self.plan), "logs": str(logs)}
+        if self.process_history:
+            value["process_history"] = self.process_history
         if pid is not None: value["pid"] = pid
         value["status"] = status
         temp = logs / "desktop-run.json.tmp"
@@ -327,6 +336,9 @@ class DesktopController:
             if code is not None:
                 self.exit_code = code
                 self.process = None
+                self.process_history.append({"exit_code": code, "launch_warning": self.error,
+                    "message": (f"Runner stopped with exit code {code}; inspect state.json and events.jsonl."
+                                if code != 0 else "Runner process exited with code 0; durable state determines the run outcome.")})
                 if self.logs:
                     try:
                         self._metadata(self.logs, status="stopped")
@@ -355,7 +367,12 @@ class DesktopController:
                               "Inspect the process and logs before starting or resuming.")
         else:
             active = self.process is not None or (self._detached_pid is not None and self._pid_active(self._detached_pid))
-        return {"active": active, "uncertain": uncertain,
+        state = read_run(self.logs).get("state") if self.logs else None
+        # A durable result cannot prove that an active/unknown child is idle.
+        outcome = ("unknown" if uncertain or active is None else "active" if active else
+                   (state or {}).get("status", "unavailable"))
+        return {"active": active, "uncertain": uncertain, "outcome": outcome,
+                "process_history": list(self.process_history),
                 "exit_code": self.exit_code, "error": self.error}
 
     def snapshot(self) -> dict:
@@ -384,6 +401,10 @@ class DesktopController:
                 self._launch_uncertain = True
                 self.error = self._metadata_error + ". Child status is unknown; inspect before retrying."
             if value is None: raise ValueError("No usable desktop metadata")
+            self.process_history = [item for item in value.get("process_history", [])
+                                    if isinstance(item, dict)] if isinstance(value.get("process_history", []), list) else []
+            self.exit_code = next((item["exit_code"] for item in reversed(self.process_history)
+                                   if type(item.get("exit_code")) is int), None)
             self.repo, self.plan = Path(value["repo"]), Path(value["plan"])
             in_flight = value.get("status") in {"launching", "running"}
             pid = value.get("pid")

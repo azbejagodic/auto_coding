@@ -110,3 +110,42 @@ Headless callers can inject `dialogs`, `controller`, and `controller_factory`
 into `Bridge`. `NativeDialogs` is bound only after the native window is created;
 it supports pywebview's `FileDialog` enum and older dialog constants. Importing
 the module or requesting `--help` does not import pywebview.
+
+## Desktop usability pass: Windows smoke check
+
+Automated tests use fake processes, dialogs and webview; they never start Codex,
+access the network or open a GUI. A real Windows check is separate and manual:
+
+1. Create a disposable Git project with an initial commit and switch it to
+   `feature/ui-smoke`. Keep a one-task plan outside that project, asking for
+   `greet.py` to print `Hello, Auto-Coding!` and a Python test of that output.
+   Ask Codex B to enumerate concrete, reproducible blockers in this task and
+   approve with no issues when acceptance passes; visual polish belongs to the
+   next task. Authenticate the local Codex CLI before launching the dashboard.
+2. Open the dashboard without logs. Check the project/plan onboarding, select
+   both using native dialogs, reselect without launching, and inspect names,
+   full paths and the actual branch. Main/master, dirty trees and invalid plans
+   must block START with instructions. Details contains technical diagnostics.
+3. Cancel START's native summary once; no run should appear. Confirm it once,
+   then check the selected run, live current task, and Tasks/Logs. Open evidence
+   and leave it open through a polling update. Inspect any authentication failure
+   in `runner-output.txt`; sign in through the local CLI before retrying.
+4. Close and reopen the app, then Open Existing Run using the saved external log
+   folder. Closing must leave a live runner alone. Completion must come from
+   `state.json`; an exited child alone cannot approve the task. Inspect the exact
+   result, checkpoint SHA and raw logs; verify the greeting and Git status in the
+   disposable project. A stopped run may resume only through the existing exact
+   path/hash/branch/process checks. Do not force a Git lock conflict for this test.
+5. For the 26 October regression, an inactive child with prior exit 1 followed by
+   durable `completed` must show **Completed (recorded)** as the primary outcome.
+   **Process history** retains the failed exit and original diagnostic, including
+   after reopening. `checkpointing` means recovery pending; it does not make
+   RESUME eligible. Active or unknown children keep their safety priority.
+   Refresh and Open Existing Run clear transient launch messages. Raw files and
+   events remain unchanged; no successful child exit is inferred from recovery.
+
+Process exits observed by the controller are saved in `desktop-run.json` as
+`process_history` for later inspection. Older runs without that field remain
+readable; absent historical exit codes are not invented. START readiness is an
+eligibility display derived from validated paths and controller preflight;
+launch-time controller checks still make the final decision.
