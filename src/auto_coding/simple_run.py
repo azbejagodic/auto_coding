@@ -19,6 +19,8 @@ import time
 import uuid
 from typing import Callable
 from auto_coding.event_log import EventLog, EventLogError
+from auto_coding.github_workspace import (managed_job, WorkspaceError, cancel_reservation,
+                                         mark_process_uncertain)
 
 
 MAX_PLAN = 512 * 1024
@@ -91,12 +93,17 @@ def call(argv: list[str], cwd: Path, timeout: int, *, prompt: str | None = None)
                                 timeout=timeout, check=False, shell=False)
         return result.returncode, (result.stdout or "")[:MAX_OUTPUT], False
     except subprocess.TimeoutExpired as exc:
+        mark_process_uncertain()
         output = exc.stdout or b""
         if isinstance(output, bytes):
             output = output.decode("utf-8", errors="replace")
         return 124, str(output)[-MAX_OUTPUT:] + "\nPROCESS TIMED OUT", True
     except OSError as exc:
         return 127, f"Process could not start: {type(exc).__name__}", False
+    except BaseException:
+        # Interrupted subprocess.run may leave hooks or tool descendants alive.
+        mark_process_uncertain()
+        raise
 
 
 def safe_repo(repo: Path, create: bool) -> Path:
@@ -624,6 +631,7 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
     return 0
 
 
+@managed_job
 def run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False, attempts=3,
         model_a=None, model_b=None, timeout=1800, execute: Callable = call) -> int:
     """Run while ensuring controlled exceptions after log creation are recorded."""
@@ -699,14 +707,16 @@ def main(argv=None):
     parser.add_argument("--model-b")
     args = parser.parse_args(argv)
     if not 1 <= args.attempts <= 10 or not 30 <= args.timeout <= 86400:
+        cancel_reservation(args.repo, os.environ.get("AUTOCODING_JOB_RESERVATION"))
         parser.error("invalid attempts or timeout")
     if shutil.which("codex") is None:
+        cancel_reservation(args.repo, os.environ.get("AUTOCODING_JOB_RESERVATION"))
         parser.error("codex command not found in PATH")
     try:
         return run(args.plan, args.repo, args.logs, create_repo=args.create_repo,
                    resume=args.resume, attempts=args.attempts, timeout=args.timeout,
                    model_a=args.model_a, model_b=args.model_b)
-    except (PilotError, OSError, UnicodeError, json.JSONDecodeError) as exc:
+    except (PilotError, WorkspaceError, OSError, UnicodeError, json.JSONDecodeError) as exc:
         print(f"STOPPED: {exc}", file=sys.stderr)
         return 1
 

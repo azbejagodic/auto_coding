@@ -566,6 +566,31 @@ class Bridge:
     def select_repo(self, path=None):
         return self._select("repo", path)
 
+    def connect_github(self, repository):
+        with self._lock:
+            return self._controller.github("connect", repository)
+
+    def github_repositories(self):
+        with self._lock:
+            return self._controller.github("list_repositories")
+
+    def github_branches(self, repository):
+        with self._lock:
+            return self._controller.github("branches", repository)
+
+    def fetch_github(self, repository):
+        with self._lock:
+            return self._controller.github("fetch", repository)
+
+    def create_github_branch(self, repository, name, base="main", confirmed_base=False):
+        with self._lock:
+            return self._controller.github("create_branch", repository, name=name,
+                                           base=base, confirmed_base=confirmed_base)
+
+    def checkout_github_branch(self, repository, name):
+        with self._lock:
+            return self._controller.github("checkout_branch", repository, name=name)
+
     def select_plan(self, path=None):
         return self._select("plan", path)
 

@@ -1,6 +1,6 @@
 """Small process controller for the existing local-only simple_run CLI.
 
-Default run storage is ``~/AutoCoding-Runs``. Closing the desktop window leaves
+Default run storage is ``LocalAppData/AutoCoding/runs``. Closing the desktop window leaves
 the child process running; it is never silently terminated. Reopen a run by
 selecting its directory and use poll()/snapshot() to observe it.
 """
@@ -17,11 +17,13 @@ import uuid
 
 from auto_coding.desktop_reader import read_run, read_evidence
 from auto_coding.simple_run import PilotError, load_tasks
+from auto_coding.github_workspace import (GitHubWorkspaceManager, storage_root, serialized_launch,
+    managed_lock, reserve_job, cancel_reservation)
 
 
 class DesktopController:
     def __init__(self, runs_dir: str | Path | None = None):
-        self.runs_dir = Path(runs_dir or (Path.home() / "AutoCoding-Runs")).expanduser().resolve()
+        self.runs_dir = Path(runs_dir or (storage_root() / "runs")).expanduser().resolve()
         self.repo: Path | None = None
         self.plan: Path | None = None
         self.logs: Path | None = None
@@ -34,11 +36,65 @@ class DesktopController:
         self.process_history = []
         self._lock = threading.Lock()
 
+    def checkout_busy(self, repo) -> bool:
+        """Fail closed for a matching checkout's active or ambiguous run records."""
+        repo = Path(repo).resolve()
+        if self.repo and self.repo.resolve() == repo:
+            if self._launch_uncertain or self._selected_run_unknown() or self._selected_run_active():
+                return True
+            if self.process is not None and self.process.poll() is None:
+                return True
+            if self.logs:
+                state = read_run(self.logs).get("state")
+                if state and state.get("repo") == str(repo) and state.get("status") not in {"stopped", "completed"}:
+                    return True
+        paths = list(self.runs_dir.glob("run-*/desktop-run.json"))
+        if self.logs and (self.logs / "desktop-run.json") not in paths:
+            paths.append(self.logs / "desktop-run.json")
+        for path in paths:
+            try:
+                item = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(item, dict): return True
+                if item.get("repo") and Path(item["repo"]).resolve() != repo: continue
+                if item.get("status") in {"launching", "running"}:
+                    # Even an absent PID may have left active descendants.
+                    return True
+            except FileNotFoundError:
+                if path.parent == self.logs: continue
+                return True
+            except (OSError, ValueError, TypeError):
+                return True
+        return False
+
+    def _workspace_manager(self):
+        manager = GitHubWorkspaceManager(active_check=self.checkout_busy)
+        manager.runs_dir = self.runs_dir
+        return manager
+
+    def github(self, action, repository=None, **kwargs):
+        try:
+            if action not in {"list_repositories", "connect", "branches", "fetch", "create_branch", "checkout_branch"}:
+                raise ValueError("Unsupported workspace operation.")
+            manager = self._workspace_manager()
+            if action == "list_repositories":
+                return {"ok": True, **manager.list_repositories()}
+            if action == "connect":
+                status = self.job_status()
+                if status["active"] is not False or status["uncertain"]:
+                    raise ValueError("Cannot change projects while a job is active or uncertain.")
+            result = getattr(manager, action)(repository, **kwargs)
+            if action == "connect":
+                self.repo = Path(result["path"])
+            return {"ok": True, **result}
+        except (OSError, ValueError) as exc:
+            return {"ok": False, "error": str(exc), "code": getattr(exc, "code", "workspace")}
+
     def select_repo(self, path: str | Path) -> dict:
         try:
             repo = Path(path).expanduser().resolve(strict=True)
             if not repo.is_dir(): raise ValueError("Target must be a directory.")
-            top = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=repo, capture_output=True, text=True, shell=False)
+            top = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=repo, capture_output=True,
+                                 text=True, encoding="utf-8", errors="replace", shell=False)
             if top.returncode or Path(top.stdout.strip()).resolve() != repo:
                 raise ValueError("Select the Git repository root, not a subdirectory.")
             self.repo = repo
@@ -83,20 +139,23 @@ class DesktopController:
         if self.repo is None:
             result["errors"].append("Select a Git repository root.")
             return result
+        job_lock = managed_lock(self.repo, ".job.lock")
+        if job_lock and job_lock.exists():
+            result["errors"].append("An Auto-Coding runner is active or uncertain for this checkout.")
         if self.runs_dir == self.repo or self.runs_dir.is_relative_to(self.repo):
             result["start_error"] = "Run storage must be outside the project. Select a different project or configure external run storage."
         if self._other_active_run():
             result["errors"].append("An earlier desktop run may still be active. Open its logs and wait for it to stop.")
         try:
             branch = subprocess.run(["git", "branch", "--show-current"], cwd=self.repo,
-                                    capture_output=True, text=True, shell=False, timeout=10)
+                                    capture_output=True, text=True, encoding="utf-8", errors="replace", shell=False, timeout=10)
             result["branch"] = branch.stdout.strip() if not branch.returncode else None
             if not result["branch"]:
                 result["errors"].append("Select a feature branch; detached HEAD or unavailable Git branch.")
             elif result["branch"].lower() in {"main", "master"}:
                 result["errors"].append("Runs are blocked on main/master. Switch to a feature branch first.")
             status = subprocess.run(["git", "status", "--porcelain", "--untracked-files=all"],
-                                    cwd=self.repo, capture_output=True, text=True, shell=False, timeout=10)
+                                    cwd=self.repo, capture_output=True, text=True, encoding="utf-8", errors="replace", shell=False, timeout=10)
             result["clean"] = not status.stdout.strip() if not status.returncode else None
             if status.returncode:
                 result["errors"].append("Could not check Git working tree.")
@@ -194,6 +253,7 @@ class DesktopController:
         return bool(self._metadata_error or (item and item.get("status") in {"launching", "running"}
                     and not self._valid_pid(item.get("pid"))))
 
+    @serialized_launch
     def start(self, attempts: int = 3) -> dict:
         with self._lock:
             if self.process is not None and self.process.poll() is None:
@@ -222,6 +282,7 @@ class DesktopController:
             except (OSError, ValueError, PilotError) as exc:
                 return self._fail(str(exc))
 
+    @serialized_launch
     def resume(self, attempts: int = 3) -> dict:
         with self._lock:
             if self.process is not None and self.process.poll() is None:
@@ -259,12 +320,19 @@ class DesktopController:
     def _launch(self, attempts: int, resume: bool) -> dict:
         src = str(Path(__file__).resolve().parents[1])
         env = os.environ.copy()
+        # A reservation belongs only to this launch, never to a parent runner.
+        env.pop("AUTOCODING_JOB_RESERVATION", None)
         env["PYTHONPATH"] = src + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
         argv = [sys.executable, "-B", "-m", "auto_coding.simple_run", "--repo", str(self.repo),
                 "--logs", str(self.logs), "--attempts", str(attempts)]
         if resume: argv.append("--resume")
         argv.append(str(self.plan))
+        reservation = None
+        spawned = False
         try:
+            reservation = reserve_job(self.repo)
+            if reservation is not None:
+                env["AUTOCODING_JOB_RESERVATION"] = reservation
             # Persist intent before creating a child. If PID persistence then fails,
             # reopen can still refuse an unsafe duplicate resume.
             self._metadata(self.logs, status="launching")
@@ -280,6 +348,7 @@ class DesktopController:
                 self.process = Popen(argv, cwd=src, env=env, shell=False,
                                      stdin=subprocess.DEVNULL, stdout=output,
                                      stderr=subprocess.STDOUT, **options)
+                spawned = True
             self.exit_code = None
             self.error = None
             try:
@@ -290,6 +359,8 @@ class DesktopController:
                 self.error = f"Runner is active (PID {getattr(self.process, 'pid', 'unknown')}), but its PID could not be saved: {exc}. Keep this window open and do not resume this run."
             return {"ok": True, "argv": argv, "error": self.error}
         except OSError as exc:
+            if not spawned:
+                cancel_reservation(self.repo, reservation)
             if self.process is None and self.logs is not None:
                 try:
                     self._metadata(self.logs, status="stopped")

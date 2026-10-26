@@ -57,12 +57,59 @@ Local Codex CLI authentication is required before starting. The runner inherits 
 2. Click **Browse** beside Project folder and select that project's Git root. Click **Browse** beside Task plan and select the intended TXT, MD or JSON plan. TXT/MD represents one task; JSON can include ordered tasks and explicit test command argv arrays (see `examples`). Keep the plan outside the target checkout, or commit it before starting. Browsing, opening and cancelling selection never launch work. Full paths, branch, working tree and validation errors appear in the dashboard.
 3. Enter a whole-number total attempt limit from **1 through 10** (default **3**). Invalid or empty entries explain why START and RESUME are disabled. Click **START** and review the native confirmation containing the repo, branch, plan and local-only policy. Cancelling does not launch anything. Approved task checkpoints are local commits. There is no automatic push, merge or force-push. Overview keeps setup compact, with preflight errors visible and safeguards in one expandable **Details** section.
 4. **Overview** shows recorded state, current task, task counts, child activity/errors and recent events. **Tasks** shows each attempt, test results and Codex B verdicts, with original feedback and summaries in expandable details. **Logs** shows timestamped actors/outcomes and evidence links. Its raw file list also supports legacy runs with no event timeline. Files are loaded only when selected, as text, confined to the chosen logs directory and capped at 1 MB. Missing/corrupt sources produce warnings. The UI polls every four seconds and preserves opened evidence and expanded details.
-5. New logs live in `%USERPROFILE%\AutoCoding-Runs\run-<id>` outside the project; the full selected log path remains accessible in **Details** after the child exits. Logs include `desktop-run.json`, `state.json`, `events.jsonl`, evidence files and `runner-output.txt` (including launch/initialization diagnostics). Historical process exits and diagnostics are in **Logs**; completed saved state takes priority over past exit warnings. A child exit code is never treated as task approval; only durable runner state supplies completion.
+5. New logs live in `%LOCALAPPDATA%\AutoCoding\runs\run-<id>` outside the project; the full selected log path remains accessible in **Details** after the child exits. Logs include `desktop-run.json`, `state.json`, `events.jsonl`, evidence files and `runner-output.txt` (including launch/initialization diagnostics). Historical process exits and diagnostics are in **Logs**; completed saved state takes priority over past exit warnings. A child exit code is never treated as task approval; only durable runner state supplies completion.
 6. To resume, click **Open Run** and choose its log directory. Desktop runs restore the original exact repo and plan paths. RESUME is enabled only for matching stopped state and inactive, known child status; the controller checks again at launch. Keep the original plan bytes and paths. Legacy runs without desktop metadata require selecting their original repo and plan explicitly. Choose **5** if the original total attempt limit of 3 was exhausted, then click **RESUME** and confirm. Staged work is reconciled by the existing runner. Running, missing-state or uncertain launches cannot be resumed through this UI; inspect the visible diagnostics instead of launching duplicate work.
 
 Closing the window leaves the Windows child process alive in the background. Open its saved log directory in another window to inspect progress. If its PID cannot be saved or its launch status is uncertain, the dashboard blocks START/RESUME and explains the error. An interrupted child whose durable state still says running is shown as unknown, rather than invented completion or approval. There is no stop/kill button in this slice.
 
 Debug export, per-task model selection and `.exe` packaging remain unimplemented. No web server, remote assets or additional model controls are included. Imports and `--help` stay GUI-free; pywebview is loaded only when opening a native window.
+
+## GitHub workspace service (Feature 2)
+
+`auto_coding.github_workspace.GitHubWorkspaceManager` provides `connect`/`reopen`,
+`branches`, `fetch`, `create_branch`, `checkout_branch`, and optional
+`list_repositories`. Repository inputs are `OWNER/REPO`,
+`https://github.com/OWNER/REPO.git` (also without `.git`), or
+`git@github.com:OWNER/REPO.git`. Only github.com is supported. Git uses existing
+credential-manager or SSH authentication; `gh` is optional. Authentication and
+network failures have safe error codes and omit raw command diagnostics.
+
+One checkout per normalized repository lives in
+`%LOCALAPPDATA%\AutoCoding\workspaces\<identity-sha256>`. The adjacent metadata
+contains only a schema version and normalized repository identity. Checkout reuse
+requires matching metadata and origin. Clones use separate attempt directories
+and publish the checkout only after verifying it. Failed attempts are left untouched;
+completed authentication/network failures and missing-Git failures can be retried without
+adopting or deleting their partial files. Unrelated directories are left untouched.
+On portable hosts without LocalAppData, explicitly set
+`AUTOCODING_CONFIG_DIR` to a per-user configuration directory; `AutoCoding/workspaces`
+and `AutoCoding/runs` live beneath it. Python callers can instead pass `config_dir`.
+
+The existing Bridge exposes `connect_github`, `github_repositories`,
+`github_branches`, `fetch_github`, `create_github_branch`, and
+`checkout_github_branch`. Connection selects the managed project without launching
+a run. Branch creation fetches current origin/main and creates a new feature
+branch from that commit. An alternate remote base requires `confirmed_base=True`
+after the caller obtains explicit user confirmation. Existing local or fetched
+remote feature branches can be selected. main/master are protected.
+
+Branch changes require a clean worktree, no unresolved Git operation and no active
+or uncertain Auto-Coding job. Atomic per-checkout locks serialize clones, branch
+operations and desktop launches. Desktop reserves a shared job lock before spawning,
+including with custom run storage; the child claims that reservation once and holds
+it for its lifetime. Known spawn, plan-validation and CLI prerequisite failures
+release the reservation. An abandoned lock or unresolved launch record deliberately
+blocks changes until its process and logs have been inspected. Managed tool timeouts,
+direct runner Git timeouts (including checkpoint commits), subprocess interruptions,
+and executor exceptions retain an uncertain job lock because child processes may
+still be alive. Workspace Git timeouts and interruptions retain the checkout
+operation lock, including during cloning; subsequent branch operations, desktop
+START/RESUME, and direct managed runner launches remain blocked across service
+instances until the checkout and surviving processes have been inspected. The
+service never automatically expires or removes an uncertain lock. The service never resets,
+cleans, deletes checkouts, pushes or merges. This slice adds service APIs without
+changing the dashboard layout: the existing project picker and Open Run remain
+available, including legacy logs under `~/AutoCoding-Runs` or other external paths.
 
 Run the headless regressions without Codex, a native window or network calls:
 
