@@ -141,6 +141,7 @@ const contents = () => get('app').textContent;
   await poll();
   const attempts = get('attempts');
   data.controller.resume_ready = true;
+  await poll(); // Sync simulated status before asserting Resume is enabled.
   for (const value of ['0', '11', '2.5', '', '-1', 'NaN', '3.0', 'Infinity']) {
     attempts.value = value; attempts.oninput();
     assert.equal(attempts['aria-invalid'], 'true', value);
