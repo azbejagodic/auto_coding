@@ -56,20 +56,44 @@ const flush = async () => { await new Promise(resolve => setImmediate(resolve));
 const click = async id => { await get(id).onclick(); await flush(); };
 const walk = node => [node, ...(node.children || []).flatMap(walk)];
 const contents = () => get('app').textContent;
+const assertCards = (status, completed, child) => {
+  const cards = get('app').children[0];
+  assert.equal(cards.className, 'grid');
+  assert.equal(get('app').children.length, 1, 'Overview ends with only the status row');
+  assert.deepEqual(cards.children.map(card => card.children[0].textContent), ['RUN STATUS', 'COMPLETED TASKS', 'CHILD PROCESS']);
+  assert.deepEqual(cards.children.map(card => card.children[1].textContent), [status, completed, child]);
+  assert(get('logs-tools').hidden, 'Secondary controls are absent from Overview');
+};
 (async () => {
   assert(get('start').disabled);
   await listeners.pywebviewready(); await flush();
   assert(!get('browse-project').disabled);
   assert(get('start').disabled);
   assert.equal(get('header-state').textContent, 'Idle');
-  assert.equal(contents(), '', 'No duplicate empty setup panel');
+  assertCards('Idle', 'Unknown', 'Inactive');
   assert(get('start-reason').textContent.includes('Connect a repository'));
   assert(!get('auto-push').checked);
-  assert(get('auto-push-note').textContent.includes('OFF'));
   assert(!contents().includes('Ready for your first run'));
   assert.equal(get('run-setup').hidden, false);
+  // Durable status, completion, and current activity are independent snapshot facts.
+  const baseline = structuredClone(data);
+  for (const [state, active, uncertain, total, expected] of [
+    [{status:'running', completed:['a']}, true, false, 3, ['Running', '1 / 3', 'Running']],
+    [{status:'completed', completed:['a','b','c']}, false, false, 3, ['Completed', '3 / 3', 'Inactive']],
+    [{status:'stopped', completed:[]}, false, false, 3, ['Stopped', '0 / 3', 'Inactive']],
+    [{status:'completed', completed:['a']}, true, false, 1, ['Completed', '1 / 1', 'Running']],
+    [null, null, true, null, ['Unknown', 'Unknown', 'Unknown']],
+    [{status:'future-status'}, false, false, 3, ['Unknown', 'Unknown', 'Inactive']],
+    [{status:'stopped', completed:['a']}, false, false, 0, ['Stopped', '1 / Unknown', 'Inactive']],
+  ]) {
+    data.state = state; data.root = data.controller.logs = 'mock/run'; data.exists = true;
+    Object.assign(data.controller, {active, uncertain, exit_code:0}); data.task_count = total;
+    await poll(); assertCards(...expected);
+    data.controller.exit_code = 1; await poll(); assertCards(...expected);
+  }
+  data = baseline; await poll();
   const initial = structuredClone(data);
-  await click('run-history');
+  await click('nav-logs');
   assert.equal(get('nav-logs')['aria-current'], 'page');
   assert(contents().includes('Inspect before sharing'));
   assert(walk(get('app')).find(node => node.textContent === 'Export DEBUG REPORT (default)').disabled);
@@ -212,12 +236,10 @@ const contents = () => get('app').textContent;
   await click('browse-plan');
   assert(!get('start').disabled);
   get('auto-push').checked = true; get('auto-push').onchange();
-  assert(get('auto-push-note').textContent.includes('New run: automatic push ON'));
   await poll();
   assert(get('auto-push').checked, 'Unchanged polling preserves explicit opt-in');
   data.controller.preflight.branch = 'feature/another-setup'; await poll();
   assert.equal(get('auto-push').checked, false, 'A different branch defaults automatic push OFF');
-  assert(get('auto-push-note').textContent.includes('New run: automatic push OFF'));
   for (const error of ['Runs are blocked on main/master. Switch to a feature branch first.', 'Plan validation failed: malformed plan', 'Commit or discard changes before START.']) {
     data.controller.start_ready = false; data.controller.preflight.errors = [error];
     await poll();
@@ -267,7 +289,6 @@ const contents = () => get('app').textContent;
   await click('start');
   assert.deepEqual(calls.at(-1), ['start', 3, true]);
   assert.equal(get('auto-push').checked, true, 'Active run shows its saved publication policy');
-  assert(get('auto-push-note').textContent.includes('This run: automatic push ON'));
   assert(get('auto-push').disabled, 'Publication settings cannot change mid-run');
   await click('start');
   assert.equal(calls.filter(call => call[0] === 'start').length, 2);
@@ -276,8 +297,6 @@ const contents = () => get('app').textContent;
   // A completed/stopped run can seed a new Start, whose policy must default OFF.
   data.controller.active = false; await poll();
   assert.equal(get('auto-push').checked, false);
-  assert(get('auto-push-note').textContent.includes('New run: automatic push OFF'));
-  assert(get('auto-push-note').textContent.includes('saved run policy: ON'));
   get('auto-push').checked = true; get('auto-push').onchange();
   launchResult = {ok:false, cancelled:true};
   await click('start');
@@ -294,7 +313,8 @@ const contents = () => get('app').textContent;
     metadata:{reason:'<script>bad()</script>'}}];
   data.event_errors = ['Line 2: corrupt event'];
   await poll();
-  assert(contents().includes('Current task: task-1'));
+  assert(!contents().includes('Current task: task-1'));
+  assertCards('Running', '0 / Unknown', 'Running');
   await click('nav-tasks');
   for (const text of ['Attempt 1', 'REJECTED', 'Original summary', 'Original feedback', 'Test 1: exit 1']) assert(contents().includes(text), text);
   assert(walk(get('app')).some(node => node.className === 'attempt rejected'));
@@ -342,6 +362,7 @@ const contents = () => get('app').textContent;
   data.state.status = 'stopped'; data.controller.resume_ready = true;
   await poll();
   assert.equal(get('header-state').textContent, 'Stopped');
+  assertCards('Stopped', '0 / Unknown', 'Inactive');
   get('attempts').value = '5';
   await click('resume'); await click('resume');
   assert.deepEqual(calls.at(-1), ['resume', 5]);
@@ -356,6 +377,9 @@ const contents = () => get('app').textContent;
   assert.equal(get('header-state').textContent, 'Completed');
   assert(!contents().includes('Line 2: corrupt event'), 'Historical log diagnostics stay in Logs');
   assert.equal(get('header-state').className, 'pill green');
+  data.task_count = 1; await poll();
+  assertCards('Completed', '1 / 1', 'Inactive');
+  delete data.task_count; await poll();
   assert(!contents().includes('Runner stopped with exit code 1'));
   await click('nav-logs');
   assert(contents().includes('Runner stopped with exit code 1'));
@@ -398,19 +422,21 @@ const contents = () => get('app').textContent;
   data.controller.active = null; data.controller.uncertain = true; data.controller.error = 'Unknown launch; inspect logs';
   await poll();
   assert.equal(get('header-state').textContent, 'Unknown child status');
-  assert(contents().includes('Unknown launch; inspect logs'));
+  assert(get('preflight').textContent.includes('Unknown launch; inspect logs'));
+  assertCards('Completed', '1 / Unknown', 'Unknown');
   assert(get('start').disabled && get('resume').disabled);
   data.root = data.controller.logs = 'C:\\legacy'; data.controller.active = false; data.controller.uncertain = false;
   data.state = null; data.events = []; data.state_error = 'state.json is corrupt or unreadable';
   data.files = [{label:'File', path:'legacy.txt', status:'available'}];
-  await poll(); await click('nav-logs');
+  await poll();
+  assertCards('Unknown', 'Unknown', 'Inactive');
+  await click('nav-logs');
+  assert.equal(get('logs-tools').hidden, false);
   assert(contents().includes('No events recorded'));
   assert(contents().includes('state.json is corrupt'));
   assert(contents().includes('legacy.txt (available)'));
-  assert(get('auto-push-note').textContent.includes('saved run policy: not recorded'));
   data.controller.active = true; await poll();
   assert(get('auto-push').indeterminate, 'Missing active state must not be reported as policy OFF');
-  assert(get('auto-push-note').textContent.includes('not recorded yet'));
   data.controller.active = false; await poll();
   assert.equal(get('evidence-viewer').children.length, 0, 'Changing runs must clear old evidence');
   api.evidence = async () => ({ok:false, text:'Evidence file is missing.'});
