@@ -31,6 +31,9 @@ button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visi
 .side p{font-size:14px;margin-top:24px}
 .main{margin-left:210px;padding:24px 32px;flex:1;min-width:0;max-width:1700px;overflow-wrap:anywhere}
 .top{display:flex;justify-content:space-between;gap:16px;align-items:center;margin-bottom:16px}
+.overview-top{justify-content:flex-start}
+.overview-top #refresh{margin-top:0!important}
+.overview-top>div:last-child{display:flex;align-items:center;gap:12px}
 .top>div:first-child{min-width:0}
 .top>div:last-child{flex-shrink:0}
 .top h1{font-size:26px;margin:4px 0}
@@ -55,12 +58,11 @@ button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visi
 .repository-line{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px}
 .branch-line{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin-top:12px}
 #github-branch{flex:1;min-width:0;max-width:100%}
-#github-state{margin:8px 0 16px;overflow-wrap:anywhere}
-.flow{color:#c5d8ef;margin:0 0 20px}
+#github-state{margin:8px 0 12px;overflow-wrap:anywhere}
 .step-title{display:block;font-weight:650;margin-bottom:8px}
 .launch-row{display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin-top:20px}
 #start-reason{flex:1;min-width:180px}
-.push-policy{display:block;margin-top:16px}
+.push-policy{display:block;margin-top:12px}
 #auto-push-note{display:block;margin:4px 0 0 26px}
 .secondary{background:#242e3b;border:1px solid #536174;border-radius:12px;padding:8px 16px;margin:16px 0}
 .secondary>summary{font-weight:650}
@@ -128,10 +130,10 @@ progress{width:100%;height:12px;accent-color:#72adf9}
 </nav>
 </aside>
 <main class="main">
-<header class="top">
-<div>
+<header id="dashboard-header" class="top overview-top">
+<div id="header-context" hidden>
 <div class="label">Local developer workspace</div>
-<h1 id="page-title">Run overview</h1>
+<h1 id="page-title">Overview</h1>
 <div class="muted project-heading" id="selected-project">No project selected</div>
 </div>
 <div>
@@ -140,16 +142,16 @@ progress{width:100%;height:12px;accent-color:#72adf9}
 </div>
 </header>
 <section class="panel" id="run-setup" aria-labelledby="setup-title">
-<h2 id="setup-title">Set up a run</h2>
-<p class="flow">Repository and branch → Task plan → Attempts → Start</p>
-<label class="step-title" for="github-repo">1. Repository and branch</label>
+<label id="setup-title" class="step-title" for="github-repo">Repository</label>
 <div class="repository-line">
 <input id="github-repo" aria-label="GitHub repository" placeholder="OWNER/REPO or GitHub URL">
-<button id="connect-github">Connect repository</button>
+<button id="connect-github">Connect Repository</button>
 </div>
-<div class="branch-line">
+<label class="step-title" for="github-branch" style="margin-top:12px">Branch</label>
+<div class="branch-line" style="margin-top:0">
 <select id="github-branch" aria-label="Feature branch"></select>
-<button id="select-branch">Select branch</button>
+<button id="fetch-github">Fetch Branches</button>
+<button id="select-branch">Select Branch</button>
 <button id="new-branch">New Branch</button>
 </div>
 <p id="github-state" class="muted">Connect a repository to choose a feature branch.</p>
@@ -163,41 +165,41 @@ progress{width:100%;height:12px;accent-color:#72adf9}
 </div>
 <div class="setup-fields">
 <div class="field">
-<label id="plan-label">2. Task plan</label>
+<label id="plan-label">Task plan</label>
 <div class="field-line">
 <div id="plan-path" class="selected-path" tabindex="0" role="textbox" aria-readonly="true" aria-labelledby="plan-label">No plan selected</div>
 <button id="browse-plan" aria-label="Browse task plan">Browse</button>
 </div>
 </div>
 <div class="field">
-<label for="attempts">3. Attempts</label>
+<label for="attempts">Attempts</label>
 <input id="attempts" type="number" min="1" max="10" step="1" value="3" required aria-describedby="attempts-hint attempts-error">
 <small id="attempts-hint" class="muted">1–10 per task</small>
 </div>
 </div>
 <div id="attempts-error" class="notice red" role="status" aria-live="polite"></div>
 <div class="launch-row">
-<button id="start" aria-describedby="start-reason attempts-error">4. Start</button>
-<span id="start-reason" class="muted" role="status" aria-live="polite"></span>
+<button id="start" aria-describedby="start-reason attempts-error">Start</button>
+<button id="resume" aria-describedby="resume-reason attempts-error">Resume</button>
+<button id="push-approved" aria-describedby="push-reason">Push Approved Commits</button>
 </div>
+<div id="start-reason" class="muted" role="status" aria-live="polite"></div>
 <label class="push-policy"><input id="auto-push" type="checkbox" aria-describedby="auto-push-note"> Automatically push approved tasks</label>
-<small id="auto-push-note" class="muted">Off for a new run. Approved commits stay local; enabling publishes them to the feature branch. No merge or force-push.</small>
+<small id="auto-push-note" class="muted">Off by default; enable to publish approved commits to the feature branch without merging or force-pushing.</small>
 <div id="preflight" class="notice muted">
 </div>
-<details id="git-actions" class="secondary">
-<summary>Git actions and saved runs</summary>
 <div class="controls">
-<button id="resume" aria-describedby="resume-reason attempts-error">Resume</button>
 <button id="open-run">Open Run</button>
-<span id="resume-reason" class="muted">Open a matching stopped run to resume.</span>
+<button id="run-history">Run history / Logs</button>
 </div>
+<details id="secondary-controls">
+<summary>More controls and diagnostics</summary>
+<div id="resume-reason" class="muted">Open a matching stopped run to resume.</div>
+<div id="push-reason" class="muted"></div>
 <div class="controls">
-<button id="fetch-github">Fetch branches</button>
 <button id="list-github">My repositories</button>
 <select id="github-repositories" aria-label="Authenticated repositories" hidden></select>
 </div>
-<div class="controls"><button id="push-approved">Push Approved Commits</button>
-<span id="push-reason" class="muted"></span></div>
 <details id="local-project"><summary>Local folder fallback</summary>
 <div class="field">
 <label id="project-label">Project folder</label>
@@ -207,13 +209,12 @@ progress{width:100%;height:12px;accent-color:#72adf9}
 </div>
 </div>
 </details>
-</details>
 <details id="launch-details">
-<summary>Launch safeguards and diagnostics</summary>
-<p class="muted">Every launch requires native confirmation. START requires a clean feature branch. RESUME requires a stopped run and its original plan, repository and logs. Attempts is the total limit per task (1–10); increase it to continue an exhausted run. Checkpoints stay local unless automatic push is explicitly enabled for this run. No automatic merge or force-push. Model and reasoning settings come from your local Codex CLI.</p>
-<p class="muted">Local Codex CLI authentication is required. Closing this window leaves the runner alive. Reopen its logs to inspect progress.</p>
+<summary>Preflight diagnostics</summary>
+<p class="muted">Start and Resume require native confirmation. Local Codex CLI authentication is required. Closing this window leaves the runner alive.</p>
 <pre id="preflight-details" tabindex="0" aria-label="Preflight diagnostics"></pre>
 <div id="run-folder" class="path muted"></div>
+</details>
 </details>
 </section>
 <div id="message" class="notice" role="status" aria-live="polite">
@@ -288,11 +289,17 @@ function updateControls() {
   ['github-branch', 'select-branch', 'new-branch', 'fetch-github', 'branch-base', 'branch-base-confirm', 'create-branch'].forEach(id => {
     document.getElementById(id).disabled = locked || !c.repository || c.preflight?.clean !== true;
   });
+  const protectedBranch = ['main', 'master'].includes((c.preflight?.branch || '').toLowerCase());
+  ['connect-github', 'browse-project', 'github-repositories'].forEach(id => {
+    document.getElementById(id).disabled = locked || (!!c.repo && c.preflight?.clean !== true);
+  });
+  const selectedBranch = document.getElementById('github-branch').value;
+  document.getElementById('select-branch').disabled ||= !selectedBranch || ['main', 'master'].includes(selectedBranch.toLowerCase());
   document.getElementById('auto-push').disabled = locked;
   const base = document.getElementById('branch-base').value;
   document.getElementById('branch-base-confirm-label').hidden = !base || base === 'main';
   document.getElementById('create-branch').disabled ||= !base || (base !== 'main' && !document.getElementById('branch-base-confirm').checked);
-  document.getElementById('push-approved').disabled = locked || !c.push?.eligible;
+  document.getElementById('push-approved').disabled = locked || protectedBranch || c.preflight?.clean !== true || !c.push?.eligible;
   document.getElementById('push-reason').textContent = c.push?.reason || 'Select a managed repository to publish approved local checkpoints.';
   const savedPush = !!latest?.state?.auto_push;
   const savedRun = !!c.logs || !!latest?.root;
@@ -308,13 +315,13 @@ function updateControls() {
   push.disabled = locked || showingSavedPolicy;
   push.indeterminate = showingSavedPolicy && !latest?.state;
   document.getElementById('auto-push-note').textContent = push.indeterminate
-    ? 'This run: automatic push policy is not recorded yet. Inspect saved state in Logs; Resume uses its saved policy.'
+    ? 'This run: automatic push policy is not recorded yet; inspect Logs, as Resume uses its saved policy.'
     : showingSavedPolicy
-    ? 'This run: automatic push ' + (savedPush ? 'ON. Approved commits publish to the feature branch.' : 'OFF. Approved commits stay local.') + ' Resume preserves this policy. No merge or force-push.'
-    : 'New run: automatic push ' + (push.checked ? 'ON. Approved commits will publish to the feature branch.' : 'OFF. Approved commits stay local.') + ' No merge or force-push.' + (savedRun ? ' Resume keeps the saved run policy: ' + (!latest?.state ? 'not recorded.' : savedPush ? 'ON.' : 'OFF.') : '');
+    ? 'This run: automatic push ' + (savedPush ? 'ON; approved commits publish to the feature branch' : 'OFF; approved commits stay local') + ', Resume preserves this policy without merging or force-pushing.'
+    : 'New run: automatic push ' + (push.checked ? 'ON; approved commits publish to the feature branch' : 'OFF; enable to publish approved commits to the feature branch') + ' without merging or force-pushing' + (savedRun ? '; Resume keeps the saved run policy: ' + (!latest?.state ? 'not recorded' : savedPush ? 'ON' : 'OFF') : '') + '.';
   const validAttempts = validateAttempts();
-  document.getElementById('start').disabled = locked || !c.start_ready || !validAttempts;
-  document.getElementById('resume').disabled = locked || !c.resume_ready || !validAttempts;
+  document.getElementById('start').disabled = locked || protectedBranch || !c.start_ready || !validAttempts;
+  document.getElementById('resume').disabled = locked || protectedBranch || !c.resume_ready || !validAttempts;
   const startReason = !ready ? 'Loading repository status...' : busy ? 'Finish the current action first.'
     : c.uncertain || c.active === null ? 'Resolve unknown child status in Logs.' : c.active ? 'A run is already active.'
     : !validAttempts ? 'Enter 1–10 whole attempts.' : !c.repo ? 'Connect a repository first.' : !c.plan ? 'Choose a task plan.'
@@ -370,6 +377,8 @@ function timelineInto(parent, events) {
 }
 function render(data) {
   evidenceViewer.hidden = page !== 'logs';
+  document.getElementById('header-context').hidden = page === 'overview';
+  document.getElementById('dashboard-header').className = 'top' + (page === 'overview' ? ' overview-top' : '');
   const searchFocused = document.activeElement?.id === 'log-search';
   const searchCursor = searchFocused ? document.activeElement.selectionStart : null;
   latest = data;
@@ -385,7 +394,12 @@ function render(data) {
   });
   document.getElementById('selected-project').textContent = c.repository || c.repo || 'No project selected';
   const connection = document.getElementById('github-state');
-  connection.textContent = c.repo ? (c.repository ? 'GitHub origin verified locally' : 'Local project') + ' | Branch: ' + (c.preflight?.branch || 'Detached HEAD') + ' | ' + (c.preflight?.clean === true ? 'Clean' : 'Changes or unavailable status') + (c.github?.error ? ' | ' + c.github.error : '') : 'Connect a repository to choose a feature branch.';
+  const currentBranch = c.preflight?.branch;
+  const publication = !c.github?.error && currentBranch && Array.isArray(c.github?.remote) && Array.isArray(c.github?.local)
+    ? c.github.remote.includes('origin/' + currentBranch) ? 'Published (cached origin ref)'
+      : c.github.local.includes(currentBranch) ? 'Local-only (no cached origin ref)' : 'Publication unknown'
+    : 'Publication unknown';
+  connection.textContent = c.repo ? 'Current branch: ' + (currentBranch || 'Detached HEAD / unavailable') + ' | ' + (c.preflight?.clean === true ? 'Clean' : 'Changes or unavailable status') + ' | ' + publication + (c.github?.error ? ' | ' + c.github.error : '') : 'Connect a repository to choose a feature branch.';
   const branches = document.getElementById('github-branch');
   const bases = document.getElementById('branch-base');
   const remoteBases = [...new Set((c.github?.remote || []).filter(name => name.startsWith('origin/') && name !== 'origin/HEAD').map(name => name.slice(7)))];
@@ -512,7 +526,6 @@ function render(data) {
   const events = data.events || [];
   const history = Array.isArray(state.history) ? state.history.filter(item => item && typeof item === 'object') : [];
   const completed = Array.isArray(state.completed) ? state.completed : null;
-  const status = presentation.label;
   const reconciled = presentation.label === 'Completed' || c.active === false && !c.uncertain && state.status === 'checkpointing';
   if (c.error && !reconciled) app.append(el('div', c.error, 'notice warning'));
   if (data.state_error) app.append(el('div', data.state_error, 'warning'));
@@ -523,33 +536,10 @@ function render(data) {
   if (state.publication?.outcome === 'pending') app.append(el('div', 'Approved locally, push pending. Resolve connectivity or permissions, then use Resume (Retry Push). The same SHA is retried before any further tasks; Codex is not rerun for the approved task. Remote divergence requires manual review.', 'warning'));
   if (page === 'logs') (data.event_errors || []).forEach(error => app.append(el('div', error, 'warning')));
   if (page === 'overview') {
-    const summary = el('div', undefined, 'grid');
     const count = data.task_count ?? c.task_count;
-    [['Run status', status], ['Completed tasks', count != null ? (completed ? completed.length : '--') + ' / ' + count : c.logs ? 'Not recorded' : 'Select a plan'], ['Child process', c.active === true ? 'Running' : c.active === false ? 'Inactive' : 'Unknown']].forEach(([label,value]) => {
-      const card = el('div', undefined, 'card');
-      card.append(el('div', label, 'label'), el('div', value, 'value ' + (label === 'Run status' ? presentation.color : '')));
-      summary.append(card);
-    });
+    const summary = el('p', 'Current task: ' + (state.current_task || 'No task in progress'), 'muted');
+    if (completed && count != null) summary.append(el('span', ' | Completed: ' + completed.length + ' / ' + count));
     app.append(summary);
-    if (count > 0 && completed) {
-      const progress = el('progress');
-      progress.setAttribute('max', count); progress.setAttribute('value', completed.length);
-      progress.setAttribute('aria-label', 'Completed tasks');
-      app.append(progress);
-    }
-    const current = panel('Current task');
-    current.append(el('div', 'Current task: ' + (state.current_task || 'No task in progress'), 'value'));
-    if (state.status === 'stopped') current.append(el('p', 'Run stopped. Review attempts in Tasks or raw evidence in Logs.', 'muted'));
-    if (count != null && completed) current.append(el('p', 'Tasks remaining: ' + Math.max(0, count - completed.length)));
-    if (history.length) current.append(el('p', 'Latest review: ' + (history[history.length - 1].review?.decision || 'Not recorded') + '. Open Tasks or Logs for original details.', 'muted'));
-    app.append(current);
-    const recent = panel('Recent activity');
-    events.slice(-5).reverse().forEach(event => {
-      recent.append(el('p', [event.timestamp_utc || 'Time not recorded', event.actor, event.event, event.outcome].filter(Boolean).join(' | ')));
-    });
-    if (!events.length) recent.append(el('p', 'No events recorded yet. Full evidence is available in Logs.', 'muted'));
-    const logs = el('button', 'View all activity'); logs.onclick = () => navigate('logs'); recent.append(logs);
-    app.append(recent);
   } else if (page === 'tasks') {
     const tasks = panel('Tasks and attempt history');
     tasks.append(el('div', 'Current task: ' + (state.current_task || 'No task in progress'), 'value'));
@@ -604,7 +594,7 @@ function render(data) {
 function navigate(name) {
   page = name;
   ['overview', 'tasks', 'logs'].forEach(view => { const nav = document.getElementById('nav-' + view); nav.className = 'nav' + (view === page ? ' active' : ''); nav.setAttribute('aria-current', view === page ? 'page' : 'false'); });
-  document.getElementById('page-title').textContent = {overview:'Run overview', tasks:'Tasks', logs:'Logs'}[page];
+  document.getElementById('page-title').textContent = {overview:'Overview', tasks:'Tasks', logs:'Logs'}[page];
   if (latest) render(latest);
   if (name === 'logs') refresh(false);
 }
@@ -733,6 +723,8 @@ document.getElementById('github-repositories').onchange = () => {
   if (value) { document.getElementById('github-repo').value = value; return workspaceAction('connect_github', [value], 'connect-github'); }
 };
 document.getElementById('select-branch').onclick = () => workspaceAction('checkout_github_branch', [latest?.controller?.repository, document.getElementById('github-branch').value], 'select-branch');
+document.getElementById('github-branch').onchange = updateControls;
+document.getElementById('run-history').onclick = () => navigate('logs');
 document.getElementById('fetch-github').onclick = () => workspaceAction('fetch_github', [latest?.controller?.repository], 'fetch-github');
 document.getElementById('new-branch').onclick = () => { if (!document.getElementById('new-branch').disabled) { document.getElementById('branch-base-confirm').checked = false; document.getElementById('branch-form').hidden = false; updateControls(); document.getElementById('branch-name').focus(); } };
 document.getElementById('cancel-branch').onclick = () => { document.getElementById('branch-form').hidden = true; document.getElementById('branch-name').value = ''; document.getElementById('new-branch').focus(); };

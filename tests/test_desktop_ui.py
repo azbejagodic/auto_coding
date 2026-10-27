@@ -3,13 +3,22 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import sys
 from html.parser import HTMLParser
 from pathlib import Path
 
+# Resolve imports from this checkout even when an older desktop build is installed.
+REPOSITORY = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPOSITORY / "src"))
+from auto_coding import desktop_app
 from auto_coding.desktop_app import HTML
 
 
 class DesktopUITests(unittest.TestCase):
+    def test_import_is_from_this_checkout(self):
+        self.assertEqual(Path(desktop_app.__file__).resolve(),
+                         REPOSITORY / "src" / "auto_coding" / "desktop_app.py")
+
     def test_controls_are_visible_and_scoped_to_bridge(self):
         class Controls(HTMLParser):
             def __init__(self):
@@ -24,7 +33,7 @@ class DesktopUITests(unittest.TestCase):
         parser = Controls()
         parser.feed(HTML)
         for name in ("browse-project", "browse-plan", "open-run", "start", "resume",
-                     "connect-github", "list-github", "select-branch", "new-branch",
+                     "connect-github", "list-github", "run-history", "select-branch", "new-branch",
                      "create-branch", "cancel-branch", "fetch-github", "push-approved",
                      "nav-overview", "nav-tasks", "nav-logs"):
             self.assertEqual(parser.ids[name], "button")
@@ -53,7 +62,7 @@ class DesktopUITests(unittest.TestCase):
                       'aria-label="Main navigation"', 'aria-labelledby="project-label"',
                       'aria-labelledby="plan-label"', 'aria-describedby="start-reason attempts-error"',
                       'id="project-path"', 'id="plan-path"', 'id="run-setup"',
-                      'Project folder', 'Task plan', 'Set up a run', 'Open Run',
+                      'Project folder', 'Task plan', 'Repository', 'Open Run',
                       "'Awaiting recovery'", "'Completed', color:'green'",
                       "'Idle', color:'muted'", "'Unknown run state'",
                       'Search actor, outcome or event', '1 MB per file',
@@ -91,19 +100,21 @@ class DesktopUITests(unittest.TestCase):
             self.assertEqual(markup.nodes[name][1]["role"], "status")
             self.assertEqual(markup.nodes[name][1]["aria-live"], "polite")
         self.assertNotIn('open', markup.nodes["launch-details"][1])
-        for name in ("git-actions", "local-project", "launch-details"):
+        for name in ("secondary-controls", "local-project", "launch-details"):
             self.assertEqual(markup.nodes[name][0], "details")
             self.assertNotIn("open", markup.nodes[name][1])
         self.assertNotIn("checked", markup.nodes["auto-push"][1])
         # Primary form order remains native; secondary tools come after Start.
         order = list(markup.nodes)
         for first, second in zip(("github-repo", "github-branch", "plan-path", "attempts", "start"),
-                                 ("github-branch", "plan-path", "attempts", "start", "git-actions")):
+                                 ("github-branch", "plan-path", "attempts", "start", "secondary-controls")):
             self.assertLess(order.index(first), order.index(second))
-        self.assertIn("Repository and branch \u2192 Task plan \u2192 Attempts \u2192 Start", HTML)
+        for text in ("Repository and branch", "1. Repository", "2. Task plan", "3. Attempts", "4. Start",
+                     "Git actions and saved runs", "Launch safeguards and diagnostics", "Run overview"):
+            self.assertNotIn(text, HTML)
         self.assertNotIn("Ready for your first run", HTML)
         self.assertNotIn("const steps", HTML)
-        self.assertEqual(HTML.count('requires native confirmation.'), 1)
+        self.assertEqual(HTML.count('require native confirmation.'), 1)
 
     def test_rendered_form_keyboard_secondary_actions_and_small_viewports(self):
         try:
@@ -152,6 +163,15 @@ class DesktopUITests(unittest.TestCase):
                   window.dispatchEvent(new Event('pywebviewready'));
                 }""")
                 page.wait_for_function("document.getElementById('connect-github').disabled === false")
+                for name in ('github-repo', 'github-branch', 'plan-path', 'browse-plan', 'attempts',
+                             'fetch-github', 'select-branch', 'new-branch', 'start', 'resume',
+                             'push-approved', 'auto-push', 'auto-push-note', 'open-run', 'run-history'):
+                    self.assertTrue(page.locator('#' + name).is_visible(), name)
+                self.assertFalse(page.locator('#header-context').is_visible())
+                for removed in ('Repository and branch', '1. Repository', '2. Task plan', '3. Attempts',
+                                '4. Start', 'Run overview', 'Local developer workspace',
+                                'Completed tasks', 'Child process', 'Current task'):
+                    self.assertNotIn(removed, page.locator('main').inner_text())
                 # Native DOM order follows the primary form; collapsed actions are skipped.
                 page.locator('#github-repo').focus()
                 page.keyboard.press('Tab')
@@ -189,24 +209,24 @@ class DesktopUITests(unittest.TestCase):
                 self.assertFalse(page.locator('#auto-push').is_checked())
                 self.assertIn('New run: automatic push OFF', page.locator('#auto-push-note').inner_text())
                 page.locator('#github-repo').focus()
-                for name in ('connect-github', 'github-branch', 'select-branch', 'new-branch',
-                             'plan-path', 'browse-plan', 'attempts', 'start', 'auto-push'):
+                for name in ('connect-github', 'github-branch', 'fetch-github', 'select-branch', 'new-branch',
+                             'plan-path', 'browse-plan', 'attempts', 'start'):
                     page.keyboard.press('Tab')
                     self.assertEqual(page.evaluate('document.activeElement.id'), name)
-                page.keyboard.press('Tab')
-                self.assertEqual(page.evaluate('document.activeElement.parentElement.id'), 'git-actions')
-                page.keyboard.press('Space')
-                self.assertTrue(page.locator('#fetch-github').is_visible())
-                page.keyboard.press('Space')
-                for name in ('fetch-github', 'list-github', 'resume', 'open-run', 'push-approved', 'browse-project'):
-                    self.assertEqual(page.locator('#git-actions #' + name).count(), 1)
-                    self.assertFalse(page.locator('#' + name).is_visible())
+                # Resume and Push remain visible even while disabled; neither is in a disclosure.
+                for name in ('resume', 'push-approved', 'fetch-github', 'select-branch', 'new-branch'):
+                    self.assertTrue(page.locator('#' + name).is_visible())
+                    self.assertEqual(page.locator('details #' + name).count(), 0)
+                page.locator('#secondary-controls > summary').click()
+                self.assertTrue(page.locator('#list-github').is_visible())
+                page.locator('#secondary-controls > summary').click()
                 page.evaluate('window.scrollTo(0, 0)')
                 for width, height in ((1280, 720), (1600, 900), (390, 720)):
                     page.set_viewport_size({'width': width, 'height': height})
                     self.assertTrue(page.evaluate('document.documentElement.scrollWidth <= innerWidth'), str(width))
                     boxes = []
-                    for name in ('github-repo', 'github-branch', 'browse-plan', 'attempts', 'start'):
+                    for name in ('github-repo', 'github-branch', 'fetch-github', 'select-branch', 'new-branch',
+                                 'plan-path', 'browse-plan', 'attempts', 'start', 'resume', 'push-approved'):
                         box = page.locator('#' + name).bounding_box()
                         self.assertGreaterEqual(box['x'], 0)
                         self.assertLessEqual(box['x'] + box['width'], width + 1)
@@ -231,8 +251,8 @@ class DesktopUITests(unittest.TestCase):
                 page.keyboard.press('Space')
                 page.wait_for_function("calls.filter(c => c[0] === 'start').length === 2 && !document.getElementById('start').disabled")
                 self.assertFalse(page.evaluate('fixture.controller.active'))
-                self.assertFalse(page.locator('#fetch-github').is_visible())
-                page.locator('#git-actions > summary').click()
+                self.assertTrue(page.locator('#fetch-github').is_visible())
+                page.locator('#secondary-controls > summary').click()
                 page.locator('#fetch-github').click()
                 page.locator('#list-github').click()
                 page.locator('#github-repositories').select_option('owner/other')
@@ -266,6 +286,11 @@ class DesktopUITests(unittest.TestCase):
                 page.wait_for_function("document.getElementById('message').textContent.includes('Cancelled')")
                 self.assertEqual(page.evaluate("calls.find(c => c[0] === 'resume')"), ['resume', 3])
                 self.assertFalse(page.evaluate('fixture.controller.active'))
+                page.locator('#start').focus()
+                page.keyboard.press('Tab')
+                self.assertEqual(page.evaluate('document.activeElement.id'), 'resume')
+                page.keyboard.press('Tab')
+                self.assertEqual(page.evaluate('document.activeElement.id'), 'push-approved')
                 page.locator('#push-approved').click()
                 page.wait_for_function("calls.some(c => c[0] === 'push') && !document.getElementById('browse-project').disabled")
                 page.locator('#local-project > summary').click()
