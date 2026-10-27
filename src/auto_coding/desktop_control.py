@@ -16,6 +16,7 @@ import threading
 import uuid
 
 from auto_coding.desktop_reader import read_run, read_evidence
+from auto_coding.run_history import RunHistory
 from auto_coding.simple_run import PilotError, load_tasks
 from auto_coding.github_workspace import (GitHubWorkspaceManager, storage_root, serialized_launch,
     managed_lock, reserve_job, cancel_reservation)
@@ -24,6 +25,7 @@ from auto_coding.github_workspace import (GitHubWorkspaceManager, storage_root, 
 class DesktopController:
     def __init__(self, runs_dir: str | Path | None = None):
         self.runs_dir = Path(runs_dir or (storage_root() / "runs")).expanduser().resolve()
+        self.run_history = RunHistory(self.runs_dir)
         self.repo: Path | None = None
         self.repository = None
         self.plan: Path | None = None
@@ -306,6 +308,7 @@ class DesktopController:
                 self.process_history = []
                 self.exit_code = None
                 self._metadata(logs)
+                self.run_history.register(logs)
                 return self._launch(attempts, False, auto_push=auto_push)
             except (OSError, ValueError, PilotError) as exc:
                 return self._fail(str(exc))
@@ -502,6 +505,7 @@ class DesktopController:
     def reopen(self, logs: str | Path) -> dict:
         result = self.select_logs(logs)
         if not result["ok"]: return result
+        self.run_history.register(self.logs)
         self.repository = None
         try:
             value = self._read_metadata()

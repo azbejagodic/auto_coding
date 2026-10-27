@@ -126,7 +126,8 @@ class SimpleRunnerTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[1][0][calls[1][0].index('--sandbox') + 1], 'read-only')
         for policy in ('substantive, reproducible blockers', 'CURRENT task/slice',
-                       'List ALL such blockers', 'optional polish', 'non-blocking suggestions'):
+                       'List ALL such blockers', 'optional polish', 'non-blocking suggestions',
+                       'run-isolation risks', 'concrete user-visible defects', 'Optional styling changes are not approval blockers'):
             self.assertIn(policy, calls[1][1])
         self.assertNotIn('--model', calls[0][0])
         self.assertNotIn('--model', calls[1][0])

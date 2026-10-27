@@ -593,7 +593,8 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                 "optional polish, hypothetical risks, unrelated pre-existing issues or future slices. "
                 "If no current blockers remain, return APPROVED with an empty issues list; put any "
                 "optional polish in summary as non-blocking suggestions. Inspect Git/credential safety "
-                "and data-loss risks carefully. Merge to Main and per-task model/reasoning selection "
+                "and data-loss and run-isolation risks, and concrete user-visible defects carefully. "
+                "Optional styling changes are not approval blockers. Merge to Main and per-task model/reasoning selection "
                 "are deferred and are not approval blockers. Do not change files.\n\nTASK:\n" + task["prompt"] +
                 "\n\nCURRENT TASK CHANGES:\n" + stat + "\n\nDIFF (truncated; inspect repository for full):\n" + diff[:35000] +
                 "\n\nTEST RESULTS:\n" + json.dumps(record["tests"]))

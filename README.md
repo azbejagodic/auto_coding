@@ -299,3 +299,20 @@ CLI behavior stays local when the options are omitted. Explicit opt-in uses both
 same options plus `--resume`. Old logs without these settings remain local. One-shot
 **Push Approved Commits** remains available. Per-task model/reasoning selection and
 Merge to Main remain deferred.
+
+LOGS includes a persistent **Recent runs** library (up to 200 displayed entries).
+It discovers only the app's managed runs directory and folders you explicitly
+open/import. Older runs outside LocalAppData remain in their original location;
+legacy state and raw evidence work without desktop metadata or a timeline.
+Repository, branch, time and counts are shown only when recorded. The path-only
+`recent-runs.json` index lives beside the managed `runs` directory and uses atomic
+writes; it contains no evidence text. Listing reads bounded metadata, never raw logs.
+
+Runs and logs stay on disk until you deliberately delete them. **Forget history
+entry** hides only that entry, including missing or unreadable locations. It never
+deletes log data; explicitly opening the folder adds it again. Corrupt history
+indexes are reported and preserved. Open/View inspects a run without launching or
+resuming work or changing Git. Switching runs remains blocked while the current
+job is active or uncertain. Timeline search covers loaded events, and the raw
+inspector reads only the selected confined file, up to 1 MB, preserving it during
+refresh. Absolute paths, traversal and links escaping the chosen run are rejected.

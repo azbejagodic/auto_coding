@@ -187,7 +187,7 @@ class DesktopBridgeTests(unittest.TestCase):
 
     def test_public_bridge_surface_contains_only_scoped_methods(self):
         self.assertEqual({name for name in dir(self.bridge) if not name.startswith("_")},
-                         {"select_repo", "select_plan", "open_run", "selected_paths",
+                     {"select_repo", "select_plan", "open_run", "selected_paths", "recent_runs", "open_recent_run", "forget_run",
                           "job_status", "start", "resume", "snapshot", "evidence",
                           "connect_github", "github_repositories", "github_branches",
                           "create_github_branch", "checkout_github_branch", "fetch_github", "push_approved_commits"})

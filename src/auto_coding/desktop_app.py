@@ -89,6 +89,7 @@ pre{font:14px/1.6 Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere
 .events th:first-child{width:20%}
 .events th:last-child{width:32%}
 .table-scroll{overflow-x:auto}
+.events{min-width:900px}
 .evidence{display:inline-block;color:#99caff;background:transparent;text-align:left;padding:4px 8px;margin:4px 0;overflow-wrap:anywhere;max-width:100%}
 .tasks{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}
 .pill{background:#252f3b;border-radius:16px;padding:6px 12px}
@@ -237,6 +238,7 @@ function panel(title) {
   return p;
 }
 let logQuery = '';
+let recentRuns = {runs:[]};
 function runPresentation(data) {
   const c = data.controller || {}, state = data.state || {};
   if (c.uncertain || (c.active !== false && c.active !== true)) return {label:'Unknown child status', color:'amber'};
@@ -365,6 +367,7 @@ function timelineInto(parent, events) {
   parent.append(scroll);
 }
 function render(data) {
+  evidenceViewer.hidden = page !== 'logs';
   const searchFocused = document.activeElement?.id === 'log-search';
   const searchCursor = searchFocused ? document.activeElement.selectionStart : null;
   latest = data;
@@ -441,6 +444,29 @@ function render(data) {
     evidenceRoot = data.root;
   }
   app.replaceChildren();
+  if (page === 'logs') {
+    const library = panel('Recent runs');
+    library.append(el('p', 'Runs and logs are kept until you deliberately delete them. Forget removes only the history entry; log files stay on disk.', 'muted'));
+    const importRun = el('button', 'Open / Import run folder');
+    importRun.disabled = busy || !ready || c.active !== false || c.uncertain;
+    importRun.onclick = () => act('open_run');
+    library.append(importRun);
+    if (recentRuns.error) library.append(el('p', recentRuns.error, 'warning'));
+    if (!recentRuns.runs.length) library.append(el('p', 'No saved runs found. Start a run or explicitly import an older run folder. Only managed runs and folders you open are listed.', 'muted'));
+    recentRuns.runs.forEach(run => {
+      const row = el('section', undefined, 'attempt');
+      row.append(el('h3', run.run_id), el('p', [run.repo || 'Repository not recorded', run.branch ? 'Branch: ' + run.branch : 'Branch not recorded', run.time || 'Time not recorded', 'Status: ' + run.status, run.completed == null ? 'Completed tasks not recorded' : 'Completed tasks: ' + run.completed].join(' | ')), el('div', run.path, 'path muted'));
+      const open = el('button', 'Open / View');
+      open.disabled = busy || !ready || c.active !== false || c.uncertain || run.status === 'missing';
+      open.onclick = () => historyAction('open_recent_run', run.path);
+      const forget = el('button', 'Forget history entry');
+      forget.disabled = busy || !ready;
+      forget.onclick = () => historyAction('forget_run', run.path);
+      row.append(open, forget); library.append(row);
+    });
+    library.append(el('p', 'Showing up to 200 runs. Active or uncertain jobs keep run switching locked; their current evidence remains available below.', 'muted'));
+    app.append(library);
+  }
   if (!c.logs && !data.root) {
     if (page !== 'overview') {
       const empty = el('section', undefined, 'empty');
@@ -486,7 +512,7 @@ function render(data) {
     current.append(el('div', 'Current task: ' + (state.current_task || 'No task in progress'), 'value'));
     if (state.status === 'stopped') current.append(el('p', 'Run stopped. Review attempts in Tasks or raw evidence in Logs.', 'muted'));
     if (count != null && completed) current.append(el('p', 'Tasks remaining: ' + Math.max(0, count - completed.length)));
-    if (history.length) current.append(detail('Latest attempt details', JSON.stringify(history[history.length - 1], null, 2), 'latest-attempt'));
+    if (history.length) current.append(el('p', 'Latest review: ' + (history[history.length - 1].review?.decision || 'Not recorded') + '. Open Tasks or Logs for original details.', 'muted'));
     app.append(current);
     const recent = panel('Recent activity');
     events.slice(-5).reverse().forEach(event => {
@@ -551,12 +577,32 @@ function navigate(name) {
   ['overview', 'tasks', 'logs'].forEach(view => { const nav = document.getElementById('nav-' + view); nav.className = 'nav' + (view === page ? ' active' : ''); nav.setAttribute('aria-current', view === page ? 'page' : 'false'); });
   document.getElementById('page-title').textContent = {overview:'Run overview', tasks:'Tasks', logs:'Logs'}[page];
   if (latest) render(latest);
+  if (name === 'logs') refresh(false);
+}
+async function historyAction(method, path) {
+  if (busy || !ready) return;
+  if (method === 'open_recent_run' && (latest?.controller?.active !== false || latest?.controller?.uncertain)) return;
+  busy = true; updateControls();
+  try {
+    if (refreshing) await refreshing;
+    const result = await window.pywebview.api[method](path);
+    message(result.error || (method === 'forget_run' ? 'History entry forgotten. Log data remains on disk.' : 'Run opened for inspection. No work launched.'), !result.ok);
+  } catch (error) { message('History action failed: ' + error, true); }
+  finally { busy = false; await refresh(false); }
 }
 async function refresh(clearMessage = true) {
   if (!ready || busy) return;
   if (refreshing) return refreshing;
   refreshing = (async () => {
-    try { const data = await window.pywebview.api.snapshot(); if (clearMessage) message(''); render(data); }
+    try {
+      const data = await window.pywebview.api.snapshot();
+      if (page === 'logs' && window.pywebview.api.recent_runs) {
+        try { recentRuns = await window.pywebview.api.recent_runs(); }
+        catch (error) { recentRuns = {runs:[], error:'Could not load run history: ' + error}; }
+        renderKey = null;
+      }
+      if (clearMessage) message(''); render(data);
+    }
     catch (error) {
       latest = {...(latest || {}), controller: {...(latest?.controller || {}), active: null, uncertain: true}};
       render(latest);
@@ -694,6 +740,7 @@ class Bridge:
                  dialogs=None, controller_factory=DesktopController):
         self._controller_factory = controller_factory
         self._controller = controller if controller is not None else controller_factory()
+        self._history = getattr(self._controller, "run_history", None)
         self._dialogs = dialogs
         self._lock = threading.RLock()
         self._launch_lock = threading.Lock()
@@ -724,6 +771,9 @@ class Bridge:
                     raise ValueError("Cannot change selections while a job is active or its launch status is unknown.")
                 if kind == "run":
                     candidate = self._controller_factory()
+                    if self._history is not None and isinstance(candidate, DesktopController):
+                        candidate.runs_dir = self._history.runs_dir
+                        candidate.run_history = self._history
                     result = candidate.reopen(path)
                     if result["ok"]:
                         self._controller = candidate
@@ -782,6 +832,23 @@ class Bridge:
 
     def open_run(self, path=None):
         return self._select("run", path)
+
+    def recent_runs(self):
+        with self._lock:
+            return self._history.list() if self._history is not None else {"runs": [], "error": None}
+
+    def open_recent_run(self, path):
+        with self._lock:
+            entries = self.recent_runs()["runs"]
+            entry = next((item for item in entries if item["path"] == path), None)
+            if entry is None or entry["status"] == "missing" or Path(path).resolve() != Path(path):
+                return {"ok": False, "error": "Run is missing or unavailable. Import its new location or forget the history entry."}
+            return self.open_run(path)
+
+    def forget_run(self, path):
+        with self._lock:
+            ok = self._history is not None and self._history.forget(path)
+            return {"ok": bool(ok), "error": self._history.error if self._history else "History unavailable."}
 
     def selected_paths(self):
         with self._lock:

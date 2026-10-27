@@ -2,16 +2,24 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 MAX_JSON = 4 * 1024 * 1024
 MAX_EVIDENCE = 1024 * 1024
 
 
 def _json_file(path: Path):
-    if path.stat().st_size > MAX_JSON:
+    with path.open("rb") as stream:
+        data = stream.read(MAX_JSON + 1)
+    if len(data) > MAX_JSON:
         raise ValueError("file exceeds 4 MB limit")
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(data)
+
+
+def _unsafe_path(name):
+    windows = PureWindowsPath(name)
+    return (not name or Path(name).is_absolute() or windows.drive or windows.root
+            or ".." in Path(name).parts or ".." in windows.parts)
 
 
 def _confined_log_file(root: Path, name: str) -> Path:
@@ -29,7 +37,7 @@ def evidence_status(log_root: str | Path, relative_path: str) -> str:
     root = Path(log_root).expanduser().resolve(strict=False)
     try:
         rel = Path(relative_path)
-        if not relative_path or rel.is_absolute() or ".." in rel.parts:
+        if _unsafe_path(relative_path):
             return "unsafe path"
         resolved = root.joinpath(rel).resolve(strict=True)
         if not resolved.is_relative_to(root):
@@ -39,7 +47,7 @@ def evidence_status(log_root: str | Path, relative_path: str) -> str:
         return "available"
     except FileNotFoundError:
         return "missing"
-    except OSError:
+    except (OSError, ValueError, RuntimeError):
         return "unavailable"
 
 
@@ -52,6 +60,10 @@ def read_run(log_root: str | Path) -> dict:
     if not root.is_dir():
         result["state_error"] = "Log directory is missing or unavailable."
         return result
+    if root.absolute().resolve() != root.absolute():
+        result["exists"] = False
+        result["state_error"] = "Selected run directory redirects elsewhere; open its location explicitly again."
+        return result
     try:
         manifest = root / "run-manifest.json"
         if manifest.exists() or manifest.is_symlink():
@@ -59,7 +71,7 @@ def read_run(log_root: str | Path) -> dict:
             if not isinstance(value, dict) or not isinstance(value.get("task_ids"), list):
                 raise ValueError("manifest must contain task_ids")
             result["task_count"] = len(value["task_ids"])
-    except (OSError, UnicodeError, ValueError) as exc:
+    except (OSError, UnicodeError, ValueError, RuntimeError) as exc:
         result["event_errors"].append(f"run-manifest.json is corrupt or unreadable: {exc}")
     try:
         # Legacy runs have no event links. List names only, never read bodies
@@ -81,7 +93,7 @@ def read_run(log_root: str | Path) -> dict:
             if not isinstance(state, dict):
                 raise ValueError("state must be a JSON object")
             result["state"] = state
-        except (OSError, UnicodeError, ValueError) as exc:
+        except (OSError, UnicodeError, ValueError, RuntimeError) as exc:
             result["state_error"] = f"state.json is corrupt or unreadable: {exc}"
     timeline = root / "events.jsonl"
     if timeline.exists() or timeline.is_symlink():
@@ -120,7 +132,7 @@ def read_run(log_root: str | Path) -> dict:
             # Stable sort means duplicate/missing seq entries retain source ordering.
             result["events"].sort(key=lambda e: (e.get("seq") if isinstance(e.get("seq"), int) else 2**63,
                                                   e["_source_order"]))
-        except (OSError, UnicodeError, ValueError) as exc:
+        except (OSError, UnicodeError, ValueError, RuntimeError) as exc:
             result["event_errors"].append(f"events.jsonl could not be read: {exc}")
     result["empty"] = not result["state"] and not result["events"] and not result["event_errors"] and not result["state_error"]
     return result
@@ -128,10 +140,12 @@ def read_run(log_root: str | Path) -> dict:
 
 def read_evidence(log_root: str | Path, relative_path: str) -> dict:
     """Read a selected evidence file only when its resolved path stays under root."""
-    root = Path(log_root).expanduser().resolve(strict=False)
     try:
+        root = Path(log_root).expanduser().absolute()
+        if root.resolve(strict=False) != root:
+            return {"ok": False, "text": "Selected run directory redirects elsewhere."}
         rel = Path(relative_path)
-        if not relative_path or rel.is_absolute() or ".." in rel.parts:
+        if _unsafe_path(relative_path):
             return {"ok": False, "text": "Unsafe evidence path rejected."}
         candidate = root.joinpath(rel)
         resolved = candidate.resolve(strict=True)
@@ -139,11 +153,12 @@ def read_evidence(log_root: str | Path, relative_path: str) -> dict:
             return {"ok": False, "text": "Evidence path escapes the selected log directory."}
         if not resolved.is_file():
             return {"ok": False, "text": "Evidence file is missing or is not a regular file."}
-        size = resolved.stat().st_size
-        if size > MAX_EVIDENCE:
+        with resolved.open("rb") as stream:
+            data = stream.read(MAX_EVIDENCE + 1)
+        if len(data) > MAX_EVIDENCE:
             return {"ok": False, "text": "Evidence file exceeds the 1 MB display limit."}
-        return {"ok": True, "text": resolved.read_text(encoding="utf-8", errors="replace")}
+        return {"ok": True, "text": data.decode("utf-8", errors="replace")}
     except FileNotFoundError:
         return {"ok": False, "text": "Evidence file is missing."}
-    except OSError as exc:
+    except (OSError, ValueError, RuntimeError) as exc:
         return {"ok": False, "text": f"Evidence could not be read: {exc}"}
