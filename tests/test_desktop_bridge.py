@@ -309,7 +309,7 @@ class DesktopBridgeTests(unittest.TestCase):
 
     def test_empty_and_invalid_startup_logs(self):
         bridge = Bridge()
-        self.assertIn("Ready", bridge.snapshot()["state_error"])
+        self.assertIsNone(bridge.snapshot()["state_error"])
         self.assertFalse(bridge.evidence("file")["ok"])
         bridge = Bridge(self.root / "missing")
         self.assertFalse(bridge.snapshot()["exists"])
@@ -360,6 +360,22 @@ class DesktopBridgeTests(unittest.TestCase):
             self.assertIsInstance(api._dialogs, NativeDialogs)
             self.assertEqual(api.selected_paths()["logs"], str(self.logs))
             webview.start.assert_called_once()
+            options = webview.create_window.call_args.kwargs
+            self.assertTrue(options["resizable"])
+            self.assertFalse(options["frameless"])
+            self.assertFalse(options["fullscreen"])
+            self.assertEqual(options["min_size"], (640, 480))
+            window = webview.create_window.return_value
+            window.maximize.assert_not_called()
+            callback, args = webview.start.call_args.args
+            callback(*args)
+            window.maximize.assert_called_once()
+            # Renderer limitations and older APIs cannot abort normal startup.
+            window.maximize.side_effect = NotImplementedError("renderer limitation")
+            webview.start.side_effect = lambda callback, args: callback(*args)
+            self.assertEqual(main([]), 0)
+            webview.create_window.return_value = object()
+            self.assertEqual(main([]), 0)
             webview.create_window.side_effect = RuntimeError("window failure")
             self.assertEqual(main([]), 2)
 

@@ -21,7 +21,8 @@ const document = {getElementById: get, createElement: tag => new Element(tag),
   createTextNode: text => ({textContent: String(text)})};
 let data = {root:'', exists:false, empty:true, state:null, events:[], event_errors:[],
   controller:{active:false, uncertain:false, repo:null, plan:null, logs:null, resume_ready:false, start_ready:false,
-    preflight:{branch:'feature/ui', clean:true, errors:[]}}};
+    preflight:{branch:null, clean:null, errors:['Select a Git repository root.']},
+    push:{eligible:false, reason:'Connect a managed GitHub repository with approved local checkpoints to publish.'}}};
 const calls = [];
 let launchResult = {ok:false, cancelled:true};
 let pendingSelection = null;
@@ -71,7 +72,10 @@ const assertCards = (status, completed, child) => {
   assert(get('start').disabled);
   assert.equal(get('header-state').textContent, 'Idle');
   assertCards('Idle', 'Unknown', 'Inactive');
-  assert(get('start-reason').textContent.includes('Connect a repository'));
+  for (const id of ['github-state', 'start-reason', 'resume-reason', 'push-reason', 'preflight', 'message']) {
+    assert.equal(get(id).textContent, '', 'Idle state must be quiet: ' + id);
+  }
+  assert(get('resume').disabled && get('push-approved').disabled && get('fetch-github').disabled);
   assert(!get('auto-push').checked);
   assert(!contents().includes('Ready for your first run'));
   assert.equal(get('run-setup').hidden, false);
@@ -143,6 +147,7 @@ const assertCards = (status, completed, child) => {
   assert.equal(get('github-branch').value, 'feature/remote', 'Failed fetch preserves pending selection');
   assert(get('message').textContent.includes('Cannot reach GitHub'));
   assert(!get('message').textContent.includes('Selection updated'));
+  assert(get('message').className.includes('red'));
   assert(!get('fetch-github').disabled, 'Fetch failure permits safe retry');
   api.fetch_github = workingFetch;
   await click('select-branch');
@@ -201,12 +206,14 @@ const assertCards = (status, completed, child) => {
   data.controller.preflight.clean = false; await poll();
   assert(get('new-branch').disabled && get('select-branch').disabled && get('push-approved').disabled);
   assert(get('connect-github').disabled && get('browse-project').disabled);
+  assert(get('preflight').textContent.includes('clean working tree'));
   const beforeDirty = calls.length;
   for (const id of ['connect-github', 'browse-project', 'select-branch', 'create-branch', 'push-approved']) await click(id);
   assert.equal(calls.length, beforeDirty, 'Dirty checkout cannot change repository or branch or publish');
   assert(!get('fetch-github').disabled, 'Fetch preserves dirty local work');
   data.controller.preflight.clean = true; data.controller.active = true; await poll();
   assert(get('connect-github').disabled && get('select-branch').disabled);
+  assert(get('start-reason').textContent.includes('already active'));
   const beforeActive = calls.length;
   for (const id of ['connect-github', 'browse-project', 'select-branch', 'create-branch', 'fetch-github', 'push-approved', 'start', 'resume']) await click(id);
   assert.equal(calls.length, beforeActive, 'Active runner locks workspace and launch actions');
@@ -248,6 +255,12 @@ const assertCards = (status, completed, child) => {
   }
   data.controller.start_ready = true; data.controller.preflight.errors = [];
   await poll();
+  const cancelledLaunch = launchResult;
+  launchResult = {ok:false, error:'Failed start: checkpoint could not be written. Check disk space and retry.'};
+  await click('start');
+  assert(get('message').textContent.includes('checkpoint could not be written'));
+  assert(get('message').className.includes('red'));
+  launchResult = cancelledLaunch;
   const attempts = get('attempts');
   data.controller.resume_ready = true;
   await poll(); // Sync simulated status before asserting Resume is enabled.

@@ -105,6 +105,17 @@ progress{width:100%;height:12px;accent-color:#72adf9}
 .project-heading{overflow-wrap:anywhere;max-width:650px}
 #header-state{white-space:nowrap}
 #evidence-viewer:empty{display:none}
+/* Compact only the Overview setup; Tasks and Logs retain their spacing. */
+#run-setup{padding:16px;margin-bottom:12px}
+#run-setup .setup-fields{gap:12px;margin-top:12px}
+#run-setup .launch-row{gap:12px;margin-top:12px}
+#run-setup .step-title,#run-setup .field label{margin-bottom:4px}
+#run-setup .notice p{margin:6px 0}
+#run-setup .push-policy{margin-top:8px}
+#run-setup .selected-path{max-height:72px}
+#run-setup:not([hidden]) ~ #app .card{padding:12px}
+#run-setup:not([hidden]) ~ #app .value{margin-top:4px}
+#github-state:empty,#start-reason:empty,#resume-reason:empty,#push-reason:empty{display:none}
 @media(max-width:1100px){.setup-fields{grid-template-columns:minmax(0,1fr)}
 .field-line{align-items:center}
 .main{padding:20px}
@@ -151,7 +162,7 @@ progress{width:100%;height:12px;accent-color:#72adf9}
 <button id="select-branch">Select Branch</button>
 <button id="new-branch">New Branch</button>
 </div>
-<p id="github-state" class="muted">Connect a repository to choose a feature branch.</p>
+<p id="github-state" class="muted"></p>
 <div id="branch-form" class="controls" hidden>
 <label for="branch-name">New feature branch</label>
 <input id="branch-name">
@@ -181,7 +192,7 @@ progress{width:100%;height:12px;accent-color:#72adf9}
 <button id="push-approved" aria-describedby="push-reason">Push Approved Commits</button>
 </div>
 <div id="start-reason" class="muted" role="status" aria-live="polite"></div>
-<div id="resume-reason" class="muted">Open a matching stopped run to resume.</div>
+<div id="resume-reason" class="muted"></div>
 <div id="push-reason" class="muted"></div>
 <div id="preflight" class="notice muted"></div>
 <div id="message" class="notice" role="status" aria-live="polite"></div>
@@ -297,7 +308,7 @@ function updateControls() {
   document.getElementById('branch-base-confirm-label').hidden = !base;
   document.getElementById('create-branch').disabled ||= !base || !document.getElementById('branch-base-confirm').checked;
   document.getElementById('push-approved').disabled = locked || protectedBranch || c.preflight?.clean !== true || !c.push?.eligible;
-  document.getElementById('push-reason').textContent = c.push?.reason || 'Select a managed repository to publish approved local checkpoints.';
+  document.getElementById('push-reason').textContent = c.repository && !c.push?.eligible ? c.push?.reason || '' : '';
   const savedPush = !!latest?.state?.auto_push;
   const savedRun = !!c.logs || !!latest?.root;
   const push = document.getElementById('auto-push');
@@ -317,8 +328,7 @@ function updateControls() {
   document.getElementById('resume').disabled = locked || protectedBranch || !c.resume_ready || !validAttempts;
   const startReason = !ready ? 'Loading repository status...' : busy ? 'Finish the current action first.'
     : c.uncertain || c.active === null ? 'Resolve unknown child status in Logs.' : c.active ? 'A run is already active.'
-    : !validAttempts ? 'Enter 1–10 whole attempts.' : !c.repo ? 'Connect a repository first.' : !c.plan ? 'Choose a task plan.'
-    : !c.start_ready ? c.preflight?.errors?.[0] || c.preflight?.start_error || 'Resolve setup diagnostics in Logs.' : 'Ready. Review the native confirmation to launch.';
+    : !validAttempts ? 'Enter 1–10 whole attempts.' : '';
   document.getElementById('start-reason').textContent = startReason;
   document.getElementById('resume').textContent = latest?.state?.publication?.outcome === 'pending' ? 'Retry Push' : 'Resume';
   document.getElementById('refresh').disabled = busy || !ready;
@@ -395,7 +405,7 @@ function render(data) {
       : c.github?.head && !c.github?.remote_head ? 'Local-only, unpublished'
       : c.github?.head ? 'Local and origin commits differ; fetch and review before publishing'
       : 'Publication unknown';
-  connection.textContent = c.repo ? 'Current branch: ' + (currentBranch || 'Detached HEAD / unavailable') + ' | ' + (c.preflight?.clean === true ? 'Clean' : 'Changes or unavailable status') + ' | ' + publication + (c.github?.error ? ' | ' + c.github.error : '') : 'Connect a repository to choose a feature branch.';
+  connection.textContent = c.repo ? 'Current branch: ' + (currentBranch || 'Detached HEAD / unavailable') + ' | ' + (c.preflight?.clean === true ? 'Clean' : 'Changes or unavailable status') + ' | ' + publication + (c.github?.error ? ' | ' + c.github.error : '') : c.github?.error || '';
   const branches = document.getElementById('github-branch');
   const bases = document.getElementById('branch-base');
   const remoteBases = [...new Set((c.github?.remote || []).filter(name => name.startsWith('origin/') && name !== 'origin/HEAD').map(name => name.slice(7)))];
@@ -444,12 +454,14 @@ function render(data) {
   if (git.start_error) errors.push(git.start_error);
   const preflight = document.getElementById('preflight');
   preflight.replaceChildren();
-  // Only actionable errors occupy the main view; the empty state supplies setup guidance.
-  if (errors.length) [...new Set(errors)].forEach(error => preflight.append(el('p', error, 'red')));
+  // Hide only the routine unselected prompt; retain full diagnostics in Logs
+  // and every error from an actual failed selection or other user action.
+  const visibleErrors = errors.filter(error => c.repo || error !== 'Select a Git repository root.');
+  // Only actionable errors occupy the main view.
+  if (visibleErrors.length) [...new Set(visibleErrors)].forEach(error => preflight.append(el('p', error, 'red')));
   else if (c.uncertain || c.active === null) preflight.append(el('p', 'Child status is unknown. Inspect this run before launching more work.', 'warning'));
-  else if (c.repo && c.plan && !c.active && !c.resume_ready && git.clean !== true) preflight.append(el('p', 'START requires a clean working tree. Commit or discard project changes first.', 'warning'));
+  else if (c.repo && !c.active && (git.clean === false || c.plan && !c.resume_ready && git.clean !== true)) preflight.append(el('p', 'START requires a clean working tree. Commit or discard project changes first.', 'warning'));
   document.getElementById('preflight-details').textContent = JSON.stringify({branch:git.branch, clean:git.clean, start_ready:c.start_ready, resume_ready:c.resume_ready, diagnostics:errors}, null, 2);
-  document.getElementById('resume-reason').textContent = c.resume_ready ? 'Continue the stopped run.' : c.active || c.uncertain ? 'Runner active or uncertain.' : 'Select a matching stopped run to resume.';
   document.getElementById('run-setup').hidden = page !== 'overview';
   document.getElementById('logs-tools').hidden = page !== 'logs';
   const presentation = runPresentation(data);
@@ -1076,7 +1088,7 @@ class Bridge:
         with self._lock:
             status = self.job_status()
             try:
-                data = read_run(self._root) if self._root else {"root":"", "exists":False, "state":None, "state_error":"Ready. Select a project and task plan, or open an existing run for inspection.", "events":[], "event_errors":[], "empty":True}
+                data = read_run(self._root) if self._root else {"root":"", "exists":False, "state":None, "state_error":None, "events":[], "event_errors":[], "empty":True}
             except Exception as exc:
                 data = {"root": str(self._root), "exists": False, "state": None,
                         "state_error": str(exc), "events": [], "event_errors": [], "empty": True}
@@ -1093,6 +1105,15 @@ class Bridge:
                 return {"ok": False, "text": f"Evidence could not be read: {exc}"}
 
 
+def _maximize_window(window):
+    """Run after GUI startup; pywebview waits for `shown` before maximizing."""
+    try:
+        window.maximize()
+    except Exception as exc:
+        # Unsupported renderers must still leave a usable, resizable window.
+        print(f"Could not maximize the desktop window: {exc}", file=sys.stderr)
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Auto-Coding desktop and run log viewer")
     parser.add_argument("--logs", type=Path, help="existing run log directory")
@@ -1104,9 +1125,9 @@ def main(argv=None) -> int:
         return 2
     try:
         api = Bridge(args.logs)
-        window = webview.create_window("Auto-Coding - Run Dashboard", html=HTML, js_api=api, width=1280, height=800, min_size=(1000, 600))
+        window = webview.create_window("Auto-Coding - Run Dashboard", html=HTML, js_api=api, width=1280, height=800, min_size=(640, 480), resizable=True, frameless=False, fullscreen=False)
         api._dialogs = NativeDialogs(webview, window)
-        webview.start()
+        webview.start(_maximize_window, (window,))
         return 0
     except Exception as exc:
         print(f"Could not start the desktop window. On Windows install Microsoft Edge WebView2 Runtime and pywebview: {exc}", file=sys.stderr)

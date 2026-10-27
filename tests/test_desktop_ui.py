@@ -147,15 +147,18 @@ class DesktopUITests(unittest.TestCase):
                 page.set_content(HTML)
                 page.evaluate("""() => {
                   window.calls = [];
-                  window.fixture = {root:'', events:[], controller:{active:false, uncertain:false,
+                  window.fixture = {root:'', events:[], state_error:null, controller:{active:false, uncertain:false,
                     repo:null, plan:null, start_ready:false, resume_ready:false,
-                    preflight:{branch:'feature/ui', clean:true, errors:[]}}};
+                    push:{eligible:false, reason:'Connect a managed GitHub repository with approved local checkpoints to publish.'},
+                    preflight:{branch:'feature/ui', clean:true, errors:['Select a Git repository root.']}}};
                   window.pywebview = {api:{
                     snapshot:async () => structuredClone(window.fixture),
                     connect_github:async repo => {
                       calls.push(['connect_github', repo]);
                       Object.assign(fixture.controller, {repo:'C:/workspace', repository:repo,
+                        push:{eligible:false, reason:'No unpublished approved checkpoints on this branch.'},
                         github:{local:['main','feature/ui'], remote:['origin/main','origin/feature/ui']}});
+                      fixture.controller.preflight.errors = [];
                       return {ok:true};
                     },
                     checkout_github_branch:async (...args) => {calls.push(['branch', ...args]); return {ok:true};},
@@ -175,6 +178,23 @@ class DesktopUITests(unittest.TestCase):
                   window.dispatchEvent(new Event('pywebviewready'));
                 }""")
                 page.wait_for_function("document.getElementById('connect-github').disabled === false")
+                for width, height in ((1366, 680), (1280, 640), (640, 480), (390, 720)):
+                    page.set_viewport_size({'width': width, 'height': height})
+                    self.assertTrue(page.evaluate('document.documentElement.scrollWidth <= innerWidth'))
+                    self.assertEqual(page.locator('#app .card').count(), 3)
+                    if width >= 1280:
+                        for box in page.locator('#app .card').all():
+                            bounds = box.bounding_box()
+                            self.assertLessEqual(bounds['y'] + bounds['height'], height)
+                for name in ('github-state', 'start-reason', 'resume-reason', 'push-reason', 'preflight'):
+                    self.assertEqual(page.locator('#' + name).inner_text(), '')
+                for text in ('Connect a repository to choose a feature branch.', 'Connect a repository first.',
+                             'Select a matching stopped run to resume.',
+                             'Connect a managed GitHub repository with approved local checkpoints to publish.',
+                             'Select a Git repository root.',
+                             'Ready. Select a project and task plan, or open an existing run for inspection.'):
+                    self.assertNotIn(text, page.locator('body').inner_text())
+                page.set_viewport_size({'width': 1366, 'height': 680})
                 for name in ('github-repo', 'github-branch', 'plan-path', 'browse-plan', 'attempts',
                              'fetch-github', 'select-branch', 'new-branch', 'start', 'resume',
                              'push-approved', 'auto-push'):
@@ -239,7 +259,7 @@ class DesktopUITests(unittest.TestCase):
                 page.locator('#nav-overview').click()
                 self.assertFalse(page.locator('#secondary-controls').is_visible())
                 page.evaluate('window.scrollTo(0, 0)')
-                for width, height in ((1280, 720), (1600, 900), (390, 720)):
+                for width, height in ((1366, 680), (1280, 720), (1600, 900), (640, 480), (390, 720)):
                     page.set_viewport_size({'width': width, 'height': height})
                     self.assertTrue(page.evaluate('document.documentElement.scrollWidth <= innerWidth'), str(width))
                     boxes = []
@@ -266,6 +286,8 @@ class DesktopUITests(unittest.TestCase):
                     positions = [cards.nth(i).bounding_box() for i in range(3)]
                     if width >= 1280:
                         self.assertEqual(len({box['y'] for box in positions}), 1)
+                        self.assertTrue(all(box['y'] + box['height'] <= height for box in positions),
+                                        f'All three status cards fit without scrolling at {width}x{height}: {positions}')
                     else:
                         self.assertEqual(len({box['y'] for box in positions}), 3)
                     self.assertEqual(page.locator('#run-setup > :last-child').get_attribute('class'), 'push-policy')
@@ -344,7 +366,7 @@ class DesktopUITests(unittest.TestCase):
                     page.set_viewport_size({'width': width, 'height': height})
                     self.assertTrue(page.evaluate('document.documentElement.scrollWidth <= innerWidth'), str(width))
                     self.assertTrue(page.locator('#start').is_disabled())
-                    self.assertIn('<img src=x onerror=bad()>', page.locator('#start-reason').inner_text())
+                    self.assertIn('<img src=x onerror=bad()>', page.locator('#preflight').inner_text())
                     self.assertEqual(page.locator('#preflight img, #start-reason img').count(), 0)
                 for view in ('tasks', 'logs', 'overview'):
                     page.locator('#nav-' + view).click()
