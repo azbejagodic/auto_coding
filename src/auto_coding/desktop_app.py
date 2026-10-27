@@ -13,8 +13,9 @@ from auto_coding.simple_run import load_tasks
 
 HTML = r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Auto-Coding</title><style>
 *{box-sizing:border-box}
-body{margin:0;background:#0e1115;color:#f0f3f7;font:15px/1.5 "Segoe UI",system-ui,sans-serif}
+body{margin:0;background:#202935;color:#f0f3f7;font:16px/1.5 "Segoe UI",system-ui,sans-serif}
 button,input,select{font:inherit}
+input::placeholder{color:#b0bccb;opacity:1}
 button,select,input{border:1px solid #475361;border-radius:10px;background:#222b36;color:#f0f3f7;padding:10px 16px}
 button{cursor:pointer;transition:background .15s}
 button:hover{background:#303e4f}
@@ -27,14 +28,14 @@ button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visi
 .nav{display:block;width:100%;text-align:left;background:transparent;border:1px solid transparent;margin:8px 0;padding:12px 16px;color:#bdc7d4}
 .nav.active{background:#1e3149;border-color:#3d6490;color:#fff}
 .side p{font-size:14px;margin-top:24px}
-.main{margin-left:210px;padding:24px;flex:1;min-width:0;max-width:1700px}
+.main{margin-left:210px;padding:24px 32px;flex:1;min-width:0;max-width:1700px;overflow-wrap:anywhere}
 .top{display:flex;justify-content:space-between;gap:16px;align-items:center;margin-bottom:16px}
 .top>div:first-child{min-width:0}
 .top>div:last-child{flex-shrink:0}
 .top h1{font-size:26px;margin:4px 0}
 .muted{color:#b0bccb}
 .label{color:#b0bccb;font-size:13px;font-weight:600;letter-spacing:.06em;text-transform:uppercase}
-.panel,.card{background:#191f27;border:1px solid #303946;border-radius:16px;padding:16px}
+.panel,.card{background:#293544;border:1px solid #536174;border-radius:16px;padding:16px}
 .panel{margin:0 0 16px}
 .panel h2{font-size:19px;margin:0 0 16px}
 .panel h3{font-size:16px;margin:0 0 12px}
@@ -46,21 +47,38 @@ button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visi
 .amber,.warning{color:#f5ca7b}
 .red{color:#ff9494}
 .warning{margin:12px 0}
-.setup-fields{display:grid;grid-template-columns:minmax(0,1fr) 110px;gap:16px}
+.setup-fields{display:grid;grid-template-columns:minmax(0,1fr) 150px;gap:20px;margin-top:20px}
 .field label{display:block;font-weight:600;margin-bottom:8px}
 #attempts{width:100%;padding:10px}
-#github-repo{flex:1;min-width:180px}
+#github-repo{flex:1;min-width:0;width:100%}
+.repository-line{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px}
+.branch-line{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin-top:12px}
+#github-branch{flex:1;min-width:0;max-width:100%}
+#github-state{margin:8px 0 16px;overflow-wrap:anywhere}
+.flow{color:#c5d8ef;margin:0 0 20px}
+.step-title{display:block;font-weight:650;margin-bottom:8px}
+.launch-row{display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin-top:20px}
+#start-reason{flex:1;min-width:180px}
+.push-policy{display:block;margin-top:16px}
+#auto-push-note{display:block;margin:4px 0 0 26px}
+.secondary{background:#242e3b;border:1px solid #536174;border-radius:12px;padding:8px 16px;margin:16px 0}
+.secondary>summary{font-weight:650}
+.secondary .controls{margin:12px 0}
+.controls>*{max-width:100%;min-width:0}
+#branch-form{padding:16px;background:#202935;border-radius:10px}
+#branch-name,#branch-base{max-width:100%;min-width:0}
+.notice:empty{display:none}
 #attempts[aria-invalid="true"]{border-color:#ff9494}
-.field-line{display:flex;align-items:flex-start;gap:8px}
-.selected-path{margin:0;min-height:46px;flex:1;min-width:0;white-space:pre-wrap;overflow-wrap:anywhere;user-select:text;color:#dbe4ef;padding:10px 12px;background:#0e1115;border-radius:8px}
+.field-line{display:flex;align-items:flex-start;gap:12px;min-width:0}
+.selected-path{margin:0;min-height:46px;max-height:96px;overflow:auto;flex:1;min-width:0;white-space:pre-wrap;overflow-wrap:anywhere;user-select:text;color:#dbe4ef;padding:10px 12px;background:#0e1115;border-radius:8px}
 .controls{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin-top:16px}
-#start{background:#3578ce;border-color:#67a7f3;color:white;font-weight:650;min-width:130px}
-#start:hover:enabled{background:#4388df}
+#start{background:#8bc3ff;border-color:#b8dbff;color:#10283f;font-size:18px;font-weight:700;min-width:160px;padding:12px 24px}
+#start:hover:enabled{background:#b8dbff}
 #start:disabled{background:#253547;color:#b3c0d1;border-color:#475361}
 #resume{border-color:#6f9ac9;font-weight:650}
 .notice,.path{white-space:pre-wrap;overflow-wrap:anywhere}
 .notice p{margin:12px 0}
-.empty{padding:16px;background:#191f27;border:1px solid #303946;border-radius:16px}
+.empty{padding:16px;background:#293544;border:1px solid #536174;border-radius:16px}
 .empty p{margin:0}
 details{margin:12px 0}
 summary{cursor:pointer;color:#c0d4eb;padding:6px 0}
@@ -91,6 +109,9 @@ progress{width:100%;height:12px;accent-color:#72adf9}
 .grid .card:first-child{grid-column:1/-1}
 .events{font-size:14px}
 }
+@media(max-width:760px){
+.side{position:static;width:auto;padding:12px 16px}.shell{display:block}.brand{margin:0 0 8px}.side nav{display:flex;gap:8px}.nav{margin:0;padding:10px}.main{margin-left:0;padding:16px}.top{align-items:flex-start}.top h1{font-size:24px}.repository-line{grid-template-columns:minmax(0,1fr)}.setup-fields{grid-template-columns:minmax(0,1fr)}.grid{grid-template-columns:minmax(0,1fr)}.field-line{flex-wrap:wrap}.selected-path{flex-basis:100%}.panel{padding:16px}.filters label{min-width:0}.top>div:last-child{flex-shrink:1}#header-state{white-space:normal}
+}
 @media(prefers-reduced-motion:reduce){button{transition:none}
 }
 
@@ -117,21 +138,19 @@ progress{width:100%;height:12px;accent-color:#72adf9}
 </div>
 </header>
 <section class="panel" id="run-setup" aria-labelledby="setup-title">
-<h2 id="setup-title">Run setup</h2>
-<label for="github-repo">GitHub repository (OWNER/REPO or GitHub URL)</label>
-<div class="controls">
-<input id="github-repo" aria-label="GitHub repository" placeholder="OWNER/REPO">
+<h2 id="setup-title">Set up a run</h2>
+<p class="flow">Repository and branch → Task plan → Attempts → Start</p>
+<label class="step-title" for="github-repo">1. Repository and branch</label>
+<div class="repository-line">
+<input id="github-repo" aria-label="GitHub repository" placeholder="OWNER/REPO or GitHub URL">
 <button id="connect-github">Connect repository</button>
-<button id="list-github">My repositories</button>
-<select id="github-repositories" aria-label="Authenticated repositories" hidden></select>
 </div>
-<p id="github-state" class="muted">Enter a repository. GitHub CLI is optional; Git authentication is used for checkout.</p>
-<div class="controls">
+<div class="branch-line">
 <select id="github-branch" aria-label="Feature branch"></select>
 <button id="select-branch">Select branch</button>
 <button id="new-branch">New Branch</button>
-<button id="fetch-github">Fetch branches</button>
 </div>
+<p id="github-state" class="muted">Connect a repository to choose a feature branch.</p>
 <div id="branch-form" class="controls" hidden>
 <label for="branch-name">New feature branch</label>
 <input id="branch-name">
@@ -142,30 +161,42 @@ progress{width:100%;height:12px;accent-color:#72adf9}
 </div>
 <div class="setup-fields">
 <div class="field">
-<label id="plan-label">Task plan</label>
+<label id="plan-label">2. Task plan</label>
 <div class="field-line">
 <div id="plan-path" class="selected-path" tabindex="0" role="textbox" aria-readonly="true" aria-labelledby="plan-label">No plan selected</div>
 <button id="browse-plan" aria-label="Browse task plan">Browse</button>
 </div>
 </div>
 <div class="field">
-<label for="attempts">Attempts</label>
+<label for="attempts">3. Attempts</label>
 <input id="attempts" type="number" min="1" max="10" step="1" value="3" required aria-describedby="attempts-hint attempts-error">
 <small id="attempts-hint" class="muted">1–10 per task</small>
 </div>
 </div>
 <div id="attempts-error" class="notice red" role="status" aria-live="polite"></div>
+<div class="launch-row">
+<button id="start" aria-describedby="start-reason attempts-error">4. Start</button>
+<span id="start-reason" class="muted" role="status" aria-live="polite"></span>
+</div>
+<label class="push-policy"><input id="auto-push" type="checkbox" aria-describedby="auto-push-note"> Automatically push approved tasks</label>
+<small id="auto-push-note" class="muted">Off for a new run. Approved commits stay local; enabling publishes them to the feature branch. No merge or force-push.</small>
+<div id="preflight" class="notice muted">
+</div>
+<details id="git-actions" class="secondary">
+<summary>Git actions and saved runs</summary>
 <div class="controls">
-<button id="start" aria-describedby="preflight attempts-error">Start</button>
 <button id="resume" aria-describedby="resume-reason attempts-error">Resume</button>
 <button id="open-run">Open Run</button>
 <span id="resume-reason" class="muted">Open a matching stopped run to resume.</span>
 </div>
+<div class="controls">
+<button id="fetch-github">Fetch branches</button>
+<button id="list-github">My repositories</button>
+<select id="github-repositories" aria-label="Authenticated repositories" hidden></select>
+</div>
 <div class="controls"><button id="push-approved">Push Approved Commits</button>
 <span id="push-reason" class="muted"></span></div>
-<label><input id="auto-push" type="checkbox"> Automatically push approved tasks</label>
-<p class="muted">Off by default for each new Start. Confirm at Start for this run. Resume keeps the run's saved setting. If publication fails, Resume is Retry Push for the same approved commit before further tasks.</p>
-<details id="local-project"><summary>Advanced / Local Project</summary>
+<details id="local-project"><summary>Local folder fallback</summary>
 <div class="field">
 <label id="project-label">Project folder</label>
 <div class="field-line">
@@ -174,12 +205,9 @@ progress{width:100%;height:12px;accent-color:#72adf9}
 </div>
 </div>
 </details>
-<div id="paths">
-</div>
-<div id="preflight" class="notice muted">
-</div>
+</details>
 <details id="launch-details">
-<summary>Details</summary>
+<summary>Launch safeguards and diagnostics</summary>
 <p class="muted">Every launch requires native confirmation. START requires a clean feature branch. RESUME requires a stopped run and its original plan, repository and logs. Attempts is the total limit per task (1–10); increase it to continue an exhausted run. Checkpoints stay local unless automatic push is explicitly enabled for this run. No automatic merge or force-push. Model and reasoning settings come from your local Codex CLI.</p>
 <p class="muted">Local Codex CLI authentication is required. Closing this window leaves the runner alive. Reopen its logs to inspect progress.</p>
 <pre id="preflight-details" tabindex="0" aria-label="Preflight diagnostics"></pre>
@@ -243,6 +271,12 @@ function message(text, error = false) {
   box.textContent = text || '';
   box.className = 'notice ' + (error ? 'red' : 'blue');
 }
+function restoreActionFocus(id) {
+  // Disabling the pressed button during a bridge call can move focus to body.
+  // Preserve navigation if the user has already focused another control.
+  const button = document.getElementById(id);
+  if (document.body && document.activeElement === document.body && !button.disabled) button.focus();
+}
 function updateControls() {
   const c = latest?.controller || {};
   const locked = busy || !ready || c.active !== false || c.uncertain;
@@ -256,9 +290,32 @@ function updateControls() {
   document.getElementById('create-branch').disabled ||= !base || (base !== 'main' && !document.getElementById('branch-base-confirm').checked);
   document.getElementById('push-approved').disabled = locked || !c.push?.eligible;
   document.getElementById('push-reason').textContent = c.push?.reason || 'Select a managed repository to publish approved local checkpoints.';
+  const savedPush = !!latest?.state?.auto_push;
+  const savedRun = !!c.logs || !!latest?.root;
+  const push = document.getElementById('auto-push');
+  // A stopped run may also be used as setup for a new Start: retain that opt-in separately.
+  const showingSavedPolicy = savedRun && (c.active !== false || c.uncertain || !c.start_ready);
+  const pushContext = JSON.stringify([c.repo, c.preflight?.branch, c.plan, c.logs, latest?.root]);
+  if (showingSavedPolicy) push.checked = savedPush;
+  // An opt-in belongs to this setup, never to another repository, branch or plan.
+  else if (push.showingSavedPolicy || push.setupContext !== pushContext) push.checked = false;
+  push.setupContext = pushContext;
+  push.showingSavedPolicy = showingSavedPolicy;
+  push.disabled = locked || showingSavedPolicy;
+  push.indeterminate = showingSavedPolicy && !latest?.state;
+  document.getElementById('auto-push-note').textContent = push.indeterminate
+    ? 'This run: automatic push policy is not recorded yet. Inspect saved state in Logs; Resume uses its saved policy.'
+    : showingSavedPolicy
+    ? 'This run: automatic push ' + (savedPush ? 'ON. Approved commits publish to the feature branch.' : 'OFF. Approved commits stay local.') + ' Resume preserves this policy. No merge or force-push.'
+    : 'New run: automatic push ' + (push.checked ? 'ON. Approved commits will publish to the feature branch.' : 'OFF. Approved commits stay local.') + ' No merge or force-push.' + (savedRun ? ' Resume keeps the saved run policy: ' + (!latest?.state ? 'not recorded.' : savedPush ? 'ON.' : 'OFF.') : '');
   const validAttempts = validateAttempts();
   document.getElementById('start').disabled = locked || !c.start_ready || !validAttempts;
   document.getElementById('resume').disabled = locked || !c.resume_ready || !validAttempts;
+  const startReason = !ready ? 'Loading repository status...' : busy ? 'Finish the current action first.'
+    : c.uncertain || c.active === null ? 'Resolve unknown child status in Logs.' : c.active ? 'A run is already active.'
+    : !validAttempts ? 'Enter 1–10 whole attempts.' : !c.repo ? 'Connect a repository first.' : !c.plan ? 'Choose a task plan.'
+    : !c.start_ready ? c.preflight?.errors?.[0] || c.preflight?.start_error || 'Resolve setup diagnostics below.' : 'Ready. Review the native confirmation to launch.';
+  document.getElementById('start-reason').textContent = startReason;
   document.getElementById('resume').textContent = latest?.state?.publication?.outcome === 'pending' ? 'Retry Push' : 'Resume';
   document.getElementById('refresh').disabled = busy || !ready;
 }
@@ -317,39 +374,47 @@ function render(data) {
   if (runPresentation(data).label === 'Completed' && document.getElementById('message').textContent.startsWith('Launch accepted.')) message('');
   if (renderKey === key) return;
   renderKey = key;
-  const paths = document.getElementById('paths');
-  paths.replaceChildren();
   [['project-path', c.repo || 'No project selected'], ['plan-path', c.plan || 'No plan selected']].forEach(([id, value]) => {
     const field = document.getElementById(id);
     if (field.textContent !== value) field.textContent = value;
   });
   document.getElementById('selected-project').textContent = c.repository || c.repo || 'No project selected';
   const connection = document.getElementById('github-state');
-  connection.textContent = c.repository ? c.repository + ' | GitHub origin verified locally | Branch: ' + (c.preflight?.branch || 'Detached HEAD') + ' | ' + (c.preflight?.clean === true ? 'Clean' : 'Changes or unavailable status') + (c.github?.error ? ' | ' + c.github.error : '') : 'No GitHub repository selected. Enter OWNER/REPO or a GitHub URL; GitHub CLI is optional.';
+  connection.textContent = c.repo ? (c.repository ? 'GitHub origin verified locally' : 'Local project') + ' | Branch: ' + (c.preflight?.branch || 'Detached HEAD') + ' | ' + (c.preflight?.clean === true ? 'Clean' : 'Changes or unavailable status') + (c.github?.error ? ' | ' + c.github.error : '') : 'Connect a repository to choose a feature branch.';
   const branches = document.getElementById('github-branch');
   const bases = document.getElementById('branch-base');
   const remoteBases = [...new Set((c.github?.remote || []).filter(name => name.startsWith('origin/') && name !== 'origin/HEAD').map(name => name.slice(7)))];
   const baseSignature = JSON.stringify([c.repository, remoteBases]);
   if (bases.datasetSignature !== baseSignature) {
+    const preserveBase = bases.repositoryContext === c.repository && remoteBases.includes(bases.value);
+    const selectedBase = preserveBase ? bases.value
+      : remoteBases.includes('main') ? 'main' : remoteBases.includes('master') ? 'master' : remoteBases[0] || '';
     bases.replaceChildren();
     remoteBases.forEach(name => { const option = el('option', 'origin/' + name); option.value = name; bases.append(option); });
-    bases.value = remoteBases.includes('main') ? 'main' : remoteBases.includes('master') ? 'master' : remoteBases[0] || '';
+    bases.value = selectedBase;
     bases.datasetSignature = baseSignature;
-    document.getElementById('branch-base-confirm').checked = false;
-    document.getElementById('branch-form').hidden = true;
+    bases.repositoryContext = c.repository;
+    // Polling must not discard an in-progress form when unrelated branches appear.
+    if (!preserveBase) {
+      document.getElementById('branch-base-confirm').checked = false;
+      document.getElementById('branch-form').hidden = true;
+    }
   }
   updateControls();
   const names = [...new Set([...(c.github?.local || []), ...(c.github?.remote || []).filter(name => name.startsWith('origin/') && name !== 'origin/HEAD').map(name => name.slice(7))])].filter(name => !['main', 'master'].includes(name.toLowerCase()));
   const signature = JSON.stringify([c.repository, c.preflight?.branch, names]);
   if (branches.datasetSignature !== signature) {
+    const selectionContext = JSON.stringify([c.repository, c.preflight?.branch]);
+    const selected = branches.selectionContext === selectionContext && names.includes(branches.value)
+      ? branches.value : names.includes(c.preflight?.branch) ? c.preflight.branch : '';
     branches.replaceChildren();
     const placeholder = el('option', 'Choose a feature branch'); placeholder.value = ''; branches.append(placeholder);
     names.forEach(name => { const option = el('option', name); option.value = name; branches.append(option); });
-    branches.value = names.includes(c.preflight?.branch) ? c.preflight.branch : '';
+    branches.value = selected;
     branches.datasetSignature = signature;
+    branches.selectionContext = selectionContext;
   }
   const git = c.preflight || {};
-  if (c.repo) paths.append(el('div', 'Branch: ' + (git.branch || 'Unavailable'), 'path muted'));
   document.getElementById('run-folder').textContent = c.logs ? 'Run folder: ' + c.logs : '';
   const errors = [...(git.errors || []), ...Object.entries(c.validation_errors || {}).map(([k,v]) => k + ': ' + v)];
   if (c.selection_error) errors.push(c.selection_error);
@@ -377,12 +442,14 @@ function render(data) {
   }
   app.replaceChildren();
   if (!c.logs && !data.root) {
-    const empty = el('section', undefined, 'empty');
-    empty.append(el('p', page === 'overview'
-      ? c.start_ready ? 'Ready. Start to confirm your run.' : 'Select a project and plan, then Start. Open Run to inspect saved work.'
-      : page === 'tasks' ? 'No task history yet. Start or open a run.' : 'No run evidence yet. Start or open a run.'));
-    if (page !== 'overview') { const setup = el('button', 'Go to run setup'); setup.onclick = () => navigate('overview'); empty.append(setup); }
-    app.append(empty);
+    if (page !== 'overview') {
+      const empty = el('section', undefined, 'empty');
+      empty.append(el('p', page === 'tasks' ? 'No task history yet. Start or open a run.' : 'No run evidence yet. Start or open a run.'));
+      const setup = el('button', 'Go to run setup');
+      setup.onclick = () => navigate('overview');
+      empty.append(setup);
+      app.append(empty);
+    }
     if (c.error) app.append(el('div', c.error, 'warning'));
     return;
   }
@@ -397,9 +464,9 @@ function render(data) {
   if (data.empty) app.append(el('div', 'No run state or events found. Select a project and plan to START, or inspect available raw files in Logs.', 'empty'));
   if (c.logs && !data.exists && !data.state_error) app.append(el('div', 'Log directory is missing or unavailable.', 'warning'));
   if (state.pending_checkpoint) app.append(el('div', 'A checkpoint is pending reconciliation. No completion is inferred.', 'warning'));
-  if (state.auto_push) app.append(el('div', 'This run automatically pushes approved tasks to origin/' + state.auto_push.branch + '. Resume preserves this setting.', 'notice'));
+  if (state.auto_push && page !== 'overview') app.append(el('div', 'This run automatically pushes approved tasks to origin/' + state.auto_push.branch + '. Resume preserves this setting.', 'notice'));
   if (state.publication?.outcome === 'pending') app.append(el('div', 'Approved locally, push pending. Resolve connectivity or permissions, then use Resume (Retry Push). The same SHA is retried before any further tasks; Codex is not rerun for the approved task. Remote divergence requires manual review.', 'warning'));
-  (data.event_errors || []).forEach(error => app.append(el('div', error, 'warning')));
+  if (page === 'logs') (data.event_errors || []).forEach(error => app.append(el('div', error, 'warning')));
   if (page === 'overview') {
     const summary = el('div', undefined, 'grid');
     const count = data.task_count ?? c.task_count;
@@ -524,6 +591,7 @@ async function act(method) {
     ready = true;
     await refresh(false);
     if (accepted && ['start', 'resume', 'open_run'].includes(method)) message('');
+    restoreActionFocus(button);
   }
 }
 async function showEvidence(name) {
@@ -564,7 +632,10 @@ async function workspaceAction(method, args, button) {
     if (result.ok && method === 'create_github_branch') document.getElementById('branch-form').hidden = true;
     message(result.error || result.message || (result.ok ? (method === 'push_approved_commits' ? 'Approved checkpoints remotely published. No merge to main.' : 'Selection updated. No work launched.') : 'Action failed.'), !result.ok);
   } catch (error) { message('Workspace action failed: ' + error, true); }
-  finally { busy = false; updateControls(); await refresh(false); }
+  finally {
+    busy = false; updateControls(); await refresh(false);
+    restoreActionFocus(method === 'create_github_branch' && document.getElementById('branch-form').hidden ? 'new-branch' : button);
+  }
 }
 document.getElementById('connect-github').onclick = () => workspaceAction('connect_github', [document.getElementById('github-repo').value.trim()], 'connect-github');
 document.getElementById('list-github').onclick = () => workspaceAction('github_repositories', [], 'list-github');
@@ -575,7 +646,7 @@ document.getElementById('github-repositories').onchange = () => {
 document.getElementById('select-branch').onclick = () => workspaceAction('checkout_github_branch', [latest?.controller?.repository, document.getElementById('github-branch').value], 'select-branch');
 document.getElementById('fetch-github').onclick = () => workspaceAction('fetch_github', [latest?.controller?.repository], 'fetch-github');
 document.getElementById('new-branch').onclick = () => { if (!document.getElementById('new-branch').disabled) { document.getElementById('branch-base-confirm').checked = false; document.getElementById('branch-form').hidden = false; updateControls(); document.getElementById('branch-name').focus(); } };
-document.getElementById('cancel-branch').onclick = () => { document.getElementById('branch-form').hidden = true; document.getElementById('branch-name').value = ''; };
+document.getElementById('cancel-branch').onclick = () => { document.getElementById('branch-form').hidden = true; document.getElementById('branch-name').value = ''; document.getElementById('new-branch').focus(); };
 document.getElementById('branch-base').onchange = () => { document.getElementById('branch-base-confirm').checked = false; updateControls(); };
 document.getElementById('branch-base-confirm').onchange = updateControls;
 document.getElementById('create-branch').onclick = () => workspaceAction('create_github_branch', [latest?.controller?.repository, document.getElementById('branch-name').value.trim(), document.getElementById('branch-base').value, document.getElementById('branch-base-confirm').checked === true], 'create-branch');
@@ -583,6 +654,7 @@ document.getElementById('push-approved').onclick = () => workspaceAction('push_a
 
 document.getElementById('refresh').onclick = refresh;
 document.getElementById('attempts').oninput = updateControls;
+document.getElementById('auto-push').onchange = updateControls;
 ['overview', 'tasks', 'logs'].forEach(name => { document.getElementById('nav-' + name).onclick = () => navigate(name); });
 Object.entries({'browse-project':'select_repo', 'browse-plan':'select_plan', 'open-run':'open_run', start:'start', resume:'resume'}).forEach(([id, method]) => { document.getElementById(id).onclick = () => act(method); });
 updateControls();

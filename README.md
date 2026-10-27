@@ -1,4 +1,4 @@
-# Auto-Coding Simple Backend V2.1 — generated-file staging fix
+# Auto-Coding
 
 The existing simple runner saves approved local checkpoints by default. The dashboard supports one-shot publication and optional, explicitly confirmed automatic publication of approved feature checkpoints.
 
@@ -54,10 +54,10 @@ py -B -m auto_coding.desktop_app --logs "C:\Users\you\AutoCoding-Runs\run-<id>"
 Local Codex CLI authentication is required before starting. The runner inherits the currently configured CLI model and reasoning settings; the dashboard has no model override controls. Git and Codex CLI must be available to the launched Python process.
 
 1. Enter a GitHub **OWNER/REPO** or GitHub URL and click **Connect repository**. The app creates or reopens its managed checkout. **My repositories** optionally lists repositories when `gh` is authenticated; manual entry works without `gh`. Choose a feature branch and click **Select branch**, or use **New Branch**, enter its name, and click **Create branch**. Choose the remote base (normally `origin/main`); an alternate base such as `origin/master` requires the explicit confirmation checkbox. New branches start from that freshly fetched base. Commit or discard outstanding changes before branch changes or START. Main, master and detached HEAD cannot run tasks.
-2. For existing local projects, **Advanced / Local Project** retains Project folder **Browse**. Otherwise the managed checkout is selected automatically. Click **Browse** beside Task plan and select the intended TXT, MD or JSON plan. TXT/MD represents one task; JSON can include ordered tasks and explicit test command argv arrays (see `examples`). Keep the plan outside the target checkout, or commit it before starting. Browsing, opening and cancelling selection never launch work. Full paths, branch, working tree and validation errors appear in the dashboard.
-3. Enter a whole-number total attempt limit from **1 through 10** (default **3**). Invalid or empty entries explain why START and RESUME are disabled. Optionally select **Automatically push approved tasks** before START. Review the native confirmation containing the repo, branch, plan and publication policy. Cancelling does not launch anything. Approved task checkpoints are committed locally before any optional push. There is no automatic merge or force-push. Overview keeps setup compact, with preflight errors visible and safeguards in one expandable **Details** section.
+2. For existing local projects, **Git actions and saved runs > Local folder fallback** retains Project folder **Browse**. Otherwise the managed checkout is selected automatically. Click **Browse** beside Task plan and select the intended TXT, MD or JSON plan. TXT/MD represents one task; JSON can include ordered tasks and explicit test command argv arrays (see `examples`). Keep the plan outside the target checkout, or commit it before starting. Browsing, opening and cancelling selection never launch work. Full paths, branch, working tree and validation errors appear in the dashboard.
+3. Enter a whole-number total attempt limit from **1 through 10** (default **3**). Invalid or empty entries explain why START and RESUME are disabled. Optionally select **Automatically push approved tasks** before START. Review the native confirmation containing the repo, branch, plan and publication policy. Cancelling does not launch anything. Approved task checkpoints are committed locally before any optional push. There is no automatic merge or force-push. Overview follows **Repository and branch → Task plan → Attempts → Start**, with a launch reason beside Start. **Git actions and saved runs** contains Resume/Open Run, Fetch, My repositories, Push Approved Commits and the local folder fallback. **Launch safeguards and diagnostics** holds detailed checks. The automatic push checkbox shows the active run policy; new runs default to OFF, changing the setup clears the opt-in, and Resume keeps its saved policy.
 4. **Overview** shows recorded state, current task, task counts, child activity/errors and recent events. **Tasks** shows each attempt, test results and Codex B verdicts, with original feedback and summaries in expandable details. **Logs** shows timestamped actors/outcomes and evidence links. Its raw file list also supports legacy runs with no event timeline. Files are loaded only when selected, as text, confined to the chosen logs directory and capped at 1 MB. Missing/corrupt sources produce warnings. The UI polls every four seconds and preserves opened evidence and expanded details.
-5. New logs live in `%LOCALAPPDATA%\AutoCoding\runs\run-<id>` outside the project; the full selected log path remains accessible in **Details** after the child exits. Logs include `desktop-run.json`, `state.json`, `events.jsonl`, evidence files and `runner-output.txt` (including launch/initialization diagnostics). Historical process exits and diagnostics are in **Logs**; completed saved state takes priority over past exit warnings. A child exit code is never treated as task approval; only durable runner state supplies completion.
+5. New logs live in `%LOCALAPPDATA%\AutoCoding\runs\run-<id>` outside the project; the full selected log path remains accessible in **Launch safeguards and diagnostics** after the child exits. Logs include `desktop-run.json`, `state.json`, `events.jsonl`, evidence files and `runner-output.txt` (including launch/initialization diagnostics). Historical process exits and diagnostics are in **Logs**; completed saved state takes priority over past exit warnings. A child exit code is never treated as task approval; only durable runner state supplies completion.
 6. To resume, click **Open Run** and choose its log directory. Desktop runs restore the original exact repo and plan paths. RESUME is enabled only for matching stopped state and inactive, known child status; the controller checks again at launch. Keep the original plan bytes and paths. Legacy runs without desktop metadata require selecting their original repo and plan explicitly. Choose **5** if the original total attempt limit of 3 was exhausted, then click **RESUME** and confirm. Staged work is reconciled by the existing runner. Running, missing-state or uncertain launches cannot be resumed through this UI; inspect the visible diagnostics instead of launching duplicate work.
 
 Closing the window leaves the Windows child process alive in the background. Open its saved log directory in another window to inspect progress. If its PID cannot be saved or its launch status is uncertain, the dashboard blocks START/RESUME and explains the error. An interrupted child whose durable state still says running is shown as unknown, rather than invented completion or approval. There is no stop/kill button in this slice.
@@ -121,7 +121,9 @@ $env:PYTHONPATH = (Join-Path (Get-Location) "src")
 py -B -m unittest discover -s tests -v
 ```
 
-When Node.js is on PATH, this suite also checks JavaScript syntax and exercises the actual UI script with a fake DOM/bridge, including button dispatch, cancellation, navigation, polling, duplicate clicks and state transitions. Only JavaScript-specific checks are skipped if Node is absent. The filesystem symlink test skips on Windows installations without symlink privileges.
+Set `PYTHONPATH` as shown even if Auto-Coding is already installed: otherwise Python may test another checkout instead of this repository.
+
+The UI tests check JavaScript syntax and exercise the actual UI script with a fake DOM/bridge, using Node.js on PATH or Playwright's bundled Node runtime. With Playwright and Chromium installed, they also check keyboard navigation, cancellation, and control layout at 1280×720, 1600×900 and a narrow viewport. Unavailable optional runtimes are reported as skips. These tests use synthetic bridge data without GitHub or real Codex calls. The filesystem symlink test skips on Windows installations without symlink privileges.
 
 ## Desktop run controller (Slice 2A)
 
@@ -171,8 +173,9 @@ py -B -c "import sys; sys.path.insert(0, 'src'); from auto_coding.desktop_app im
 ```
 
 The dashboard uses a fixed 210px navigation sidebar, a project/state header and
-readable system fonts on charcoal panels. Overview owns Run setup, full selectable
-project/plan paths, branch/readiness diagnostics, onboarding or progress/current
+16px system fonts on spacious slate panels; navigation stacks above the form on
+small windows. Overview owns the numbered setup flow, selectable project/plan
+paths, branch/readiness diagnostics, progress/current
 task, and five recent events. Tasks owns attempt/test/commit rows with distinct
 approved/rejected labels and collapsed original Codex B feedback. Logs owns the
 UTC event timeline, local actor/outcome/event search, missing/corrupt warnings,
@@ -188,14 +191,14 @@ Codex or open a GUI. Perform this separate manual check on Windows:
    sidebar, readable labels, normal vertical scrolling and no page/toolbar
    horizontal overflow. Tab through navigation, Browse, Attempts, Start, Resume,
    Open Run and details. Verify visible focus, hover and selected navigation;
-   Enter/Space must activate buttons. Overview shows **Idle** and onboarding;
+   Enter/Space must activate buttons. Overview shows **Idle** and the setup flow;
    Tasks/Logs show their own empty state and a working **Go to run setup** button.
 2. Use a disposable Git project with an initial commit on `feature/ui-smoke`.
    Keep a one-task plan outside it asking for `greet.py` to print
    `Hello, Auto-Coding!` and a Python test of that output. Authenticate the local
-   Codex CLI. In the review instructions ask Codex B to reject only reproducible
-   in-scope functional, regression, accessibility or security issues; personal
-   color/style preferences and optional redesign notes are nonblocking.
+   Codex CLI. In the review instructions ask Codex B to identify all demonstrable in-scope
+   functional, regression, accessibility or security blockers; subjective visual
+   preferences and optional redesign notes are nonblocking suggestions.
 3. Browse for the project and plan, including a long path with spaces. Read and
    select/copy the entire paths; confirm branch and readiness. Cancel a picker
    and verify selections remain. Main/master, dirty trees and invalid plans

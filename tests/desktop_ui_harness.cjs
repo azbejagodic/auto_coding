@@ -43,7 +43,7 @@ const api = {
     data.controller.repo = 'C:\\project with spaces'; return {ok:true}; },
   select_plan: async (...args) => { calls.push(['select_plan', ...args]); data.controller.plan = 'C:\\plans\\task.json'; data.controller.start_ready = true; return {ok:true}; },
   open_run: async (...args) => { calls.push(['open_run', ...args]); return {ok:true, cancelled:true}; },
-  start: async (...args) => { calls.push(['start', ...args]); if (launchResult.ok) { data.controller.active = true; data.controller.logs = data.root = 'C:\\runs\\one'; data.exists = true; data.empty = false; } return launchResult; },
+  start: async (...args) => { calls.push(['start', ...args]); if (launchResult.ok) { data.controller.active = true; data.controller.logs = data.root = 'C:\\runs\\one'; data.exists = true; data.empty = false; data.state = {status:'running', auto_push: args[1] ? {branch:'feature/ui'} : null}; } return launchResult; },
   resume: async (...args) => { calls.push(['resume', ...args]); data.controller.active = true; return {ok:true}; },
   evidence: async name => { evidenceReads++; return {ok:true, text:'<img src=x onerror=bad()> original evidence: ' + name}; }
 };
@@ -62,7 +62,10 @@ const contents = () => get('app').textContent;
   assert(!get('browse-project').disabled);
   assert(get('start').disabled);
   assert.equal(get('header-state').textContent, 'Idle');
-  assert(contents().includes('Select a project and plan, then Start.'));
+  assert.equal(contents(), '', 'No duplicate empty setup panel');
+  assert(get('start-reason').textContent.includes('Connect a repository'));
+  assert(!get('auto-push').checked);
+  assert(get('auto-push-note').textContent.includes('OFF'));
   assert(!contents().includes('Ready for your first run'));
   assert.equal(get('run-setup').hidden, false);
   const initial = structuredClone(data);
@@ -77,13 +80,34 @@ const contents = () => get('app').textContent;
   assert(get('selected-project').textContent.includes('owner/repo'));
   assert(get('github-state').textContent.includes('main | Clean'));
   assert(get('start').disabled && get('push-approved').disabled);
-  get('github-branch').value = 'feature/remote'; await click('select-branch');
+  const beforeBranchSelection = calls.length;
+  get('github-branch').value = 'feature/remote';
+  assert.equal(calls.length, beforeBranchSelection, 'Selecting a branch alone has no side effects');
+  data.controller.github.remote.push('origin/feature/newly-fetched');
+  await poll();
+  assert.equal(get('github-branch').value, 'feature/remote', 'New branch options preserve the pending selection');
+  assert.equal(calls.length, beforeBranchSelection, 'Refreshing branch options must not perform an action');
+  await click('fetch-github');
+  assert.deepEqual(calls.at(-1), ['fetch_github', 'owner/repo']);
+  await click('select-branch');
   assert.deepEqual(calls.at(-1), ['checkout_github_branch', 'owner/repo', 'feature/remote']);
   await click('new-branch'); get('branch-name').value = 'feature/cancelled';
   const beforeCancel = calls.length; await click('cancel-branch');
   assert.equal(calls.length, beforeCancel);
   assert(get('branch-form').hidden);
-  await click('new-branch'); get('branch-name').value = 'feature/new'; await click('create-branch');
+  assert.equal(document.activeElement, get('new-branch'), 'Cancel restores branch focus');
+  await click('new-branch'); get('branch-name').value = 'feature/new';
+  get('branch-base').value = 'master'; get('branch-base').onchange();
+  get('branch-base-confirm').checked = true; get('branch-base-confirm').onchange();
+  get('branch-base').focus();
+  data.controller.github.remote.push('origin/feature/unrelated'); await poll();
+  assert(!get('branch-form').hidden, 'Polling keeps the in-progress branch form open');
+  assert.equal(get('branch-base').value, 'master');
+  assert(get('branch-base-confirm').checked, 'Unchanged alternate base keeps its confirmation');
+  assert.equal(document.activeElement, get('branch-base'));
+  assert.equal(get('branch-name').value, 'feature/new');
+  get('branch-base').value = 'main'; get('branch-base').onchange();
+  await click('create-branch');
   assert.deepEqual(calls.at(-1), ['create_github_branch', 'owner/repo', 'feature/new', 'main', false]);
   assert(get('branch-form').hidden);
   // A master-only remote still has a dashboard route to a feature branch.
@@ -131,6 +155,13 @@ const contents = () => get('app').textContent;
   assert(get('project-path').textContent.includes('C:\\project with spaces'));
   await click('browse-plan');
   assert(!get('start').disabled);
+  get('auto-push').checked = true; get('auto-push').onchange();
+  assert(get('auto-push-note').textContent.includes('New run: automatic push ON'));
+  await poll();
+  assert(get('auto-push').checked, 'Unchanged polling preserves explicit opt-in');
+  data.controller.preflight.branch = 'feature/another-setup'; await poll();
+  assert.equal(get('auto-push').checked, false, 'A different branch defaults automatic push OFF');
+  assert(get('auto-push-note').textContent.includes('New run: automatic push OFF'));
   for (const error of ['Runs are blocked on main/master. Switch to a feature branch first.', 'Plan validation failed: malformed plan', 'Commit or discard changes before START.']) {
     data.controller.start_ready = false; data.controller.preflight.errors = [error];
     await poll();
@@ -179,12 +210,26 @@ const contents = () => get('app').textContent;
   get('auto-push').checked = true;
   await click('start');
   assert.deepEqual(calls.at(-1), ['start', 3, true]);
-  assert.equal(get('auto-push').checked, false, 'A new run must explicitly opt in again');
+  assert.equal(get('auto-push').checked, true, 'Active run shows its saved publication policy');
+  assert(get('auto-push-note').textContent.includes('This run: automatic push ON'));
   assert(get('auto-push').disabled, 'Publication settings cannot change mid-run');
   await click('start');
   assert.equal(calls.filter(call => call[0] === 'start').length, 2);
   assert(contents().includes('Running'));
   assert(get('browse-project').disabled && get('resume').disabled);
+  // A completed/stopped run can seed a new Start, whose policy must default OFF.
+  data.controller.active = false; await poll();
+  assert.equal(get('auto-push').checked, false);
+  assert(get('auto-push-note').textContent.includes('New run: automatic push OFF'));
+  assert(get('auto-push-note').textContent.includes('saved run policy: ON'));
+  get('auto-push').checked = true; get('auto-push').onchange();
+  launchResult = {ok:false, cancelled:true};
+  await click('start');
+  assert.deepEqual(calls.at(-1), ['start', 3, true], 'Busy state must preserve explicit new-run opt-in');
+  assert.equal(data.controller.active, false);
+  get('auto-push').checked = false; get('auto-push').onchange();
+  data.controller.active = true; await poll();
+  assert.equal(get('auto-push').checked, true, 'Saved run still shows its own policy');
   data.state = {status:'running', current_task:'task-1', completed:[], history:[
     {task:'task-1', attempt:1, tests:[{index:1, exit_code:1, timed_out:false}],
       review:{decision:'REJECTED', issues:['real blocker'], summary:'Original summary'}, feedback:'Original feedback <script>bad()</script>', commit:'abc123'}]};
@@ -253,6 +298,7 @@ const contents = () => get('app').textContent;
   await poll();
   assert(contents().includes('Completed'));
   assert.equal(get('header-state').textContent, 'Completed');
+  assert(!contents().includes('Line 2: corrupt event'), 'Historical log diagnostics stay in Logs');
   assert.equal(get('header-state').className, 'pill green');
   assert(!contents().includes('Runner stopped with exit code 1'));
   await click('nav-logs');
@@ -305,6 +351,11 @@ const contents = () => get('app').textContent;
   assert(contents().includes('No events recorded'));
   assert(contents().includes('state.json is corrupt'));
   assert(contents().includes('legacy.txt (available)'));
+  assert(get('auto-push-note').textContent.includes('saved run policy: not recorded'));
+  data.controller.active = true; await poll();
+  assert(get('auto-push').indeterminate, 'Missing active state must not be reported as policy OFF');
+  assert(get('auto-push-note').textContent.includes('not recorded yet'));
+  data.controller.active = false; await poll();
   assert.equal(get('evidence-viewer').children.length, 0, 'Changing runs must clear old evidence');
   api.evidence = async () => ({ok:false, text:'Evidence file is missing.'});
   await walk(get('app')).find(node => node.textContent === 'legacy.txt (available)').onclick();

@@ -84,10 +84,12 @@ vm.runInContext('render(' + JSON.stringify(snapshot) + ')', context);
 vm.runInContext("navigate('tasks')", context);
 const contents = app.textContent;
 for (const text of ['Current task: desktop-readonly-logs', 'Attempt 2', 'REJECTED',
-  'Fix a real issue', 'Line 3: corrupt event']) {
+  'Fix a real issue']) {
   assert(contents.includes(text), 'Missing UI text: ' + text);
 }
+assert(!contents.includes('Line 3: corrupt event'), 'Historical parse diagnostics belong in Logs');
 vm.runInContext("navigate('logs')", context);
+assert(app.textContent.includes('Line 3: corrupt event'));
 assert(app.textContent.includes('gone.txt (missing)'));
 assert(!contents.includes('Raw evidence'), 'Evidence must be opened explicitly');
 const walk = node => [node, ...(node.children || []).flatMap(walk)];
