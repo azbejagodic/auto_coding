@@ -273,10 +273,12 @@ class DesktopUITests(unittest.TestCase):
                 self.assertEqual(page.locator('#branch-name').input_value(), 'feature/new')
                 self.assertEqual(page.locator('#branch-base').input_value(), 'main')
                 self.assertEqual(page.evaluate('document.activeElement.id'), 'branch-base')
+                self.assertTrue(page.locator('#create-branch').is_disabled())
+                page.locator('#branch-base-confirm').check()
                 page.locator('#create-branch').click()
                 page.wait_for_function("calls.some(c => c[0] === 'create') && document.getElementById('branch-form').hidden")
                 self.assertEqual(page.evaluate("calls.find(c => c[0] === 'create')"),
-                                 ['create', 'owner/other', 'feature/new', 'main', False])
+                                 ['create', 'owner/other', 'feature/new', 'main', True])
                 page.evaluate("""() => {
                   fixture.controller.resume_ready = true;
                   fixture.controller.push = {eligible:true};

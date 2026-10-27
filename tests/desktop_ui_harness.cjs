@@ -32,10 +32,10 @@ const api = {
   github_repositories: async () => ({ok:true, available:false, repositories:[], message:'Enter OWNER/REPO manually; Git authentication remains available.'}),
   connect_github: async repository => { calls.push(['connect_github', repository]);
     if (repository === 'bad/repo') return {ok:false, error:'GitHub authentication failed <img onerror=bad()>; authenticate Git and retry.'};
-    Object.assign(data.controller, {repository:'owner/repo', repo:'managed/checkout', github:{local:['main', 'feature/existing'], remote:['origin/main', 'origin/master', 'origin/feature/remote']}, push:{eligible:false, reason:'No approved checkpoints'}});
+    Object.assign(data.controller, {repository:'owner/repo', repo:'managed/checkout', github:{head:'abc123', remote_head:'abc123', local:['main', 'feature/existing'], remote:['origin/main', 'origin/master', 'origin/feature/remote']}, push:{eligible:false, reason:'No approved checkpoints'}});
     data.controller.preflight = {branch:'main', clean:true, errors:['Runs are blocked on main/master.']}; return {ok:true}; },
   checkout_github_branch: async (repository, name) => { calls.push(['checkout_github_branch', repository, name]); data.controller.preflight = {branch:name, clean:true, errors:[]}; return {ok:true}; },
-  create_github_branch: async (repository, name, base, confirmed) => { calls.push(['create_github_branch', repository, name, base, confirmed]); data.controller.github.local.push(name); data.controller.preflight.branch = name; return {ok:true}; },
+  create_github_branch: async (repository, name, base, confirmed) => { calls.push(['create_github_branch', repository, name, base, confirmed]); data.controller.github.local.push(name); data.controller.preflight.branch = name; data.controller.github.remote_head = null; return {ok:true}; },
   fetch_github: async repository => { calls.push(['fetch_github', repository]); return {ok:true}; },
   push_approved_commits: async () => { calls.push(['push_approved_commits']); return {ok:false, error:'Remote branch changed. Fetch and review; no force push.'}; },
   snapshot: async () => { snapshotReads++; if (failStatus) throw Error('status unavailable'); return structuredClone(data); },
@@ -85,7 +85,11 @@ const contents = () => get('app').textContent;
   assert(get('selected-project').textContent.includes('owner/repo'));
   assert(get('github-state').textContent.includes('main | Clean'));
   assert(get('start').disabled && get('push-approved').disabled);
-  assert(get('github-state').textContent.includes('Published (cached origin ref)'));
+  assert(get('github-state').textContent.includes('Published at abc123 (cached origin/main)'));
+  assert(get('github-branch').children.some(option => option.value === 'main' && option.textContent.includes('protected, base only')));
+  assert(get('github-branch').children.some(option => option.value === 'feature/remote' && option.textContent.includes('remote-only')));
+  assert(get('github-branch').children.some(option => option.value === 'feature/existing' && option.textContent.includes('local-only, unpublished')));
+  assert(!get('github-branch').children.some(option => option.value === 'HEAD'));
   // Even inconsistent readiness metadata cannot make a protected branch writable.
   for (const branch of ['main', 'master', 'MAIN']) {
     Object.assign(data.controller, {start_ready:true, resume_ready:true, push:{eligible:true}});
@@ -109,6 +113,14 @@ const contents = () => get('app').textContent;
   assert.equal(calls.length, beforeBranchSelection, 'Refreshing branch options must not perform an action');
   await click('fetch-github');
   assert.deepEqual(calls.at(-1), ['fetch_github', 'owner/repo']);
+  const workingFetch = api.fetch_github;
+  api.fetch_github = async () => ({ok:false, error:'Cannot reach GitHub. Check your network connection, then retry.'});
+  await click('fetch-github');
+  assert.equal(get('github-branch').value, 'feature/remote', 'Failed fetch preserves pending selection');
+  assert(get('message').textContent.includes('Cannot reach GitHub'));
+  assert(!get('message').textContent.includes('Selection updated'));
+  assert(!get('fetch-github').disabled, 'Fetch failure permits safe retry');
+  api.fetch_github = workingFetch;
   await click('select-branch');
   assert.deepEqual(calls.at(-1), ['checkout_github_branch', 'owner/repo', 'feature/remote']);
   await click('new-branch'); get('branch-name').value = 'feature/cancelled';
@@ -127,11 +139,13 @@ const contents = () => get('app').textContent;
   assert.equal(document.activeElement, get('branch-base'));
   assert.equal(get('branch-name').value, 'feature/new');
   get('branch-base').value = 'main'; get('branch-base').onchange();
+  assert(get('create-branch').disabled, 'Main base also requires explicit confirmation');
+  get('branch-base-confirm').checked = true; get('branch-base-confirm').onchange();
   await click('create-branch');
-  assert.deepEqual(calls.at(-1), ['create_github_branch', 'owner/repo', 'feature/new', 'main', false]);
+  assert.deepEqual(calls.at(-1), ['create_github_branch', 'owner/repo', 'feature/new', 'main', true]);
   assert(get('branch-form').hidden);
   assert(get('github-state').textContent.includes('Current branch: feature/new'));
-  assert(get('github-state').textContent.includes('Local-only (no cached origin ref)'));
+  assert(get('github-state').textContent.includes('Local-only, unpublished'));
   data.controller.github.error = 'Branch metadata unavailable'; await poll();
   assert(get('github-state').textContent.includes('Publication unknown'));
   assert(!get('github-state').textContent.includes('Local-only'));
@@ -164,8 +178,9 @@ const contents = () => get('app').textContent;
   assert(get('new-branch').disabled && get('select-branch').disabled && get('push-approved').disabled);
   assert(get('connect-github').disabled && get('browse-project').disabled);
   const beforeDirty = calls.length;
-  for (const id of ['connect-github', 'browse-project', 'select-branch', 'create-branch', 'fetch-github', 'push-approved']) await click(id);
+  for (const id of ['connect-github', 'browse-project', 'select-branch', 'create-branch', 'push-approved']) await click(id);
   assert.equal(calls.length, beforeDirty, 'Dirty checkout cannot change repository or branch or publish');
+  assert(!get('fetch-github').disabled, 'Fetch preserves dirty local work');
   data.controller.preflight.clean = true; data.controller.active = true; await poll();
   assert(get('connect-github').disabled && get('select-branch').disabled);
   const beforeActive = calls.length;
@@ -175,6 +190,11 @@ const contents = () => get('app').textContent;
   await click('push-approved');
   assert.deepEqual(calls.at(-1), ['push_approved_commits']);
   assert(get('message').textContent.includes('Remote branch changed'));
+  data.controller.github.head = 'newsha'; data.controller.github.remote_head = 'oldsha';
+  await poll();
+  assert(get('github-state').textContent.includes('Approved checkpoints pending push'));
+  data.controller.push = {eligible:false}; await poll();
+  assert(!get('github-state').textContent.includes('Published at'));
   data = initial; calls.length = 0; await poll();
   await click('nav-tasks');
   assert(get('run-setup').hidden);

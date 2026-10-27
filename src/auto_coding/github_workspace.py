@@ -299,19 +299,23 @@ class GitHubWorkspaceManager:
         identity, _, repo, metadata, lock = self._paths(repository)
         with checkout_lock(lock):
             self._verify(identity, repo, metadata)
-            return {**self._status(repo),
+            status = self._status(repo)
+            head = self._git(repo, "rev-parse", "HEAD")
+            remote_ref = "refs/remotes/origin/" + (status["branch"] or "")
+            remote_sha = self._command(["git", "rev-parse", "--verify", remote_ref], repo, allowed=(0, 128))
+            return {**status, "head": head, "remote_head": remote_sha or None,
                     "local": self._git(repo, "for-each-ref", "--format=%(refname:strip=2)", "refs/heads/").splitlines(),
-                    "remote": self._git(repo, "for-each-ref", "--format=%(refname:strip=2)", "refs/remotes/origin/").splitlines()}
+                    "remote": [ref for ref in self._git(repo, "for-each-ref", "--format=%(refname:strip=2)", "refs/remotes/origin/").splitlines() if ref != "origin/HEAD"]}
 
     def fetch(self, repository):
         identity, _, repo, metadata, lock = self._paths(repository)
         with checkout_lock(lock):
             self._verify(identity, repo, metadata)
-            self._idle(repo)
-            self._git(repo, "fetch", "--no-tags", "origin", "+refs/heads/*:refs/remotes/origin/*")
-            return self._status(repo)
+            self._idle(repo, clean=False)
+            self._git(repo, "fetch", "--atomic", "--prune", "--no-tags", "origin", "+refs/heads/*:refs/remotes/origin/*")
+            return {**self._status(repo), "message": "Branches fetched from origin. Local work was preserved."}
 
-    def _idle(self, repo):
+    def _idle(self, repo, *, clean=True):
         if managed_lock(repo, ".job.lock").exists():
             raise WorkspaceError("active_job", "An Auto-Coding runner is active or uncertain for this checkout.")
         if self.active_check is not None and self.active_check(repo) is not False:
@@ -321,7 +325,8 @@ class GitHubWorkspaceManager:
         for root in (self.runs_dir, Path.home() / "AutoCoding-Runs"):
             if DesktopController(root).checkout_busy(repo):
                 raise WorkspaceError("active_job", "An Auto-Coding job is active or uncertain for this checkout.")
-        self._publication_tree(repo)
+        if clean:
+            self._publication_tree(repo)
 
     def _publication_tree(self, repo):
         if not self._status(repo)["clean"]:
@@ -344,8 +349,8 @@ class GitHubWorkspaceManager:
             self._verify(identity, repo, metadata)
             self._idle(repo)
             self._branch(repo, name)
-            if base != "main" and confirmed_base is not True:
-                raise WorkspaceError("confirmation", "An alternate base requires explicit user confirmation.")
+            if confirmed_base is not True:
+                raise WorkspaceError("confirmation", "Creating a branch requires confirmation of the selected remote base.")
             if not isinstance(base, str) or base.startswith("-"):
                 raise WorkspaceError("invalid_branch", "Invalid base branch.")
             self._git(repo, "check-ref-format", "refs/heads/" + base)
@@ -475,4 +480,9 @@ class GitHubWorkspaceManager:
                       "-c", "push.followTags=false", "-c", "push.recurseSubmodules=no",
                       "-c", "remote.origin.mirror=false", "-c", "push.gpgSign=false",
                       "push", "origin", "HEAD:refs/heads/" + check["branch"])
-            return {"published": True, "branch": check["branch"], "message": "Approved checkpoints published to the feature branch. No merge to main."}
+            sha = self._git(repo, "rev-parse", "HEAD")
+            remote = self._git(repo, "ls-remote", "--heads", "origin", "refs/heads/" + check["branch"])
+            if remote.split()[:1] != [sha]:
+                raise WorkspaceError("unconfirmed", "Remote checkpoint could not be confirmed. Retry Push Approved Commits.")
+            return {"published": True, "branch": check["branch"], "sha": sha,
+                    "message": f"Published approved checkpoints to {check['branch']} at {sha}. No merge to main."}

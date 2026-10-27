@@ -160,7 +160,7 @@ progress{width:100%;height:12px;accent-color:#72adf9}
 <input id="branch-name">
 <label for="branch-base">Remote base</label>
 <select id="branch-base" aria-describedby="branch-base-confirm-label"></select>
-<label id="branch-base-confirm-label" hidden><input id="branch-base-confirm" type="checkbox"> I confirm creating this feature branch from the selected alternate remote base instead of origin/main.</label>
+<label id="branch-base-confirm-label" hidden><input id="branch-base-confirm" type="checkbox"> I confirm creating this feature branch from the selected remote base.</label>
 <button id="create-branch">Create branch</button><button id="cancel-branch">Cancel</button>
 </div>
 <div class="setup-fields">
@@ -286,9 +286,10 @@ function updateControls() {
   const c = latest?.controller || {};
   const locked = busy || !ready || c.active !== false || c.uncertain;
   controls.forEach(id => { document.getElementById(id).disabled = locked; });
-  ['github-branch', 'select-branch', 'new-branch', 'fetch-github', 'branch-base', 'branch-base-confirm', 'create-branch'].forEach(id => {
+  ['github-branch', 'select-branch', 'new-branch', 'branch-base', 'branch-base-confirm', 'create-branch'].forEach(id => {
     document.getElementById(id).disabled = locked || !c.repository || c.preflight?.clean !== true;
   });
+  document.getElementById('fetch-github').disabled = locked || !c.repository;
   const protectedBranch = ['main', 'master'].includes((c.preflight?.branch || '').toLowerCase());
   ['connect-github', 'browse-project', 'github-repositories'].forEach(id => {
     document.getElementById(id).disabled = locked || (!!c.repo && c.preflight?.clean !== true);
@@ -297,8 +298,8 @@ function updateControls() {
   document.getElementById('select-branch').disabled ||= !selectedBranch || ['main', 'master'].includes(selectedBranch.toLowerCase());
   document.getElementById('auto-push').disabled = locked;
   const base = document.getElementById('branch-base').value;
-  document.getElementById('branch-base-confirm-label').hidden = !base || base === 'main';
-  document.getElementById('create-branch').disabled ||= !base || (base !== 'main' && !document.getElementById('branch-base-confirm').checked);
+  document.getElementById('branch-base-confirm-label').hidden = !base;
+  document.getElementById('create-branch').disabled ||= !base || !document.getElementById('branch-base-confirm').checked;
   document.getElementById('push-approved').disabled = locked || protectedBranch || c.preflight?.clean !== true || !c.push?.eligible;
   document.getElementById('push-reason').textContent = c.push?.reason || 'Select a managed repository to publish approved local checkpoints.';
   const savedPush = !!latest?.state?.auto_push;
@@ -312,7 +313,8 @@ function updateControls() {
   else if (push.showingSavedPolicy || push.setupContext !== pushContext) push.checked = false;
   push.setupContext = pushContext;
   push.showingSavedPolicy = showingSavedPolicy;
-  push.disabled = locked || showingSavedPolicy;
+  push.disabled = locked || showingSavedPolicy || protectedBranch;
+  if (protectedBranch && !showingSavedPolicy) push.checked = false;
   push.indeterminate = showingSavedPolicy && !latest?.state;
   document.getElementById('auto-push-note').textContent = push.indeterminate
     ? 'This run: automatic push policy is not recorded yet; inspect Logs, as Resume uses its saved policy.'
@@ -395,10 +397,12 @@ function render(data) {
   document.getElementById('selected-project').textContent = c.repository || c.repo || 'No project selected';
   const connection = document.getElementById('github-state');
   const currentBranch = c.preflight?.branch;
-  const publication = !c.github?.error && currentBranch && Array.isArray(c.github?.remote) && Array.isArray(c.github?.local)
-    ? c.github.remote.includes('origin/' + currentBranch) ? 'Published (cached origin ref)'
-      : c.github.local.includes(currentBranch) ? 'Local-only (no cached origin ref)' : 'Publication unknown'
-    : 'Publication unknown';
+  const publication = c.github?.error || !currentBranch ? 'Publication unknown' : c.push?.eligible ? 'Approved checkpoints pending push'
+    : c.github?.head && c.github?.remote_head === c.github.head
+      ? 'Published at ' + c.github.head + ' (cached origin/' + currentBranch + ')'
+      : c.github?.head && !c.github?.remote_head ? 'Local-only, unpublished'
+      : c.github?.head ? 'Local and origin commits differ; fetch and review before publishing'
+      : 'Publication unknown';
   connection.textContent = c.repo ? 'Current branch: ' + (currentBranch || 'Detached HEAD / unavailable') + ' | ' + (c.preflight?.clean === true ? 'Clean' : 'Changes or unavailable status') + ' | ' + publication + (c.github?.error ? ' | ' + c.github.error : '') : 'Connect a repository to choose a feature branch.';
   const branches = document.getElementById('github-branch');
   const bases = document.getElementById('branch-base');
@@ -420,19 +424,26 @@ function render(data) {
     }
   }
   updateControls();
-  const names = [...new Set([...(c.github?.local || []), ...(c.github?.remote || []).filter(name => name.startsWith('origin/') && name !== 'origin/HEAD').map(name => name.slice(7))])].filter(name => !['main', 'master'].includes(name.toLowerCase()));
-  const signature = JSON.stringify([c.repository, c.preflight?.branch, names]);
+  const names = [...new Set([...(c.github?.local || []), ...(c.github?.remote || []).filter(name => name.startsWith('origin/') && name !== 'origin/HEAD').map(name => name.slice(7))])];
+  const signature = JSON.stringify([c.repository, c.preflight?.branch, names, c.github?.local, c.github?.remote]);
   if (branches.datasetSignature !== signature) {
     const selectionContext = JSON.stringify([c.repository, c.preflight?.branch]);
     const selected = branches.selectionContext === selectionContext && names.includes(branches.value)
       ? branches.value : names.includes(c.preflight?.branch) ? c.preflight.branch : '';
     branches.replaceChildren();
     const placeholder = el('option', 'Choose a feature branch'); placeholder.value = ''; branches.append(placeholder);
-    names.forEach(name => { const option = el('option', name); option.value = name; branches.append(option); });
+    names.forEach(name => {
+      const local = (c.github?.local || []).includes(name);
+      const remote = (c.github?.remote || []).includes('origin/' + name);
+      const protectedName = ['main', 'master'].includes(name.toLowerCase());
+      const label = name + (protectedName ? ' (protected, base only)' : '') + ' (' + (local && remote ? 'local + origin' : local ? 'local-only, unpublished' : 'origin, remote-only') + ')';
+      const option = el('option', label); option.value = name; branches.append(option);
+    });
     branches.value = selected;
     branches.datasetSignature = signature;
     branches.selectionContext = selectionContext;
   }
+  updateControls();
   const git = c.preflight || {};
   document.getElementById('run-folder').textContent = c.logs ? 'Run folder: ' + c.logs : '';
   const errors = [...(git.errors || []), ...Object.entries(c.validation_errors || {}).map(([k,v]) => k + ': ' + v)];

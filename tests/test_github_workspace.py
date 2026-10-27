@@ -6,8 +6,11 @@ import subprocess
 import tempfile
 import threading
 import unittest
+import sys
 from unittest.mock import patch
 
+REPOSITORY = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPOSITORY / "src"))
 from auto_coding.github_workspace import (GitHubWorkspaceManager, WorkspaceError,
     checkout_lock, managed_job, managed_lock, normalize_repository, storage_root, reserve_job)
 from auto_coding.desktop_control import DesktopController
@@ -57,9 +60,136 @@ class WorkspaceTests(unittest.TestCase):
     def connect(self):
         return Path(self.manager.connect("Owner/Repo")["path"])
 
+    def test_branch_inventory_tracking_and_local_only_history(self):
+        repo = self.connect()
+        inventory = self.manager.branches("owner/repo")
+        self.assertIn("origin/main", inventory["remote"])
+        self.assertNotIn("origin/HEAD", inventory["remote"])
+        self.assertEqual(inventory["head"], inventory["remote_head"])
+        main = self.git(repo, "rev-parse", "main")
+        self.manager.checkout_branch("owner/repo", "feature/existing")
+        self.assertEqual(self.git(repo, "rev-parse", "--abbrev-ref", "@{upstream}"),
+                         "origin/feature/existing")
+        self.manager.create_branch("owner/repo", "feature/local", base="main", confirmed_base=True)
+        approved = self.checkpoint(repo)
+        sha = next(iter(approved))
+        self.manager.checkout_branch("owner/repo", "feature/existing")
+        self.manager.checkout_branch("owner/repo", "feature/local")
+        inventory = self.manager.branches("owner/repo")
+        self.assertEqual(inventory["head"], sha)
+        self.assertIsNone(inventory["remote_head"])
+        self.assertNotIn("origin/feature/local", inventory["remote"])
+        self.assertEqual(self.git(repo, "rev-parse", "main"), main)
+        self.assertFalse(any("push" in argv for argv in self.calls))
+
+    def test_main_base_requires_confirmation_without_changing_refs(self):
+        repo = self.connect()
+        before = self.git(repo, "show-ref")
+        self.assert_error("confirmation", lambda: self.manager.create_branch(
+            "owner/repo", "feature/new", base="main"))
+        self.assertEqual(self.git(repo, "show-ref"), before)
+        self.assertEqual(self.git(repo, "branch", "--show-current"), "main")
+
+    def test_subprocess_imports_this_checkout_from_fixture_directory(self):
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(REPOSITORY / "src")
+        result = subprocess.run([sys.executable, "-B", "-c",
+                                 "from auto_coding import github_workspace; print(github_workspace.__file__)"],
+                                cwd=self.root, env=env, capture_output=True, text=True, check=True)
+        self.assertEqual(Path(result.stdout.strip()).resolve(),
+                         REPOSITORY / "src" / "auto_coding" / "github_workspace.py")
+
+    def test_fetch_failure_and_dirty_fetch_preserve_checkout(self):
+        repo = self.connect()
+        self.manager.checkout_branch("owner/repo", "feature/existing")
+        (repo / "file.txt").write_text("staged local work")
+        self.git(repo, "add", "file.txt")
+        (repo / "local.txt").write_text("untracked local work")
+        before = self.git(repo, "status", "--porcelain")
+        staged = self.git(repo, "diff", "--cached")
+        refs = self.git(repo, "show-ref")
+        for diagnostic, code in (("Could not resolve host SECRET", "network"),
+                                 ("Authentication failed SECRET", "authentication")):
+            def fail_fetch(argv, **kwargs):
+                if argv[1] == "fetch":
+                    return subprocess.CompletedProcess(argv, 1, "", diagnostic)
+                return self.command(argv, **kwargs)
+            with patch.object(self.manager, "run_command", side_effect=fail_fetch):
+                with self.assertRaises(WorkspaceError) as caught:
+                    self.manager.fetch("owner/repo")
+                self.assertEqual(caught.exception.code, code)
+                self.assertNotIn("SECRET", str(caught.exception))
+            self.assertEqual(self.git(repo, "show-ref"), refs)
+        self.git(self.seed, "branch", "feature/fetched")
+        self.git(self.seed, "push", str(self.remote), "feature/fetched")
+        self.assertIn("fetched", self.manager.fetch("owner/repo")["message"])
+        self.assertIn("origin/feature/fetched", self.manager.branches("owner/repo")["remote"])
+        self.assertEqual(self.git(repo, "status", "--porcelain"), before)
+        self.assertEqual(self.git(repo, "diff", "--cached"), staged)
+        self.assertEqual(self.git(repo, "branch", "--show-current"), "feature/existing")
+
+    def test_each_approved_task_publishes_and_network_retry_skips_codex(self):
+        from auto_coding import simple_run
+        self.assertEqual(Path(simple_run.__file__).resolve(),
+                         REPOSITORY / "src" / "auto_coding" / "simple_run.py")
+        repo = self.connect()
+        main = self.git(self.remote, "rev-parse", "main")
+        self.manager.create_branch("owner/repo", "feature/auto", base="main", confirmed_base=True)
+        plan, logs = self.root / "plan.json", self.root / "logs"
+        plan.write_text(json.dumps({"tasks": [{"id": "one", "prompt": "First"},
+                                               {"id": "two", "prompt": "Second"}]}))
+        config = {"repository": "owner/repo", "branch": "feature/auto"}
+        codex_calls = []
+        def execute(argv, cwd, timeout, *, prompt=None):
+            reviewing = "--output-schema" in argv
+            second = "Second" in prompt
+            codex_calls.append((second, reviewing))
+            if second and not reviewing:
+                # Publication must happen before the next task starts.
+                self.assertEqual(self.git(self.remote, "rev-parse", config["branch"]),
+                                 self.git(repo, "rev-parse", "HEAD"))
+            out = Path(argv[argv.index("--output-last-message") + 1])
+            if reviewing:
+                out.write_text(json.dumps({"decision": "APPROVED", "issues": [], "summary": "OK"}))
+            else:
+                (cwd / ("two.txt" if second else "one.txt")).write_text("approved")
+                out.write_text("done")
+            return 0, "", False
+        with patch("auto_coding.simple_run.GitHubWorkspaceManager", return_value=self.manager):
+            self.assertEqual(simple_run.run(plan, repo, self.root / "success-logs",
+                             auto_push=config, execute=execute), 0)
+        self.assertEqual(len([argv for argv in self.calls if "push" in argv]), 2)
+        self.assertEqual(self.git(self.remote, "rev-parse", config["branch"]),
+                         self.git(repo, "rev-parse", "HEAD"))
+        self.assertEqual(self.git(self.remote, "rev-parse", "main"), main)
+        self.manager.create_branch("owner/repo", "feature/retry", base="main", confirmed_base=True)
+        config["branch"] = "feature/retry"
+        codex_calls.clear()
+        def fail_second_push(argv, **kwargs):
+            if "push" in argv and len([c for c in codex_calls if c[1]]) == 2:
+                return subprocess.CompletedProcess(argv, 1, "", "Could not resolve host SECRET")
+            return self.command(argv, **kwargs)
+        with patch("auto_coding.simple_run.GitHubWorkspaceManager", return_value=self.manager):
+            with patch.object(self.manager, "run_command", side_effect=fail_second_push):
+                self.assertEqual(simple_run.run(plan, repo, logs, auto_push=config, execute=execute), 1)
+            before = json.loads((logs / "state.json").read_text())
+            sha = self.git(repo, "rev-parse", "HEAD")
+            self.assertEqual(before["completed"], ["one", "two"])
+            self.assertEqual(before["publication"]["outcome"], "pending")
+            self.assertEqual(self.git(self.remote, "rev-parse", config["branch"]),
+                             self.git(repo, "rev-parse", "HEAD^"))
+            self.assertEqual(simple_run.run(plan, repo, logs, resume=True, auto_push=config,
+                             execute=lambda *a, **kw: self.fail("Retry must not rerun Codex")), 0)
+        after = json.loads((logs / "state.json").read_text())
+        self.assertEqual(after["history"], before["history"])
+        self.assertEqual(after["publication"]["outcome"], "published")
+        self.assertEqual(self.git(self.remote, "rev-parse", config["branch"]), sha)
+        self.assertEqual(self.git(self.remote, "rev-parse", "main"), main)
+        self.assertEqual(self.git(repo, "status", "--porcelain"), "")
+
     def test_coordinator_checkpoint_publish_reconciles_remote_and_retries_identical_sha(self):
         repo = self.connect()
-        self.manager.create_branch("owner/repo", "feature/auto")
+        self.manager.create_branch("owner/repo", "feature/auto", confirmed_base=True)
         approved = self.checkpoint(repo)
         sha = next(iter(approved))
         self.manager.publish_checkpoint(repo, "owner/repo", "feature/auto", sha, approved)
@@ -88,7 +218,7 @@ class WorkspaceTests(unittest.TestCase):
 
     def test_published_checkpoint_reconciles_dirty_tree_without_pushing(self):
         repo = self.connect()
-        self.manager.create_branch("owner/repo", "feature/auto")
+        self.manager.create_branch("owner/repo", "feature/auto", confirmed_base=True)
         approved = self.checkpoint(repo)
         sha = next(iter(approved))
         self.manager.publish_checkpoint(repo, "owner/repo", "feature/auto", sha, approved)
@@ -109,7 +239,7 @@ class WorkspaceTests(unittest.TestCase):
 
     def test_unpublished_checkpoint_still_requires_clean_tree_before_push(self):
         repo = self.connect()
-        self.manager.create_branch("owner/repo", "feature/auto")
+        self.manager.create_branch("owner/repo", "feature/auto", confirmed_base=True)
         approved = self.checkpoint(repo)
         sha = next(iter(approved))
         (repo / "unfinished.txt").write_text("unreviewed")
@@ -124,7 +254,7 @@ class WorkspaceTests(unittest.TestCase):
     def test_auto_push_resume_repairs_rejected_second_task_after_first_published(self):
         from auto_coding.simple_run import run
         repo = self.connect()
-        self.manager.create_branch("owner/repo", "feature/auto")
+        self.manager.create_branch("owner/repo", "feature/auto", confirmed_base=True)
         plan, logs = self.root / "plan.json", self.root / "logs"
         plan.write_text(json.dumps({"tasks": [
             {"id": "first", "prompt": "Make first file"},
@@ -188,7 +318,7 @@ class WorkspaceTests(unittest.TestCase):
 
     def test_coordinator_transient_authentication_and_rejection_preserve_commit(self):
         repo = self.connect()
-        self.manager.create_branch("owner/repo", "feature/retry")
+        self.manager.create_branch("owner/repo", "feature/retry", confirmed_base=True)
         approved = self.checkpoint(repo)
         sha = next(iter(approved))
         for diagnostic, code in (("permission denied SECRET_TOKEN", "authentication"),
@@ -232,7 +362,7 @@ class WorkspaceTests(unittest.TestCase):
 
     def test_push_new_branch_and_non_force_explicit_destination(self):
         repo = self.connect()
-        self.manager.create_branch("owner/repo", "feature/publish")
+        self.manager.create_branch("owner/repo", "feature/publish", confirmed_base=True)
         approved = self.checkpoint(repo)
         self.git(repo, "config", "push.followTags", "true")
         self.git(repo, "config", "remote.origin.mirror", "true")
@@ -240,6 +370,9 @@ class WorkspaceTests(unittest.TestCase):
         self.assertTrue(self.manager.push_eligibility("owner/repo", approved)["eligible"])
         result = self.manager.push_approved("owner/repo", approved)
         self.assertTrue(result["published"])
+        self.assertEqual(result["sha"], next(iter(approved)))
+        self.assertIn(result["branch"], result["message"])
+        self.assertIn(result["sha"], result["message"])
         self.assertEqual(self.git(self.remote, "rev-parse", "feature/publish"), next(iter(approved)))
         pushes = [argv for argv in self.calls if "push" in argv]
         self.assertEqual(pushes, [["git", "-c", "core.hooksPath=" + os.devnull,
@@ -253,7 +386,7 @@ class WorkspaceTests(unittest.TestCase):
     def test_push_blocks_dirty_active_main_origin_unapproved_and_changed_bytes(self):
         repo = self.connect()
         self.assert_error("invalid_branch", lambda: self.manager.push_eligibility("owner/repo", {}))
-        self.manager.create_branch("owner/repo", "feature/publish")
+        self.manager.create_branch("owner/repo", "feature/publish", confirmed_base=True)
         approved = self.checkpoint(repo)
         self.assert_error("approval", lambda: self.manager.push_approved("owner/repo", {}))
         record = next(iter(approved.values()))
@@ -295,7 +428,7 @@ class WorkspaceTests(unittest.TestCase):
         for filename in (".env.production", "credentials.json", "cache.pyc"):
             repo = self.connect()
             branch = "feature/" + filename.replace(".", "x")
-            self.manager.create_branch("owner/repo", branch)
+            self.manager.create_branch("owner/repo", branch, confirmed_base=True)
             approved = self.checkpoint(repo, filename)
             self.assert_error("sensitive", lambda: self.manager.push_approved("owner/repo", approved))
         self.assertFalse(any("push" in argv for argv in self.calls))
@@ -307,7 +440,7 @@ class WorkspaceTests(unittest.TestCase):
         controller._workspace_manager = lambda: self.manager
         bridge = Bridge(controller=controller, dialogs=Mock())
         self.assertTrue(bridge.connect_github("owner/repo")["ok"])
-        self.assertTrue(bridge.create_github_branch("owner/repo", "feature/checkpoint")["ok"])
+        self.assertTrue(bridge.create_github_branch("owner/repo", "feature/checkpoint", confirmed_base=True)["ok"])
         approved = self.checkpoint(controller.repo)
         logs = controller.runs_dir / "run-fixture"
         logs.mkdir(parents=True)
@@ -340,7 +473,7 @@ class WorkspaceTests(unittest.TestCase):
         with patch("auto_coding.desktop_control.Popen") as popen:
             self.assertTrue(bridge.connect_github("https://github.com/Owner/Repo.git")["ok"])
             self.assertTrue(bridge.checkout_github_branch("owner/repo", "feature/existing")["ok"])
-            self.assertTrue(bridge.create_github_branch("owner/repo", "feature/desktop")["ok"])
+            self.assertTrue(bridge.create_github_branch("owner/repo", "feature/desktop", confirmed_base=True)["ok"])
             self.assertFalse(bridge.checkout_github_branch("other/repo", "feature/existing")["ok"])
             repo = controller.repo
             (repo / "dirty").write_text("dirty")
@@ -364,7 +497,7 @@ class WorkspaceTests(unittest.TestCase):
             confirmation = dialogs.confirm.call_args.args[0]
             for text in ("owner/repo", "feature/desktop", str(plan), "Attempts: 4", "NO automatic main merge"):
                 self.assertIn(text, confirmation)
-            self.assertFalse(bridge.create_github_branch("owner/repo", "feature/blocked")["ok"])
+            self.assertFalse(bridge.create_github_branch("owner/repo", "feature/blocked", confirmed_base=True)["ok"])
             self.assertFalse(bridge.push_approved_commits()["ok"])
 
     def test_master_only_remote_confirmed_base_reaches_managed_start(self):
@@ -380,7 +513,7 @@ class WorkspaceTests(unittest.TestCase):
         with patch("auto_coding.desktop_control.Popen") as popen:
             self.assertTrue(bridge.connect_github("https://github.com/Owner/Repo.git")["ok"])
             status = bridge.job_status()
-            self.assertEqual(status["github"]["remote"], ["origin/HEAD", "origin/master"])
+            self.assertEqual(status["github"]["remote"], ["origin/master"])
             self.assertFalse(status["start_ready"])
             rejected = bridge.create_github_branch("owner/repo", "feature/master-base", "master", False)
             self.assertEqual(rejected["code"], "confirmation")
@@ -416,12 +549,12 @@ class WorkspaceTests(unittest.TestCase):
         (self.seed / "file.txt").write_text("new upstream")
         self.git(self.seed, "commit", "-am", "upstream")
         self.git(self.seed, "push", str(self.remote), "main")
-        result = self.manager.create_branch("owner/repo", "feature/new")
+        result = self.manager.create_branch("owner/repo", "feature/new", confirmed_base=True)
         self.assertEqual(result, {"branch": "feature/new", "clean": True})
         self.assertEqual(self.git(repo, "rev-parse", "HEAD"), self.git(self.seed, "rev-parse", "HEAD"))
         self.assertNotEqual(self.git(repo, "rev-parse", "main"), self.git(repo, "rev-parse", "HEAD"))
-        self.assert_error("branch_exists", lambda: self.manager.create_branch("owner/repo", "feature/new"))
-        self.assert_error("branch_exists", lambda: self.manager.create_branch("owner/repo", "feature/existing"))
+        self.assert_error("branch_exists", lambda: self.manager.create_branch("owner/repo", "feature/new", confirmed_base=True))
+        self.assert_error("branch_exists", lambda: self.manager.create_branch("owner/repo", "feature/existing", confirmed_base=True))
 
     def test_non_ascii_workspace_and_branches(self):
         self.manager = GitHubWorkspaceManager(self.root / "caf\u00e9" / "配置", run_command=self.command)
@@ -433,7 +566,7 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(sum(argv[1] == "clone" for argv in self.calls), 1)
         self.assertIn("origin/" + existing, self.manager.branches("owner/repo")["remote"])
         self.assertEqual(self.manager.checkout_branch("owner/repo", existing), {"branch": existing, "clean": True})
-        self.assertEqual(self.manager.create_branch("owner/repo", created), {"branch": created, "clean": True})
+        self.assertEqual(self.manager.create_branch("owner/repo", created, confirmed_base=True), {"branch": created, "clean": True})
         self.assertIn(created, self.manager.branches("owner/repo")["local"])
         self.assertEqual(self.manager.reopen("owner/repo")["branch"], created)
         self.assertEqual(self.manager.checkout_branch("owner/repo", existing)["branch"], existing)
@@ -450,11 +583,11 @@ class WorkspaceTests(unittest.TestCase):
         self.assert_error("dirty", lambda: self.manager.checkout_branch("owner/repo", "feature/existing"))
         (repo / "untracked").unlink()
         (repo / ".git" / "MERGE_HEAD").write_text(self.git(repo, "rev-parse", "HEAD"))
-        self.assert_error("git_operation", lambda: self.manager.create_branch("owner/repo", "feature/new"))
+        self.assert_error("git_operation", lambda: self.manager.create_branch("owner/repo", "feature/new", confirmed_base=True))
         (repo / ".git" / "MERGE_HEAD").unlink()
         for active in (True, None):
             self.manager.active_check = lambda path: active
-            self.assert_error("active_job", lambda: self.manager.create_branch("owner/repo", "feature/new"))
+            self.assert_error("active_job", lambda: self.manager.create_branch("owner/repo", "feature/new", confirmed_base=True))
         self.manager.active_check = None
         logs = self.manager.runs_dir / "run-test"
         logs.mkdir(parents=True)
@@ -470,7 +603,7 @@ class WorkspaceTests(unittest.TestCase):
         self.connect()
         for name in ("main", "MASTER", "-x", "../escape", "feature/../../bad", "a.lock", "a..b", "@{-1}"):
             with self.assertRaises(WorkspaceError):
-                self.manager.create_branch("owner/repo", name)
+                self.manager.create_branch("owner/repo", name, confirmed_base=True)
         self.assert_error("confirmation", lambda: self.manager.create_branch("owner/repo", "feature/new", base="feature/existing"))
         self.manager.create_branch("owner/repo", "feature/new", base="feature/existing", confirmed_base=True)
 
@@ -507,9 +640,9 @@ class WorkspaceTests(unittest.TestCase):
             self.assertEqual(errors, ["busy"])
         @managed_job
         def job(plan, path, logs):
-            self.assert_error("active_job", lambda: self.manager.create_branch("owner/repo", "feature/new"))
+            self.assert_error("active_job", lambda: self.manager.create_branch("owner/repo", "feature/new", confirmed_base=True))
         job(None, repo, None)
-        self.manager.create_branch("owner/repo", "feature/new")
+        self.manager.create_branch("owner/repo", "feature/new", confirmed_base=True)
 
     def test_first_clone_race(self):
         entered, release = threading.Event(), threading.Event()
@@ -545,13 +678,13 @@ class WorkspaceTests(unittest.TestCase):
         (repo / "file.txt").write_text("staged")
         self.git(repo, "add", "file.txt")
         self.assertFalse(self.manager.branches("owner/repo")["clean"])
-        self.assert_error("dirty", lambda: self.manager.create_branch("owner/repo", "feature/new"))
+        self.assert_error("dirty", lambda: self.manager.create_branch("owner/repo", "feature/new", confirmed_base=True))
 
     def test_deleted_base_cannot_use_stale_remote_ref(self):
         repo = self.connect()
         self.git(self.remote, "config", "receive.denyDeleteCurrent", "ignore")
         self.git(self.seed, "push", str(self.remote), ":main")
-        self.assert_error("git", lambda: self.manager.create_branch("owner/repo", "feature/new"))
+        self.assert_error("git", lambda: self.manager.create_branch("owner/repo", "feature/new", confirmed_base=True))
         self.assertEqual(self.git(repo, "branch", "--show-current"), "main")
 
     def test_live_external_job_and_launch_lock(self):
@@ -614,7 +747,7 @@ class WorkspaceTests(unittest.TestCase):
                 patch("auto_coding.desktop_control.Popen") as popen:
             for operation in (
                 lambda: manager.checkout_branch("owner/repo", "feature/existing"),
-                lambda: manager.create_branch("owner/repo", "feature/new"),
+                lambda: manager.create_branch("owner/repo", "feature/new", confirmed_base=True),
                 lambda: manager.fetch("owner/repo"),
                 lambda: manager.reopen("owner/repo"),
                 lambda: job(None, repo, None),
@@ -646,12 +779,12 @@ class WorkspaceTests(unittest.TestCase):
                             "owner/repo", "feature/existing" if action == "checkout_branch" else "feature/new")
                         if isinstance(exception, subprocess.TimeoutExpired):
                             with self.assertRaises(WorkspaceError) as caught:
-                                operation(*args)
+                                operation(*args, **({"confirmed_base": True} if action == "create_branch" else {}))
                             self.assertEqual(caught.exception.code, "network")
                             self.assertNotIn("SECRET", str(caught.exception))
                         else:
                             with self.assertRaises(KeyboardInterrupt):
-                                operation(*args)
+                                operation(*args, **({"confirmed_base": True} if action == "create_branch" else {}))
                     self.assert_uncertain_checkout_blocks_operations_and_launches(repo)
 
     def test_clone_timeout_retains_partial_attempt_and_checkout_gate(self):
@@ -701,7 +834,7 @@ class WorkspaceTests(unittest.TestCase):
             return execute()
         job(None, repo, None)
         self.assertTrue((managed_lock(repo, ".job.lock") / "uncertain").exists())
-        self.assert_error("active_job", lambda: self.manager.create_branch("owner/repo", "feature/new"))
+        self.assert_error("active_job", lambda: self.manager.create_branch("owner/repo", "feature/new", confirmed_base=True))
 
     def test_direct_checkpoint_git_timeout_retains_job_gate(self):
         from auto_coding.simple_run import local_commit, PilotError
@@ -718,7 +851,7 @@ class WorkspaceTests(unittest.TestCase):
             with self.assertRaises(PilotError):
                 job(None, repo, None)
         self.assertTrue((managed_lock(repo, ".job.lock") / "uncertain").exists())
-        self.assert_error("active_job", lambda: self.manager.create_branch("owner/repo", "feature/new"))
+        self.assert_error("active_job", lambda: self.manager.create_branch("owner/repo", "feature/new", confirmed_base=True))
         self.assert_error("active_job", lambda: self.manager.checkout_branch("owner/repo", "feature/existing"))
 
     def test_direct_git_interruption_retains_job_gate(self):
@@ -751,7 +884,7 @@ class WorkspaceTests(unittest.TestCase):
         job_path = managed_lock(repo, ".job.lock")
         self.assertTrue((job_path / "reservation").exists())
         self.assert_error("active_job", lambda: independent.checkout_branch("owner/repo", "feature/existing"))
-        self.assert_error("active_job", lambda: independent.create_branch("owner/repo", "feature/new"))
+        self.assert_error("active_job", lambda: independent.create_branch("owner/repo", "feature/new", confirmed_base=True))
         @managed_job
         def child(plan, repo, logs):
             self.assertFalse((job_path / "reservation").exists())
@@ -761,7 +894,7 @@ class WorkspaceTests(unittest.TestCase):
         with patch.dict(os.environ, child_env):
             child(None, repo, None)
         self.assertFalse(job_path.exists())
-        independent.create_branch("owner/repo", "feature/new")
+        independent.create_branch("owner/repo", "feature/new", confirmed_base=True)
 
     def test_failed_desktop_spawn_releases_reservation(self):
         repo = self.connect()
@@ -773,7 +906,7 @@ class WorkspaceTests(unittest.TestCase):
         with patch("auto_coding.desktop_control.Popen", side_effect=OSError("spawn failed")):
             self.assertFalse(controller.start()["ok"])
         self.assertFalse(managed_lock(repo, ".job.lock").exists())
-        self.manager.create_branch("owner/repo", "feature/new")
+        self.manager.create_branch("owner/repo", "feature/new", confirmed_base=True)
 
     def test_plan_validation_failure_releases_job_for_retry(self):
         from auto_coding.simple_run import run
@@ -786,7 +919,7 @@ class WorkspaceTests(unittest.TestCase):
             with self.assertRaises((ValueError, OSError)):
                 run(invalid_plan, repo, logs)
             self.assertFalse(managed_lock(repo, ".job.lock").exists())
-        self.manager.create_branch("owner/repo", "feature/new")
+        self.manager.create_branch("owner/repo", "feature/new", confirmed_base=True)
         plan.write_text("Implement example task", encoding="utf-8")
         with patch("auto_coding.simple_run._run", return_value=0) as runner:
             self.assertEqual(run(plan, repo, logs), 0)
@@ -824,7 +957,7 @@ class WorkspaceTests(unittest.TestCase):
                             main(argv)
                         self.assertEqual(error.exception.code, 2)
             self.assertFalse(managed_lock(repo, ".job.lock").exists())
-        self.manager.create_branch("owner/repo", "feature/new")
+        self.manager.create_branch("owner/repo", "feature/new", confirmed_base=True)
 
     def test_controller_bridge_and_legacy_logs(self):
         controller = DesktopController(self.manager.runs_dir)
@@ -832,7 +965,7 @@ class WorkspaceTests(unittest.TestCase):
         bridge = Bridge(controller=controller)
         with patch.object(controller, "_workspace_manager", return_value=self.manager):
             self.assertTrue(bridge.connect_github("owner/repo")["ok"])
-            self.assertTrue(bridge.create_github_branch("owner/repo", "feature/new")["ok"])
+            self.assertTrue(bridge.create_github_branch("owner/repo", "feature/new", confirmed_base=True)["ok"])
             self.assertTrue(bridge.github_branches("owner/repo")["ok"])
         legacy = self.root / "legacy"
         legacy.mkdir()
