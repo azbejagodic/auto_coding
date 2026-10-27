@@ -9,6 +9,7 @@ from pathlib import Path
 from auto_coding.desktop_reader import read_run, read_evidence
 from auto_coding.desktop_control import DesktopController
 from auto_coding.simple_run import load_tasks
+from auto_coding.debug_export import export_debug, WARNING
 
 
 HTML = r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Auto-Coding</title><style>
@@ -239,6 +240,7 @@ function panel(title) {
 }
 let logQuery = '';
 let recentRuns = {runs:[]};
+let exportResult = null;
 function runPresentation(data) {
   const c = data.controller || {}, state = data.state || {};
   if (c.uncertain || (c.active !== false && c.active !== true)) return {label:'Unknown child status', color:'amber'};
@@ -440,6 +442,7 @@ function render(data) {
   updateControls();
   if (evidenceRoot !== data.root) {
     evidenceViewer.replaceChildren();
+    exportResult = null;
     expanded.clear();
     evidenceRoot = data.root;
   }
@@ -466,6 +469,32 @@ function render(data) {
     });
     library.append(el('p', 'Showing up to 200 runs. Active or uncertain jobs keep run switching locked; their current evidence remains available below.', 'muted'));
     app.append(library);
+  }
+  if (page === 'logs') {
+    const exports = panel('Download Logs / Export Debug Package');
+    exports.append(el('p', 'Inspect before sharing every ZIP. Run identifiers and filenames may be private.', 'warning'));
+    exports.append(el('p', 'DEBUG REPORT (recommended default): bounded structured state, timeline, test results and review decisions plus inventory. Prompts, output and free-form review text are omitted. This is not a guarantee of perfect redaction.'));
+    exports.append(el('p', 'FULL RAW LOGS: allowed files from this run only; prompts, review text and subprocess output may contain private data/API keys. Requires an extra native confirmation.', 'warning'));
+    [['standard', 'Export DEBUG REPORT (default)'], ['raw', 'Export FULL RAW LOGS']].forEach(([mode, label]) => {
+      const button = el('button', label);
+      button.disabled = busy || !ready || !data.root || !data.exists;
+      button.onclick = () => exportLogs(mode);
+      exports.append(button);
+    });
+    if (!data.root || !data.exists) exports.append(el('p', 'Select an available run using Open / View or Open / Import run folder to export.'));
+    if (exportResult) {
+      exports.append(el('pre', exportResult));
+      if (window.pywebview.api.open_export_folder) {
+        const folder = el('button', 'Open export destination folder');
+        folder.disabled = busy || !ready;
+        folder.onclick = async () => {
+          const result = await window.pywebview.api.open_export_folder();
+          if (!result.ok) message(result.error, true);
+        };
+        exports.append(folder);
+      }
+    }
+    app.append(exports);
   }
   if (!c.logs && !data.root) {
     if (page !== 'overview') {
@@ -578,6 +607,20 @@ function navigate(name) {
   document.getElementById('page-title').textContent = {overview:'Run overview', tasks:'Tasks', logs:'Logs'}[page];
   if (latest) render(latest);
   if (name === 'logs') refresh(false);
+}
+async function exportLogs(mode) {
+  if (busy || !ready || !latest?.root || !latest?.exists) return;
+  exportResult = null;
+  busy = true; updateControls(); renderKey = null; render(latest);
+  try {
+    if (refreshing) await refreshing;
+    const result = await window.pywebview.api.export_logs(mode);
+    if (result.ok && !result.cancelled) {
+      exportResult = 'Created: ' + result.path + '\nContents: ' + result.contents.join(', ') + '\n' + result.warning + '\n' + JSON.stringify(result.inventory, null, 2);
+      message('ZIP created: ' + result.path + '. Inspect before sharing.');
+    } else message(result.cancelled ? 'Export cancelled. No ZIP created.' : result.error, !result.cancelled);
+  } catch (error) { message('Export failed: ' + error, true); }
+  finally { busy = false; renderKey = null; render(latest); updateControls(); }
 }
 async function historyAction(method, path) {
   if (busy || !ready) return;
@@ -728,6 +771,16 @@ class NativeDialogs:
     def confirm(self, message):
         return self._window.create_confirmation_dialog("Confirm local runner launch", message)
 
+    def confirm_export(self, message):
+        return self._window.create_confirmation_dialog("Confirm debug package export", message)
+
+    def save_export(self):
+        enum = getattr(self._webview, "FileDialog", None)
+        kind = getattr(enum, "SAVE") if enum is not None else self._webview.SAVE_DIALOG
+        result = self._window.create_file_dialog(kind, allow_multiple=False,
+                    save_filename="debug-report.zip", file_types=("ZIP archives (*.zip)",))
+        return result[0] if result and not isinstance(result, str) else result
+
 
 class Bridge:
     """Small JS API. Selection never launches; each launch needs native confirmation.
@@ -746,6 +799,7 @@ class Bridge:
         self._launch_lock = threading.Lock()
         self._root = Path(root).expanduser() if root is not None else None
         self._selection_error = None
+        self._export_folder = None
         if root is not None:
             result = self.open_run(str(root))
             if not result["ok"]:
@@ -853,6 +907,50 @@ class Bridge:
     def selected_paths(self):
         with self._lock:
             return self._controller.selected_paths()
+
+    def export_logs(self, mode="standard"):
+        # No caller-supplied source or destination; selection remains locked through
+        # confirmations, native Save As and publication. No controller status/preflight
+        # calls here: those may invoke Git. Export never launches any such operation.
+        with self._lock:
+            try:
+                if mode not in ("standard", "raw"):
+                    raise ValueError("Choose standard or raw export.")
+                if self._root is None:
+                    raise ValueError("No run selected.")
+                if self._dialogs is None:
+                    raise ValueError("Export requires native confirmation and Save As dialogs.")
+                if self._dialogs.confirm_export(f"Export {mode.upper()} for selected run:\n{self._root}\n{WARNING}") is not True:
+                    return {"ok": True, "cancelled": True}
+                if mode == "raw" and self._dialogs.confirm_export(
+                    "FULL RAW LOGS: Codex prompts, review text and subprocess output can contain private data/API keys. "
+                    "Inspect before sharing. Include these raw files?") is not True:
+                    return {"ok": True, "cancelled": True}
+                destination = self._dialogs.save_export()
+                if not destination:
+                    return {"ok": True, "cancelled": True}
+                if not isinstance(destination, str):
+                    raise ValueError("Invalid native Save As result.")
+                result = export_debug(self._root, destination, mode,
+                                      excluded_roots=(self._controller.repo,))
+                self._export_folder = Path(result["path"]).parent
+                return result
+            except Exception as exc:
+                return self._failure(exc)
+
+    def open_export_folder(self):
+        with self._lock:
+            try:
+                import os
+                if self._export_folder is None or not hasattr(os, "startfile"):
+                    raise ValueError("Opening the export folder is unavailable on this platform.")
+                folder = self._export_folder
+                if folder.resolve(strict=True) != folder or not folder.is_dir():
+                    raise ValueError("Export folder is unavailable or redirects elsewhere.")
+                os.startfile(str(folder))
+                return {"ok": True}
+            except Exception as exc:
+                return self._failure(exc)
 
     def job_status(self):
         with self._lock:

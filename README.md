@@ -316,3 +316,47 @@ resuming work or changing Git. Switching runs remains blocked while the current
 job is active or uncertain. Timeline search covers loaded events, and the raw
 inspector reads only the selected confined file, up to 1 MB, preserving it during
 refresh. Absolute paths, traversal and links escaping the chosen run are rejected.
+
+### Export a debug ZIP from Logs
+
+Open **Logs → Recent runs → Open / View** to inspect an old run (or **Open / Import
+run folder** for an external legacy run). In **Download Logs / Export Debug Package**,
+choose **Export DEBUG REPORT (default)**, confirm the selected run in the native
+dialog, then choose a new `.zip` filename with native Save As outside every repository
+checkout and outside the run logs. Cancelling either dialog creates nothing. Existing
+ZIPs are refused; choose a different filename. Original logs stay in their run directory.
+
+The standard ZIP contains `debug-report.json`: available run ID, status, task IDs,
+timestamps, limited structured state/timeline/test results/review decisions and a file
+inventory explaining omissions. Prompts, raw subprocess output, review prose, feedback,
+repository paths and arbitrary state fields are excluded. Identifiers and filenames can
+still be private: **inspect before sharing**. This selection is not a promise that
+arbitrary free-form text can be perfectly redacted. Missing or corrupt files are reported.
+
+**Export FULL RAW LOGS** requires an additional native warning confirmation. Its
+`raw/` files may include Codex prompts, review text, diffs/source evidence and subprocess
+output containing private data or API keys. **Check raw ZIPs for secrets before sharing
+with ChatGPT or anyone else.** Even raw export only considers known flat runner filenames
+in the chosen run; it excludes directories (including `.git`), `.env`, credentials,
+private keys, hidden token files, arbitrary source trees, links and external files.
+
+Limits: 4 MiB per file, 32 MiB total input/archive (2 MiB reserved for the report),
+499 scanned run entries and 500 records per structured list. Oversized/unstable/unreadable
+files are omitted with reasons; entry/report/archive limit failures create no ZIP.
+Each file is checked for changes during reading; the package is not a transactional
+snapshot of a running process. Retry a changing-file omission after the run stops.
+The Logs page shows the created path, contents and inventory. On Windows **Open export
+destination folder** opens only that saved folder. Export itself runs no Git commands,
+Codex, uploads or network operations and never changes automatic push policy.
+
+Before merging, **the user must perform a Windows native dialog smoke check** (headless
+tests do not substitute for this):
+
+1. Open a disposable saved run in Logs. Cancel confirmation and Save As separately;
+   verify no ZIP or temporary file remains.
+2. Export the default report to a folder outside any checkout, reopen the ZIP, inspect
+   its report/inventory and use **Open export destination folder**.
+3. Try an existing ZIP and a checkout destination; verify refusal and unchanged files.
+4. Choose raw, cancel its extra warning, then repeat and confirm. Inspect the ZIP for
+   secrets and confirm only the selected run's allowed files appear. Verify original
+   logs and the checkout remain unchanged. No push or merge is part of this check.
