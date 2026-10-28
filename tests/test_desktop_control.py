@@ -115,7 +115,7 @@ class DesktopControlTests(unittest.TestCase):
         self.assertEqual(kwargs["stderr"], subprocess.STDOUT)
         self.assertEqual(Path(kwargs["stdout"].name), self.controller.logs / "runner-output.txt")
         if __import__("os").name == "nt":
-            self.assertEqual(kwargs["creationflags"], subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)
+            self.assertEqual(kwargs["creationflags"], subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP)
         self.assertEqual(kwargs["cwd"], src)
         self.assertIn(src, kwargs["env"]["PYTHONPATH"])
         self.assertFalse(self.controller.logs.is_relative_to(self.repo))

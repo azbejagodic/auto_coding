@@ -17,6 +17,7 @@ import sys
 import time
 import uuid
 from typing import Callable
+from auto_coding.background_process import background_options
 from auto_coding.event_log import EventLog, EventLogError
 from auto_coding.github_workspace import (managed_job, WorkspaceError, cancel_reservation,
                                          mark_process_uncertain, GitHubWorkspaceManager,
@@ -90,7 +91,7 @@ def call(argv: list[str], cwd: Path, timeout: int, *, prompt: str | None = None)
         result = subprocess.run(argv, cwd=str(cwd), input=prompt, text=True,
                                 encoding="utf-8", errors="replace",
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                timeout=timeout, check=False, shell=False)
+                                timeout=timeout, check=False, shell=False, **background_options())
         return result.returncode, (result.stdout or "")[:MAX_OUTPUT], False
     except subprocess.TimeoutExpired as exc:
         mark_process_uncertain()

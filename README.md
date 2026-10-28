@@ -135,6 +135,18 @@ The UI tests check JavaScript syntax and exercise the actual UI script with a fa
 
 Closing the window does not terminate the child: it continues in the background. This avoids killing Codex mid-change. The run PID and paths are retained in its logs so a reopened UI can monitor the child; if the child disappears, the controller reports that and leaves runner state untouched for inspection.
 
+On Windows, app-owned background commands use `CREATE_NO_WINDOW`; the runner
+also keeps its own process group. Git/`gh`, Codex A/B and task tests retain their
+existing output capture and error reporting. Runner output remains in
+`runner-output.txt`, with Codex streams and test output in the run's evidence files.
+Headless launch regressions simulate Windows, Linux and macOS without starting
+Codex, contacting GitHub or opening a GUI. With `PYTHONPATH` set as above, run them
+with `python -B -m unittest discover -s tests -p test_background_process.py -v`.
+A manual Windows smoke test is still
+required: launch the dashboard normally, check its single maximized window, then
+exercise Start/Resume and managed Connect/Fetch/Select/New Branch/Push while
+watching for console flashes and checking Logs for output and failures.
+
 When an existing run is reopened with `launching`/`running` metadata but no valid child PID, `job_status()` reports `active: null`, `uncertain: true`, and an actionable `error` rather than incorrectly reporting the run as idle. `reopen()` also returns a warning. Starting or resuming while that run is unresolved is blocked. Stopped metadata never reuses a historical PID as evidence of a live process.
 
 ## Desktop bridge API (Slice 2B-1)

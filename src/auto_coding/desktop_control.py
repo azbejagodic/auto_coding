@@ -15,6 +15,7 @@ import sys
 import threading
 import uuid
 
+from auto_coding.background_process import background_options
 from auto_coding.desktop_reader import read_run, read_evidence
 from auto_coding.run_history import RunHistory
 from auto_coding.simple_run import PilotError, load_tasks
@@ -120,7 +121,7 @@ class DesktopController:
             repo = Path(path).expanduser().resolve(strict=True)
             if not repo.is_dir(): raise ValueError("Target must be a directory.")
             top = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=repo, capture_output=True,
-                                 text=True, encoding="utf-8", errors="replace", shell=False)
+                                 text=True, encoding="utf-8", errors="replace", shell=False, **background_options())
             if top.returncode or Path(top.stdout.strip()).resolve() != repo:
                 raise ValueError("Select the Git repository root, not a subdirectory.")
             self.repo = repo
@@ -176,14 +177,16 @@ class DesktopController:
             result["errors"].append("An earlier desktop run may still be active. Open its logs and wait for it to stop.")
         try:
             branch = subprocess.run(["git", "branch", "--show-current"], cwd=self.repo,
-                                    capture_output=True, text=True, encoding="utf-8", errors="replace", shell=False, timeout=10)
+                                    capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                    shell=False, timeout=10, **background_options())
             result["branch"] = branch.stdout.strip() if not branch.returncode else None
             if not result["branch"]:
                 result["errors"].append("Select a feature branch; detached HEAD or unavailable Git branch.")
             elif result["branch"].lower() in {"main", "master"}:
                 result["errors"].append("Runs are blocked on main/master. Switch to a feature branch first.")
             status = subprocess.run(["git", "status", "--porcelain", "--untracked-files=all"],
-                                    cwd=self.repo, capture_output=True, text=True, encoding="utf-8", errors="replace", shell=False, timeout=10)
+                                    cwd=self.repo, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                    shell=False, timeout=10, **background_options())
             result["clean"] = not status.stdout.strip() if not status.returncode else None
             if status.returncode:
                 result["errors"].append("Could not check Git working tree.")
@@ -375,9 +378,7 @@ class DesktopController:
             # Persist intent before creating a child. If PID persistence then fails,
             # reopen can still refuse an unsafe duplicate resume.
             self._metadata(self.logs, status="launching")
-            options = {}
-            if os.name == "nt":
-                options["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            options = background_options(new_process_group=True)
             # Do not inherit the dashboard console or pipes. Diagnostic output
             # remains available even if initialization fails before state.json.
             output_path = self.logs / "runner-output.txt"

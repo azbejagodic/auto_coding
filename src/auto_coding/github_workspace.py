@@ -12,6 +12,7 @@ import subprocess
 import time
 import uuid
 from functools import wraps
+from auto_coding.background_process import background_options
 
 
 _uncertain_process = ContextVar("autocoding_uncertain_process", default=None)
@@ -204,7 +205,7 @@ class GitHubWorkspaceManager:
             # Git emits UTF-8 paths and refs even on Windows ACP locales.
             result = self.run_command(argv, cwd=cwd, capture_output=True, text=True,
                                       encoding="utf-8", errors="replace",
-                                      shell=False, timeout=120, env=env)
+                                      shell=False, timeout=120, env=env, **background_options())
         except FileNotFoundError:
             raise WorkspaceError("unavailable", "Required command is unavailable.") from None
         except subprocess.TimeoutExpired:
