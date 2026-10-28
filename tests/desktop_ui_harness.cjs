@@ -23,6 +23,11 @@ let data = {root:'', exists:false, empty:true, state:null, events:[], event_erro
   controller:{active:false, uncertain:false, repo:null, plan:null, logs:null, resume_ready:false, start_ready:false,
     preflight:{branch:null, clean:null, errors:['Select a Git repository root.']},
     push:{eligible:false, reason:'Connect a managed GitHub repository with approved local checkpoints to publish.'}}};
+const mode = process.argv[3];
+if (mode === 'saved' || mode === 'stale') data.preferences = {
+  repository:'owner/repo', branch:mode === 'saved' ? 'feature/existing' : 'feature/deleted',
+  plan:'C:/missing-plan.json', attempts:7, auto_push:false
+};
 const calls = [];
 let launchResult = {ok:false, cancelled:true};
 let pendingSelection = null;
@@ -68,6 +73,35 @@ const assertCards = (status, completed, child) => {
 (async () => {
   assert(get('start').disabled);
   await listeners.pywebviewready(); await flush();
+  if (mode === 'saved' || mode === 'stale') {
+    assert.equal(get('github-repo').value, 'owner/repo');
+    assert.equal(get('attempts').value, '7');
+    assert.equal(get('plan-path').textContent, 'C:/missing-plan.json');
+    assert.equal(get('github-branch').value, '');
+    assert(get('preferences-notice').textContent.includes('Connect the repository'));
+    assert(get('preferences-notice').textContent.includes('Choose an available task plan'));
+    assert(get('auto-push').checked, 'Legacy unchecked preference cannot override new-run default');
+    assert(get('start').disabled);
+    assert.equal(calls.length, 0, 'Saved settings never connect, launch or push');
+    await click('nav-logs'); await click('nav-overview');
+    assert.equal(get('github-repo').value, 'owner/repo');
+    assert.equal(get('attempts').value, '7');
+    await click('connect-github');
+    assert.equal(get('github-branch').value, mode === 'saved' ? 'feature/existing' : '');
+    assert(get('start').disabled && get('push-approved').disabled, 'Protected main and missing plan remain blocked');
+    if (mode === 'stale') assert(get('preferences-notice').textContent.includes('Saved branch is unavailable'));
+    assert(!calls.some(call => ['start', 'resume', 'push_approved_commits', 'checkout_github_branch'].includes(call[0])));
+    // An eligible current branch is still not the restored selected branch.
+    data.controller.preflight = {branch:'feature/other', clean:true, errors:[]};
+    data.controller.github.local.push('feature/other');
+    data.controller.plan = 'C:/valid.json'; data.controller.start_ready = true;
+    await poll();
+    assert(get('start').disabled, 'Saved or missing selection cannot launch on another current feature branch');
+    const before = calls.length; await click('start'); assert.equal(calls.length, before);
+    get('github-branch').value = 'feature/remote'; get('github-branch').onchange();
+    assert(!get('select-branch').disabled, 'Unavailable saved setup allows another choice');
+    return;
+  }
   assert(!get('browse-project').disabled);
   assert(get('start').disabled);
   assert.equal(get('header-state').textContent, 'Idle');
@@ -76,7 +110,9 @@ const assertCards = (status, completed, child) => {
     assert.equal(get(id).textContent, '', 'Idle state must be quiet: ' + id);
   }
   assert(get('resume').disabled && get('push-approved').disabled && get('fetch-github').disabled);
-  assert(!get('auto-push').checked);
+  assert(get('auto-push').checked);
+  assert(!get('auto-push').disabled);
+  assert.equal(calls.length, 0, 'Initialization never connects, launches or pushes');
   assert(!contents().includes('Ready for your first run'));
   assert.equal(get('run-setup').hidden, false);
   // Durable status, completion, and current activity are independent snapshot facts.
@@ -290,11 +326,11 @@ const assertCards = (status, completed, child) => {
   assert(get('project-path').textContent.includes('C:\\project with spaces'));
   await click('browse-plan');
   assert(!get('start').disabled);
-  get('auto-push').checked = true; get('auto-push').onchange();
+  get('auto-push').checked = false; get('auto-push').onchange();
   await poll();
-  assert(get('auto-push').checked, 'Unchanged polling preserves explicit opt-in');
+  assert(!get('auto-push').checked, 'Unchanged polling preserves explicit OFF');
   data.controller.preflight.branch = 'feature/another-setup'; await poll();
-  assert.equal(get('auto-push').checked, false, 'A different branch defaults automatic push OFF');
+  assert.equal(get('auto-push').checked, false, 'Live branch refresh preserves explicit OFF');
   for (const error of ['Runs are blocked on main/master. Switch to a feature branch first.', 'Plan validation failed: malformed plan', 'Commit or discard changes before START.']) {
     data.controller.start_ready = false; data.controller.preflight.errors = [error];
     await poll();
@@ -346,24 +382,56 @@ const assertCards = (status, completed, child) => {
   assert(get('message').textContent.includes('Cancelled'));
   assert.equal(data.controller.active, false);
   launchResult = {ok:true};
+  get('auto-push').checked = false; get('auto-push').onchange();
+  await click('start');
+  assert.deepEqual(calls.at(-1), ['start', 3], 'Explicit OFF is forwarded to the new run');
+  await poll();
+  assert(!get('auto-push').checked, 'Active run refresh preserves durable OFF');
+  const beforeActiveFailure = calls.length;
+  failStatus = true; await poll();
+  assert(!get('auto-push').checked && get('auto-push').disabled);
+  failStatus = false; await poll();
+  assert(!get('auto-push').checked && get('auto-push').disabled, 'Active run OFF survives status recovery');
+  assert.equal(calls.length, beforeActiveFailure, 'Active status recovery never launches or pushes');
+  data.controller.active = false; data.state.status = 'completed'; await poll();
+  assert(get('auto-push').checked, 'The next new setup defaults ON after an OFF run');
   get('auto-push').checked = true;
   await click('start');
   assert.deepEqual(calls.at(-1), ['start', 3, true]);
   assert.equal(get('auto-push').checked, true, 'Active run shows its saved publication policy');
   assert(get('auto-push').disabled, 'Publication settings cannot change mid-run');
   await click('start');
-  assert.equal(calls.filter(call => call[0] === 'start').length, 2);
+  assert.equal(calls.filter(call => call[0] === 'start').length, 3);
   assert.equal(get('header-state').textContent, 'Running');
   assert(get('browse-project').disabled && get('resume').disabled);
-  // A completed/stopped run can seed a new Start, whose policy must default OFF.
+  // A completed/stopped run can seed a new Start, whose policy must default ON.
   data.controller.active = false; await poll();
-  assert.equal(get('auto-push').checked, false);
+  assert.equal(get('auto-push').checked, true);
   get('auto-push').checked = true; get('auto-push').onchange();
   launchResult = {ok:false, cancelled:true};
   await click('start');
   assert.deepEqual(calls.at(-1), ['start', 3, true], 'Busy state must preserve explicit new-run opt-in');
   assert.equal(data.controller.active, false);
   get('auto-push').checked = false; get('auto-push').onchange();
+  data.controller.start_ready = false; await poll();
+  assert(!get('auto-push').checked, 'New setup OFF survives temporary validation failure on a previous run');
+  data.controller.start_ready = true; await poll();
+  assert(!get('auto-push').checked, 'Recovery of readiness must preserve OFF');
+  const beforeStatusFailure = calls.length;
+  for (const startReady of [true, false]) {
+    data.controller.start_ready = startReady; await poll();
+    failStatus = true; await poll(); await poll();
+    assert(!get('auto-push').checked, 'Unknown status preserves the setup checkbox value');
+    assert(get('auto-push').disabled && get('start').disabled && get('resume').disabled);
+    await click('nav-logs'); await click('nav-overview');
+    failStatus = false; await poll();
+    assert(!get('auto-push').checked, 'Status recovery preserves explicit OFF on the same new setup');
+    assert(!get('auto-push').disabled, 'Recovered setup remains editable');
+  }
+  assert.equal(calls.length, beforeStatusFailure, 'Status failure and recovery never launch or push');
+  data.controller.start_ready = true; await poll();
+  await click('start');
+  assert.deepEqual(calls.at(-1), ['start', 3], 'Recovered setup forwards explicit OFF');
   data.controller.active = true; await poll();
   assert.equal(get('auto-push').checked, true, 'Saved run still shows its own policy');
   data.state = {status:'running', current_task:'task-1', completed:[], history:[

@@ -310,9 +310,28 @@ Publication reads structured checkpoint state, never raw evidence files. Existin
 raw logs remain available only through explicit evidence selection. Local commits
 are labelled local; remote publication requires confirmation from the remote.
 
-**Automatically push approved tasks** starts unchecked and requires native START
-confirmation for that run. Repository, branch and publication settings are fixed
-for the run. The same coordinator synchronously pushes each independently approved,
+The dashboard remembers the last repository input, successfully selected feature
+branch, task-plan path and attempts in `%LOCALAPPDATA%\AutoCoding\settings.json`
+(using the existing per-user `AUTOCODING_CONFIG_DIR` fallback on other hosts).
+This also works with a packaged Windows EXE and a read-only installation directory.
+Preferences contain only these setup hints; no credentials, prompts or run logs.
+Writes replace the file atomically and failures are best effort. Invalid or
+inaccessible settings fall back to defaults. Existing history and run data are unchanged.
+On startup, the local plan is revalidated; missing paths remain visible for replacement.
+The repository remains disconnected until you explicitly connect. A remembered branch
+is suggested only if it exists in the validated branch listing; use Select Branch
+(which performs the existing freshness checks) to check it out. Opening the app never
+clones, starts, resumes or pushes.
+
+**Automatically push approved tasks** starts checked for each fresh/new-run setup and
+requires native START confirmation for that run. Uncheck it to keep that run local.
+The checkbox is not persisted as a preference: legacy unchecked preferences are ignored
+on startup. An explicit OFF survives setup polling, transient status failures and
+navigation; unavailable status locks actions without resetting that choice. Active/reopened runs
+retain their durable run policy, including OFF, and Resume never changes that policy.
+When a stopped/completed run becomes ready for a new Start, the new setup defaults ON.
+This does not authorize publishing earlier local commits on startup. Repository, branch
+and publication settings are fixed for the run. The same coordinator synchronously pushes each independently approved,
 integrity-validated local checkpoint by its exact SHA to the selected origin feature
 branch. It verifies origin identity, all unpublished approvals and sensitive paths;
 main/master, force pushes, tags, hooks and automatic merges are excluded.

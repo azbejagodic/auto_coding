@@ -39,7 +39,7 @@ class DesktopUITests(unittest.TestCase):
             self.assertEqual(parser.ids[name], "button")
         self.assertEqual(parser.ids["github-repo"], "input")
         self.assertEqual(parser.ids["auto-push"], "input")
-        self.assertIn('id="auto-push" type="checkbox"> Automatically push approved tasks', HTML)
+        self.assertIn('id="auto-push" type="checkbox" checked> Automatically push approved tasks', HTML)
         self.assertEqual(parser.ids["github-branch"], "select")
         self.assertEqual(parser.ids["branch-base"], "select")
         self.assertEqual(parser.ids["branch-base-confirm"], "input")
@@ -103,7 +103,7 @@ class DesktopUITests(unittest.TestCase):
         for name in ("secondary-controls", "local-project", "launch-details"):
             self.assertEqual(markup.nodes[name][0], "details")
             self.assertNotIn("open", markup.nodes[name][1])
-        self.assertNotIn("checked", markup.nodes["auto-push"][1])
+        self.assertIn("checked", markup.nodes["auto-push"][1])
         # Primary form order remains native; secondary tools live in Logs.
         order = list(markup.nodes)
         for first, second in zip(("github-repo", "github-branch", "plan-path", "attempts", "start"),
@@ -119,7 +119,7 @@ class DesktopUITests(unittest.TestCase):
     def test_overview_ends_with_checkbox_and_only_status_cards(self):
         setup = HTML.split('<section class="panel" id="run-setup"', 1)[1].split('</section>', 1)[0]
         tail = setup.split('<label class="push-policy">', 1)[1]
-        self.assertEqual(tail.strip(), '<input id="auto-push" type="checkbox"> Automatically push approved tasks</label>')
+        self.assertEqual(tail.strip(), '<input id="auto-push" type="checkbox" checked> Automatically push approved tasks</label>')
         for name in ('open-run', 'secondary-controls', 'local-project', 'launch-details', 'list-github'):
             self.assertNotIn('id="' + name + '"', setup)
             logs = HTML.split('<section id="logs-tools"', 1)[1].split('</section>', 1)[0]
@@ -230,7 +230,7 @@ class DesktopUITests(unittest.TestCase):
                 self.assertEqual(page.evaluate('document.activeElement.id'), 'browse-plan')
                 self.assertIn('<script>bad()</script>', page.locator('#plan-path').inner_text())
                 self.assertEqual(page.locator('#plan-path script').count(), 0)
-                self.assertFalse(page.locator('#auto-push').is_checked())
+                self.assertTrue(page.locator('#auto-push').is_checked())
                 page.locator('#auto-push').check()
                 page.evaluate('refresh(false)')
                 self.assertTrue(page.locator('#auto-push').is_checked())
@@ -238,7 +238,7 @@ class DesktopUITests(unittest.TestCase):
                   fixture.controller.plan += '.next.md';
                   return refresh(false);
                 }""")
-                self.assertFalse(page.locator('#auto-push').is_checked())
+                self.assertTrue(page.locator('#auto-push').is_checked())
                 page.locator('#github-repo').focus()
                 for name in ('connect-github', 'github-branch', 'fetch-github', 'select-branch', 'new-branch',
                              'plan-path', 'browse-plan', 'attempts', 'start'):
@@ -305,7 +305,7 @@ class DesktopUITests(unittest.TestCase):
                 page.keyboard.press('Enter')
                 page.wait_for_function("document.getElementById('message').textContent.includes('Cancelled')")
                 self.assertFalse(page.evaluate('fixture.controller.active'))
-                self.assertEqual(page.evaluate("calls.filter(c => c[0] === 'start')"), [['start', 3]])
+                self.assertEqual(page.evaluate("calls.filter(c => c[0] === 'start')"), [['start', 3, True]])
                 self.assertEqual(page.evaluate('document.activeElement.id'), 'start')
                 page.keyboard.press('Space')
                 page.wait_for_function("calls.filter(c => c[0] === 'start').length === 2 && !document.getElementById('start').disabled")
@@ -404,9 +404,10 @@ class DesktopUITests(unittest.TestCase):
             syntax = subprocess.run([node, "--check", str(js)], capture_output=True,
                                     text=True, timeout=20)
             self.assertEqual(syntax.returncode, 0, syntax.stderr)
-            result = subprocess.run([node, str(fixture), str(js)], capture_output=True,
-                                    text=True, encoding="utf-8", errors="replace", timeout=20)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            for mode in ('normal', 'saved', 'stale'):
+                result = subprocess.run([node, str(fixture), str(js), mode], capture_output=True,
+                                        text=True, encoding="utf-8", errors="replace", timeout=20)
+                self.assertEqual(result.returncode, 0, mode + result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

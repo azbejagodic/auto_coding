@@ -15,6 +15,9 @@ from auto_coding.run_history import RunHistory, LIMIT
 class RunHistoryTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
+        app_data = patch.dict(os.environ, {"LOCALAPPDATA": self.temp.name})
+        app_data.start()
+        self.addCleanup(app_data.stop)
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve()
         self.runs = self.root / "app" / "runs"

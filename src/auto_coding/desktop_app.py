@@ -8,6 +8,7 @@ from pathlib import Path
 
 from auto_coding.desktop_reader import read_run, read_evidence
 from auto_coding.desktop_control import DesktopController
+from auto_coding.desktop_settings import DesktopSettings, clean_preferences
 from auto_coding.simple_run import load_tasks
 from auto_coding.debug_export import export_debug, WARNING
 
@@ -192,6 +193,7 @@ progress{width:100%;height:12px;accent-color:#72adf9}
 <small id="attempts-hint" class="muted">1–10 per task</small>
 </div>
 </div>
+<div id="preferences-notice" class="notice muted" role="status"></div>
 <div id="attempts-error" class="notice red" role="status" aria-live="polite"></div>
 <div class="launch-row">
 <button id="start" aria-describedby="preflight start-reason attempts-error">Start</button>
@@ -203,7 +205,7 @@ progress{width:100%;height:12px;accent-color:#72adf9}
 <div id="push-reason" class="muted"></div>
 <div id="preflight" class="notice muted" role="status" aria-live="polite" aria-atomic="true"></div>
 <div id="message" class="notice" role="status" aria-live="polite"></div>
-<label class="push-policy"><input id="auto-push" type="checkbox"> Automatically push approved tasks</label>
+<label class="push-policy"><input id="auto-push" type="checkbox" checked> Automatically push approved tasks</label>
 </section>
 <section id="logs-tools" hidden aria-label="Repository tools and diagnostics">
 <details id="secondary-controls">
@@ -326,20 +328,31 @@ function updateControls() {
   const savedRun = !!c.logs || !!latest?.root;
   const push = document.getElementById('auto-push');
   // A stopped run may also be used as setup for a new Start: retain that opt-in separately.
-  const showingSavedPolicy = savedRun && (c.active !== false || c.uncertain || !c.start_ready);
-  const pushContext = JSON.stringify([c.repo, c.preflight?.branch, c.plan, c.logs, latest?.root]);
-  if (showingSavedPolicy) push.checked = savedPush;
-  // An opt-in belongs to this setup, never to another repository, branch or plan.
-  else if (push.showingSavedPolicy || push.setupContext !== pushContext) push.checked = false;
-  push.setupContext = pushContext;
-  push.showingSavedPolicy = showingSavedPolicy;
-  push.disabled = locked || showingSavedPolicy || protectedBranch;
-  if (protectedBranch && !showingSavedPolicy) push.checked = false;
-  push.indeterminate = showingSavedPolicy && !latest?.state;
+  const pushContext = JSON.stringify([c.logs, latest?.root]);
+  const statusKnown = (c.active === false || c.active === true) && !c.uncertain;
+  // An unavailable status is not a run transition. Keep the setup choice and
+  // context until a successful snapshot can establish whether a run started.
+  if (statusKnown) {
+    const showingSavedPolicy = savedRun && (c.active
+      || (!c.start_ready && push.newSetupContext !== pushContext));
+    if (showingSavedPolicy) {
+      push.checked = savedPush;
+      if (c.active) push.newSetupContext = null;
+    }
+    // A new setup defaults ON; polling preserves an explicit OFF until the run ends.
+    else if (push.showingSavedPolicy || push.setupContext !== pushContext) push.checked = true;
+    if (!showingSavedPolicy) push.newSetupContext = pushContext;
+    push.setupContext = pushContext;
+    push.showingSavedPolicy = showingSavedPolicy;
+  }
+  push.disabled = locked || !!push.showingSavedPolicy;
+  push.indeterminate = !statusKnown || (!!push.showingSavedPolicy && !latest?.state);
   const validAttempts = validateAttempts();
-  document.getElementById('start').disabled = locked || protectedBranch || !c.start_ready || !validAttempts;
+  const branchPending = !!c.repository && (!selectedBranch || selectedBranch !== c.preflight?.branch || !!c.github?.error);
+  document.getElementById('start').disabled = locked || protectedBranch || branchPending || !c.start_ready || !validAttempts;
   document.getElementById('resume').disabled = locked || protectedBranch || !c.resume_ready || !validAttempts;
-  const startReason = !ready ? 'Loading repository status...' : busy ? 'Finish the current action first.' : '';
+  const startReason = !ready ? 'Loading repository status...' : busy ? 'Finish the current action first.'
+    : branchPending && c.start_ready ? 'Select and verify the chosen feature branch before starting.' : '';
   document.getElementById('start-reason').textContent = startReason;
   document.getElementById('resume').textContent = latest?.state?.publication?.outcome === 'pending' ? 'Retry Push' : 'Resume';
   document.getElementById('refresh').disabled = busy || !ready;
@@ -398,12 +411,26 @@ function render(data) {
   const searchCursor = searchFocused ? document.activeElement.selectionStart : null;
   latest = data;
   const c = data.controller || {};
+  const preferences = data.preferences || {};
+  if (!render.preferencesLoaded) {
+    if (preferences.repository) document.getElementById('github-repo').value = preferences.repository;
+    if (preferences.attempts) document.getElementById('attempts').value = String(preferences.attempts);
+    render.preferencesLoaded = true;
+  }
+  const savedRepository = preferences.repository && !c.repository;
+  document.getElementById('preferences-notice').textContent = savedRepository
+    ? 'Saved setup restored. Connect the repository and verify its feature branch before starting.' + (preferences.plan && !c.plan ? ' Choose an available task plan.' : '')
+    : preferences.plan && !c.plan ? 'Saved task plan is unavailable. Choose another plan.' : '';
+  if (c.repository && preferences.branch && !c.github?.error
+      && ![...(c.github?.local || []), ...(c.github?.remote || []).map(name => name.replace(/^origin\//, ''))].includes(preferences.branch)) {
+    document.getElementById('preferences-notice').textContent = 'Saved branch is unavailable. Fetch branches or choose another feature branch.';
+  }
   const key = page + JSON.stringify(data);
   updateControls();
   if (runPresentation(data).label === 'Completed' && document.getElementById('message').textContent.startsWith('Launch accepted.')) message('');
   if (renderKey === key) return;
   renderKey = key;
-  [['project-path', c.repo || 'No project selected'], ['plan-path', c.plan || 'No plan selected']].forEach(([id, value]) => {
+  [['project-path', c.repo || 'No project selected'], ['plan-path', c.plan || preferences.plan || 'No plan selected']].forEach(([id, value]) => {
     const field = document.getElementById(id);
     if (field.textContent !== value) field.textContent = value;
   });
@@ -441,8 +468,10 @@ function render(data) {
   const signature = JSON.stringify([c.repository, c.preflight?.branch, names, c.github?.local, c.github?.remote]);
   if (branches.datasetSignature !== signature) {
     const selectionContext = JSON.stringify([c.repository, c.preflight?.branch]);
+    const savedBranch = c.repository && !c.github?.error && preferences.repository && preferences.branch
+      && names.includes(preferences.branch) ? preferences.branch : '';
     const selected = branches.selectionContext === selectionContext && names.includes(branches.value)
-      ? branches.value : names.includes(c.preflight?.branch) ? c.preflight.branch : '';
+      ? branches.value : preferences.branch ? savedBranch : (names.includes(c.preflight?.branch) ? c.preflight.branch : '');
     branches.replaceChildren();
     const placeholder = el('option', 'Choose a feature branch'); placeholder.value = ''; branches.append(placeholder);
     names.forEach(name => {
@@ -714,7 +743,6 @@ async function act(method) {
     if (method === 'start' && document.getElementById('auto-push').checked === true) args.push(true);
     const result = await window.pywebview.api[method](...args);
     accepted = result.ok && !result.cancelled;
-    if (accepted) document.getElementById('auto-push').checked = false;
     if (args.length && accepted) navigate('overview');
     message(result.cancelled ? 'Cancelled. No work launched.' : result.error || result.warning || (result.ok ? (args.length ? 'Launch accepted. Waiting for durable runner progress.' : 'Selection updated. No work launched.') : 'Action failed.'), !result.ok && !result.cancelled);
   } catch (error) { message('Action failed: ' + error, true); }
@@ -788,7 +816,13 @@ document.getElementById('create-branch').onclick = () => workspaceAction('create
 document.getElementById('push-approved').onclick = () => workspaceAction('push_approved_commits', [], 'push-approved');
 
 document.getElementById('refresh').onclick = refresh;
-document.getElementById('attempts').oninput = updateControls;
+function saveSetup() {
+  if (!ready || !window.pywebview.api.save_setup) return;
+  window.pywebview.api.save_setup(document.getElementById('github-repo').value.trim(),
+    Number(document.getElementById('attempts').value)).catch(() => {});
+}
+document.getElementById('github-repo').oninput = saveSetup;
+document.getElementById('attempts').oninput = () => { updateControls(); if (validateAttempts()) saveSetup(); };
 document.getElementById('auto-push').onchange = updateControls;
 ['overview', 'tasks', 'logs'].forEach(name => { document.getElementById('nav-' + name).onclick = () => navigate(name); });
 Object.entries({'browse-project':'select_repo', 'browse-plan':'select_plan', 'open-run':'open_run', start:'start', resume:'resume'}).forEach(([id, method]) => { document.getElementById(id).onclick = () => act(method); });
@@ -836,7 +870,7 @@ class Bridge:
     """
 
     def __init__(self, root: Path | None = None, *, controller=None,
-                 dialogs=None, controller_factory=DesktopController):
+                 dialogs=None, controller_factory=DesktopController, settings=None):
         self._controller_factory = controller_factory
         self._controller = controller if controller is not None else controller_factory()
         self._history = getattr(self._controller, "run_history", None)
@@ -846,10 +880,33 @@ class Bridge:
         self._root = Path(root).expanduser() if root is not None else None
         self._selection_error = None
         self._export_folder = None
+        self._settings = settings if settings is not None else DesktopSettings()
+        self._preferences = self._settings.load()
+        if root is None and self._preferences["plan"] and self._controller.plan is None:
+            # Local validation only; an unavailable hint gets one short UI notice.
+            from auto_coding.simple_run import PilotError
+            try:
+                load_tasks(Path(self._preferences["plan"]))
+            except (OSError, ValueError, UnicodeError, PilotError):
+                pass
+            else:
+                self._controller.select_plan(self._preferences["plan"])
         if root is not None:
             result = self.open_run(str(root))
             if not result["ok"]:
                 self._selection_error = result["error"]
+
+    def _remember(self, **values):
+        self._preferences = clean_preferences({**self._preferences, **values})
+        self._settings.save(self._preferences)
+
+    def save_setup(self, repository, attempts):
+        with self._lock:
+            if self._controller.job_status()["active"] is False:
+                previous = self._preferences["repository"]
+                self._remember(repository=repository, attempts=attempts,
+                               branch=self._preferences["branch"] if repository == previous else "")
+            return {"ok": True}
 
     @staticmethod
     def _failure(exc):
@@ -880,6 +937,8 @@ class Bridge:
                         self._root = candidate.logs
                 else:
                     result = getattr(self._controller, "select_" + kind)(path)
+                if kind == "plan" and result.get("ok"):
+                    self._remember(plan=str(self._controller.plan))
                 self._selection_error = result.get("error")
                 return result
             except Exception as exc:
@@ -892,6 +951,8 @@ class Bridge:
     def _github(self, action, *args, **kwargs):
         try:
             result = self._controller.github(action, *args, **kwargs)
+            if result.get("ok") and action in {"checkout_branch", "create_branch"}:
+                self._remember(branch=kwargs["name"])
             self._selection_error = result.get("error")
             return result
         except Exception:
@@ -900,6 +961,8 @@ class Bridge:
 
     def connect_github(self, repository):
         with self._lock:
+            self._remember(repository=repository, branch=self._preferences["branch"]
+                           if repository == self._preferences["repository"] else "")
             return self._github("connect", repository)
 
     def github_repositories(self):
@@ -1111,6 +1174,7 @@ class Bridge:
             except Exception as exc:
                 data = {"root": str(self._root), "exists": False, "state": None,
                         "state_error": str(exc), "events": [], "event_errors": [], "empty": True}
+            data["preferences"] = dict(self._preferences)
             data["controller"] = {**self.selected_paths(), **status}
             return data
 

@@ -14,6 +14,9 @@ from auto_coding.desktop_app import Bridge, NativeDialogs
 class DebugExportTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1])
+        app_data = patch.dict(os.environ, {"LOCALAPPDATA": self.temp.name})
+        app_data.start()
+        self.addCleanup(app_data.stop)
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name).resolve()
         # Keep fixtures inside this workspace while modelling an external Save As

@@ -20,6 +20,9 @@ from auto_coding.desktop_app import Bridge
 class WorkspaceTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
+        app_data = patch.dict(os.environ, {"LOCALAPPDATA": self.temp.name})
+        app_data.start()
+        self.addCleanup(app_data.stop)
         self.root = Path(self.temp.name)
         self.seed = self.root / "seed"
         self.seed.mkdir()
