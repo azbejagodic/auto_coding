@@ -132,6 +132,7 @@ assert(missing && typeof missing.onclick !== 'function', 'Missing evidence must 
             (root / "run-manifest.json").write_text('{"task_ids":["one","two"]}')
             data = read_run(root)
             self.assertEqual(data["task_count"], 2)
+            self.assertEqual(data["task_ids"], ["one", "two"])
             self.assertIn({"label":"File", "path":"original-answer.txt", "status":"available"}, data["files"])
             self.assertNotIn("body is not loaded", json.dumps(data))
             self.assertEqual(read_evidence(root, "original-answer.txt")["text"], "body is not loaded by polling")
@@ -173,12 +174,13 @@ assert(missing && typeof missing.onclick !== 'function', 'Missing evidence must 
 
     def test_attempt_history_shows_actual_review_and_feedback_fields(self):
         from auto_coding.desktop_app import HTML
-        self.assertIn("item.review && item.review.decision", HTML)
-        self.assertIn("item.feedback", HTML)
+        self.assertIn("record?.review?.decision", HTML)
+        self.assertIn("item?.feedback", HTML)
 
     def test_current_task_is_displayed_without_fabricating_completion(self):
-        self.assertIn("state.current_task || 'No task in progress'", HTML)
-        self.assertIn("Current task: ", HTML)
+        self.assertIn("state.current_task === id", HTML)
+        self.assertIn("task.status", HTML)
+        self.assertNotIn("Current task: ", HTML)
         self.assertIn("A checkpoint is pending reconciliation", HTML)
 
     def test_selected_evidence_survives_refresh_and_invalid_links_are_not_clickable(self):

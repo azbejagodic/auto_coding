@@ -71,6 +71,7 @@ def read_run(log_root: str | Path) -> dict:
             if not isinstance(value, dict) or not isinstance(value.get("task_ids"), list):
                 raise ValueError("manifest must contain task_ids")
             result["task_count"] = len(value["task_ids"])
+            result["task_ids"] = [ident for ident in value["task_ids"] if isinstance(ident, str)]
     except (OSError, UnicodeError, ValueError, RuntimeError) as exc:
         result["event_errors"].append(f"run-manifest.json is corrupt or unreadable: {exc}")
     try:

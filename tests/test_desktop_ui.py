@@ -384,6 +384,63 @@ class DesktopUITests(unittest.TestCase):
             finally:
                 browser.close()
 
+    def test_tasks_compact_rendering_keyboard_and_evidence(self):
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            self.skipTest("Playwright absent; rendered Tasks checks unavailable")
+        with sync_playwright() as playwright:
+            try:
+                browser = playwright.chromium.launch(headless=True)
+            except Exception as exc:
+                self.skipTest(f"Chromium unavailable: {exc}")
+            try:
+                page = browser.new_page(viewport={"width": 960, "height": 600})
+                page.route("**/*", lambda route: route.abort())
+                page.set_content(HTML)
+                page.evaluate("""() => {
+                  window.fixture = {root:'saved/run', exists:true, task_count:4,
+                    task_ids:['Layout','Progress','Evidence','Keyboard'], events:[],
+                    controller:{active:false, uncertain:false, logs:'saved/run', preflight:{errors:[]}},
+                    state:{status:'stopped', current_task:'Progress', completed:['Layout'], history:[
+                      {task:'Layout', attempt:1, review:{decision:'APPROVED', summary:'Full approval'}, commit:'abcdef0123456789'},
+                      {task:'Progress', attempt:1, tests:[{index:1,exit_code:1,timed_out:true}],
+                       review:null, feedback:'Original feedback <script>unsafe()</script>', extra:{preserve:'every byte'}}]}};
+                  window.pywebview={api:{snapshot:async()=>structuredClone(fixture),
+                    evidence:async path=>({ok:true,text:'Exact evidence '+path})}};
+                  window.dispatchEvent(new Event('pywebviewready'));
+                }""")
+                page.locator('#nav-tasks').click()
+                rows = page.locator('.task-row')
+                self.assertEqual(rows.count(), 4)
+                self.assertEqual(page.locator('.task-progress').first.inner_text(), '1 / 4 completed')
+                self.assertLess(rows.last.bounding_box()['y'] + rows.last.bounding_box()['height'], 600)
+                self.assertEqual(page.locator('.task-row[open]').count(), 0)
+                self.assertNotIn('exit 1', page.locator('#app').inner_text())
+                self.assertNotIn('timed out: true', page.locator('#app').inner_text())
+                self.assertNotIn('Original feedback', page.locator('#app').inner_text())
+                self.assertEqual(page.locator('.task-stop').count(), 1)
+                summary = rows.nth(1).locator(':scope > summary')
+                summary.focus()
+                page.keyboard.press('Enter')
+                self.assertTrue(rows.nth(1).evaluate('(row)=>row.open'))
+                page.keyboard.press('Tab')
+                self.assertEqual(page.evaluate('document.activeElement.textContent'), 'Feedback (original)')
+                page.keyboard.press('Enter')
+                self.assertIn('Original feedback', rows.nth(1).inner_text())
+                self.assertEqual(page.locator('#app script').count(), 0)
+                # Polling keeps native expander state and keyboard focus.
+                page.evaluate("fixture.events.push({event:'stopped',task_id:'Progress',attempt:1,metadata:{reason:'test timeout'}}); refresh(false)")
+                self.assertEqual(page.evaluate('document.activeElement.textContent'), 'Feedback (original)')
+                self.assertTrue(page.locator('.task-row details').filter(has=page.locator('summary', has_text='Feedback (original)')).first.evaluate('(node)=>node.open'))
+                page.locator('summary', has_text='Full attempt record').nth(1).click()
+                self.assertIn('every byte', rows.nth(1).inner_text())
+                for width, height in ((960,600), (640,480), (390,720)):
+                    page.set_viewport_size({'width':width, 'height':height})
+                    self.assertTrue(page.evaluate('document.documentElement.scrollWidth <= innerWidth'))
+            finally:
+                browser.close()
+
     def test_actual_ui_buttons_navigation_polling_and_state_transitions(self):
         node = shutil.which("node")
         if not node:
@@ -404,7 +461,7 @@ class DesktopUITests(unittest.TestCase):
             syntax = subprocess.run([node, "--check", str(js)], capture_output=True,
                                     text=True, timeout=20)
             self.assertEqual(syntax.returncode, 0, syntax.stderr)
-            for mode in ('normal', 'saved', 'stale'):
+            for mode in ('normal', 'saved', 'stale', 'tasks'):
                 result = subprocess.run([node, str(fixture), str(js), mode], capture_output=True,
                                         text=True, encoding="utf-8", errors="replace", timeout=20)
                 self.assertEqual(result.returncode, 0, mode + result.stdout + result.stderr)

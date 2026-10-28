@@ -55,7 +55,9 @@ const api = {
 };
 const listeners = {};
 let poll;
-const context = vm.createContext({document, window:{pywebview:{api}, addEventListener:(name, callback) => { listeners[name] = callback; }},
+let clockNow = Date.parse('2026-10-25T12:00:00Z');
+class ControlledDate extends Date { static now() { return clockNow; } }
+const context = vm.createContext({document, Date:ControlledDate, window:{pywebview:{api}, addEventListener:(name, callback) => { listeners[name] = callback; }},
   setInterval:(callback, ms) => { assert.equal(ms, 4000); poll = callback; }});
 vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), context);
 const flush = async () => { await new Promise(resolve => setImmediate(resolve)); };
@@ -73,6 +75,7 @@ const assertCards = (status, completed, child) => {
 (async () => {
   assert(get('start').disabled);
   await listeners.pywebviewready(); await flush();
+  if (mode === 'tasks') { await taskContracts(); return; }
   if (mode === 'saved' || mode === 'stale') {
     assert.equal(get('github-repo').value, 'owner/repo');
     assert.equal(get('attempts').value, '7');
@@ -313,7 +316,7 @@ const assertCards = (status, completed, child) => {
   data = initial; calls.length = 0; await poll();
   await click('nav-tasks');
   assert(get('run-setup').hidden);
-  assert(contents().includes('No task history yet.'));
+  assert(contents().includes('No run loaded.'));
   assert.equal(get('nav-tasks')['aria-current'], 'page');
   await click('nav-overview');
   let release;
@@ -632,3 +635,230 @@ const assertCards = (status, completed, child) => {
   assert(snapshotReads > 5);
   console.log('Dashboard button, navigation, polling, evidence and state contracts passed');
 })().catch(error => { console.error(error); process.exitCode = 1; });
+
+async function taskContracts() {
+  const base = Date.parse('2026-10-25T11:00:00Z');
+  clockNow = base;
+  data = {root:'saved/run', exists:true, task_ids:['one','two','three','four'], task_count:4,
+    controller:{active:true, uncertain:false, logs:'saved/run', task_steps:[{id:'one',test_count:4}]},
+    state:{status:'running', current_task:'one', completed:[], history:[], auto_push:null}, events:[]};
+  const event = (second, actor, name, outcome, metadata={}, attempt=1, task='one') => {
+    data.events.push({seq:data.events.length+1, timestamp_utc:new Date(base+second*1000).toISOString(),
+      task_id:task, attempt, actor, event:name, outcome, metadata,
+      _evidence_status:[{label:'output',path:'exact-evidence.txt',status:'available'}]});
+    clockNow = base + second*1000;
+  };
+  const project = () => {
+    context.fixture = structuredClone(data);
+    return JSON.parse(vm.runInContext('JSON.stringify(taskPresentation(fixture))', context));
+  };
+  const current = () => project()[0].current;
+  const phase = name => current().phases.find(p => p.name === name);
+  const summaries = () => walk(get('app')).filter(n => n.tag === 'details' && n.className === 'task-row').map(n => n.children[0]);
+  const defaultText = () => summaries().map(n => n.textContent).join('\n');
+  event(0,'controller','task_started','started');
+  event(0,'Codex A','process_started','started');
+  await poll(); await click('nav-tasks');
+  assert.equal(project()[0].status,'Running');
+  assert.equal(phase('Codex A').status,'Running');
+  assert.equal(summaries().length,4);
+  assert(defaultText().includes('Push off'));
+  assert(!defaultText().includes('exit '));
+  assert(!defaultText().includes('timed out:'));
+  assert(!contents().includes('Tasks and attempt history'));
+  assert(!contents().includes('Current task:'));
+  const initialText = defaultText();
+  clockNow += 15000; await poll();
+  assert.notEqual(defaultText(), initialText, 'Clock refresh must update unchanged active snapshot');
+  assert.equal(current().duration,15000);
+  assert.equal(phase('Codex A').duration,15000);
+  const row = walk(get('app')).find(n => n.className === 'task-row');
+  row.open = true; row.ontoggle(); row.children[0].focus();
+  event(20,'Codex A','process_finished','success');
+  event(20,'tests','test_started','started',{index:1});
+  event(25,'tests','test_finished','success',{index:1,exit_code:0,timed_out:false});
+  event(25,'tests','test_started','started',{index:2});
+  clockNow += 3000; await poll();
+  assert.equal(phase('Tests').label,'Tests 2/4');
+  assert.equal(phase('Tests').status,'Running');
+  assert.equal(phase('Tests').duration,8000);
+  assert.equal(document.activeElement.taskFocus,'task-one');
+  assert(walk(get('app')).find(n => n.className === 'task-row').open);
+  event(30,'tests','test_finished','success',{index:2});
+  assert.equal(phase('Tests').status,'Running', 'Two finishes cannot complete a four-test stage');
+  for (let i=3;i<=4;i++) {
+    event(30+(i-3)*5,'tests','test_started','started',{index:i});
+    event(35+(i-3)*5,'tests','test_finished','success',{index:i});
+  }
+  assert.equal(phase('Tests').status,'Passed');
+  event(40,'Codex B','review_started','started');
+  assert.equal(phase('Codex B').status,'Running');
+  event(50,'Codex B','review_process_finished','success');
+  assert.equal(phase('Codex B').status,'Waiting for Codex B');
+  assert.equal(project()[0].status,'Waiting for review');
+  // Interrupted review with passed tests never becomes approved.
+  data.controller.active=false; data.state.status='stopped';
+  event(51,'controller','stopped','failed',{reason:'invalid review verdict'});
+  await poll();
+  assert.equal(project()[0].status,'Stopped');
+  assert.equal(current().approved,false);
+  assert(!defaultText().includes('Approved'));
+  assert.equal(defaultText().split('STOPPED').length-1,1);
+  assert.equal(defaultText().split('invalid review verdict').length-1,1);
+  const firstDuration=current().duration;
+  const firstPhases=JSON.stringify(current().phases);
+  clockNow+=3600000; await poll();
+  assert.equal(current().duration,firstDuration);
+  assert.equal(JSON.stringify(current().phases),firstPhases);
+  // A second attempt after a long stopped gap has an independent clock.
+  data.state.history=[{task:'one',attempt:1,tests:[{index:1,exit_code:0,timed_out:false}],review:null,
+    feedback:'Keep every original byte <script>unsafe()</script>', custom_metadata:{unmodified:true}}];
+  data.controller.active=true; data.state.status='running';
+  event(3600,'controller','resume_started','started',{},null,null);
+  event(3601,'controller','task_started','started',{},2);
+  event(3601,'Codex A','process_started','started',{},2);
+  event(3611,'Codex A','process_finished','success',{},2);
+  event(3611,'Codex B','review_started','started',{},2);
+  event(3621,'Codex B','review_process_finished','success',{},2);
+  event(3621,'Codex B','review_finished','rejected',{},2);
+  event(3622,'controller','correction_requested','retry',{},2);
+  data.state.history.push({task:'one',attempt:2,review:{decision:'REJECTED',issues:['Original rejection'],summary:'Exact review'},feedback:'Fix original blocker'});
+  event(3623,'controller','task_started','started',{},3);
+  event(3623,'Codex A','process_started','started',{},3);
+  event(3633,'Codex A','process_finished','success',{},3);
+  event(3633,'Codex B','review_started','started',{},3);
+  event(3643,'Codex B','review_process_finished','success',{},3);
+  event(3643,'Codex B','review_finished','approved',{},3);
+  assert.equal(project()[0].status,'Running', 'B approval alone is not task completion');
+  assert.equal(phase('Codex B').status,'Approved');
+  assert.equal(phase('Codex B').duration,10000);
+  event(3643,'Git','checkpoint_started','started',{},3);
+  assert.equal(phase('Commit').status,'Running');
+  assert.equal(project()[0].status,'Running');
+  event(3645,'Git','checkpoint_committed','success',{commit:'abcdef0123456789'},3);
+  event(3645,'controller','task_completed','success',{},3);
+  data.state.completed=['one'];
+  data.state.history.push({task:'one',attempt:3,review:{decision:'APPROVED',issues:[],summary:'Exact approval'},commit:'abcdef0123456789'});
+  await poll();
+  assert.equal(project()[0].duration,51000+21000+22000);
+  assert.equal(project()[0].attempts[0].duration,firstDuration);
+  assert.equal(phase('Commit').status,'Committed locally');
+  assert.equal(phase('Push').status,'Off');
+  assert(defaultText().includes('Local commit abcdef01'));
+  assert(!defaultText().includes('Pushed to GitHub'));
+  for (const text of ['Full attempt record','custom_metadata','Keep every original byte','Exact review','Exact approval','exact-evidence.txt','Original event','abcdef0123456789','REJECTED','APPROVED']) assert(contents().includes(text),text);
+  assert(walk(get('app')).filter(n=>n.tag==='details'&&n.textContent.startsWith('Full attempt record')).every(n=>!n.open));
+  // Optional publication is distinct from committing locally; retries exclude idle.
+  data.state.auto_push={branch:'feature/ui'};
+  event(3645,'Git','push_started','started',{commit:'abcdef0123456789'},null);
+  assert.equal(phase('Push').status,'Running');
+  event(3648,'Git','push_finished','failed',{reason:'connectivity'},null);
+  data.state.status='stopped'; data.controller.active=false;
+  data.state.current_task=null;
+  assert.equal(project()[0].status,'Stopped');
+  assert.equal(project()[0].reason,'connectivity');
+  await poll();
+  assert.equal(defaultText().split('connectivity').length-1,1);
+  const beforeRetry=project()[0].duration;
+  event(7200,'controller','resume_started','started',{},null,null);
+  data.controller.active=true;
+  event(7201,'Git','push_started','started',{commit:'abcdef0123456789'},null);
+  event(7204,'Git','push_finished','success',{},null);
+  assert.equal(phase('Push').duration,6000);
+  assert.equal(project()[0].duration,beforeRetry+3000);
+  assert.equal(phase('Push').status,'Pushed to GitHub');
+  data.state.status='completed'; data.controller.active=false; data.state.current_task=null;
+  await poll();
+  const saved=structuredClone(data), savedProjection=JSON.stringify(project());
+  data={root:'different',controller:{active:false},state:null,events:[]}; await poll();
+  data=saved; clockNow+=10000000; await poll();
+  assert.equal(JSON.stringify(project()),savedProjection,'Reopened run reconstructs the same recorded stage and timings');
+  // Missing and inconsistent timestamps remain unknown, never negative.
+  data.events=data.events.map(e=>({...e,timestamp_utc:undefined}));
+  assert.equal(project()[0].duration,null);
+  assert(current().phases.every(p=>p.duration===null));
+  await poll(); assert(defaultText().includes('\u2014') || defaultText().includes(String.fromCharCode(8212)));
+  data=saved;
+  data.events[1].timestamp_utc=new Date(base+99999999).toISOString();
+  assert.equal(project()[0].attempts[0].phases[0].duration,null);
+  assert.equal(vm.runInContext('compactTime(-1)',context),String.fromCharCode(8212));
+  // Timeout has a single actionable reason and the actual last stage.
+  data={root:'timeout',task_ids:['one'],task_count:1,controller:{active:false,logs:'timeout'},
+    state:{status:'stopped',current_task:'one',completed:[],history:[]},events:[]};
+  event(0,'controller','task_started','started');
+  event(0,'Codex A','process_started','started'); event(2,'Codex A','process_finished','success');
+  event(2,'tests','test_started','started',{index:1});
+  event(12,'tests','test_finished','timed_out',{index:1,timed_out:true,exit_code:1});
+  event(12,'controller','stopped','failed',{reason:'test timeout'});
+  await poll();
+  assert.equal(phase('Tests').status,'Timed out');
+  assert.equal(phase('Tests').duration,10000);
+  assert(defaultText().includes('STOPPED at Tests: test timeout'));
+  assert.equal(defaultText().split('test timeout').length-1,1);
+  assert(!defaultText().includes('Approved'));
+  // Resume can reuse a number when the interrupted attempt never reached history.
+  data={root:'reused',controller:{active:false},state:{status:'completed',current_task:null,
+    completed:['one'],history:[{task:'one',attempt:1,review:{decision:'APPROVED'}}]},events:[]};
+  event(0,'controller','task_started','started');
+  event(0,'Codex B','review_started','started');
+  event(1000,'controller','resume_started','started',{},null,null);
+  event(1001,'controller','task_started','started');
+  event(1001,'Codex B','review_started','started');
+  event(1005,'Codex B','review_finished','approved');
+  event(1006,'controller','task_completed','success');
+  assert.equal(project()[0].attempts.length,2);
+  assert.equal(project()[0].attempts[0].approved,false,'Reused number must not approve interrupted review');
+  assert.equal(project()[0].attempts[0].duration,null,'Unfinished session cannot span resume idle time');
+  assert.equal(project()[0].attempts[1].duration,5000);
+  assert.equal(project()[0].attempts[1].approved,true);
+  // Checkpoint recovery adds only recorded active work, including live refresh.
+  data={root:'checkpoint',task_ids:['one'],controller:{active:true},
+    state:{status:'checkpointing',current_task:'one',completed:[],history:[]},events:[]};
+  event(0,'controller','task_started','started');
+  event(1,'Codex B','review_started','started');
+  event(5,'Codex B','review_finished','approved');
+  event(5,'Git','checkpoint_started','started');
+  assert.equal(project()[0].status,'Running');
+  event(7,'Git','stopped','failed',{reason:'checkpoint pending reconciliation'});
+  data.controller.active=false;
+  assert.equal(project()[0].status,'Stopped');
+  assert.equal(project()[0].reason,'checkpoint pending reconciliation');
+  assert.equal(current().approved,true, 'The original B verdict stays accessible');
+  assert.equal(project()[0].duration,7000);
+  event(3600,'controller','resume_started','started',{},null,null);
+  data.controller.active=true;
+  event(3601,'Git','checkpoint_started','started');
+  clockNow+=2000; await poll();
+  assert.equal(project()[0].duration,9000);
+  assert.equal(phase('Commit').status,'Running');
+  event(3604,'Git','checkpoint_committed','success',{commit:'abc123'});
+  assert.equal(project()[0].duration,10000);
+  assert.equal(phase('Commit').duration,5000);
+  data.state.completed=['one']; data.state.current_task=null; data.controller.active=false;
+  assert.equal(project()[0].status,'Approved');
+  const recovered=JSON.stringify(project());
+  clockNow+=1000000;
+  assert.equal(JSON.stringify(project()),recovered);
+  // Failed recovery is terminal even without a separate controller stopped event.
+  data.state.current_task='one'; data.state.completed=[];
+  event(7200,'Git','checkpoint_started','started');
+  event(7203,'Git','checkpoint_stopped','failed',{reason:'checkpoint recovery failed'});
+  assert.equal(project()[0].status,'Stopped');
+  assert.equal(project()[0].reason,'checkpoint recovery failed');
+  assert.equal(project()[0].duration,13000);
+  // A prior failure remains evidence while the next configured test runs.
+  data={root:'tests',task_ids:['one'],controller:{active:true,task_steps:[{id:'one',test_count:4}]},
+    state:{status:'running',current_task:'one',completed:[],history:[]},events:[]};
+  event(0,'controller','task_started','started');
+  event(1,'tests','test_started','started',{index:1});
+  event(2,'tests','test_finished','failed',{index:1,exit_code:1});
+  event(3,'tests','test_started','started',{index:2});
+  await poll();
+  assert.equal(phase('Tests').status,'Running');
+  assert.equal(phase('Tests').label,'Tests 2/4');
+  assert.equal(phase('Tests').failures,1);
+  assert(defaultText().includes('Tests 2/4: Running (1 earlier failed)'));
+  data={root:'',controller:{active:false},state:null,events:[]}; await poll();
+  assert.equal(contents(),'No run loaded.');
+  console.log('Tasks phase, clock, resume, review, evidence and compact-row contracts passed');
+}

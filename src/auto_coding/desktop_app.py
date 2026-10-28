@@ -106,7 +106,23 @@ progress{width:100%;height:12px;accent-color:#72adf9}
 .project-heading{overflow-wrap:anywhere;max-width:650px}
 #header-state{white-space:nowrap}
 #evidence-viewer:empty{display:none}
-/* Compact only the Overview setup; Tasks and Logs retain their spacing. */
+/* Compact Tasks rows; technical evidence stays in native expanders. */
+.task-list{padding:0;border:1px solid #536174;border-radius:12px;background:#293544}
+.task-progress{margin:0 0 10px;font-size:14px;color:#b0bccb}
+.task-row{margin:0;border-bottom:1px solid #475361;padding:8px 12px;min-width:0}
+.task-row:last-child{border-bottom:0}
+.task-row>summary{padding:2px 0;list-style-position:inside}
+.task-heading{display:inline;font-weight:600;color:#f0f3f7}
+.task-meta{font-size:13px;color:#b0bccb;margin-left:8px;font-weight:400}
+.phase-strip{display:flex;flex-wrap:wrap;gap:2px 10px;margin:3px 0 0 18px;font-size:13px;color:#b0bccb}
+.phase-strip span{max-width:100%;overflow-wrap:anywhere}
+.task-stop{font-size:13px;margin:4px 0 0 18px;color:#f5ca7b}
+.task-row .attempt{padding:10px;margin:8px 0;font-size:14px}
+.task-row .attempt h3{font-size:14px;margin:0 0 4px}
+.task-row pre{font-size:13px;padding:10px}
+.task-row .events{min-width:0;font-size:12px}
+.task-row .events th,.task-row .events td{padding:4px}
+/* Compact Overview setup. */
 #run-setup{padding:12px;margin-bottom:12px}
 #run-setup .setup-fields{grid-template-columns:minmax(0,1fr) 100px;gap:12px;margin-top:12px}
 #run-setup .launch-row{gap:12px;margin-top:12px}
@@ -278,11 +294,14 @@ const expanded = new Set();
 const controls = ['github-repo', 'connect-github', 'list-github', 'github-repositories', 'github-branch', 'select-branch', 'new-branch', 'fetch-github', 'branch-name', 'branch-base', 'branch-base-confirm', 'create-branch', 'cancel-branch', 'push-approved', 'browse-project', 'browse-plan', 'open-run', 'start', 'resume', 'attempts'];
 function detail(title, text, key) {
   const box = el('details');
+  box.detailKey = key;
   box.open = expanded.has(key);
   box.ontoggle = () => { if (box.open) expanded.add(key); else expanded.delete(key); };
   const content = el('pre', text);
   content.setAttribute('tabindex', '0');
-  box.append(el('summary', title), content);
+  const summary = el('summary', title);
+  summary.taskFocus = key;
+  box.append(summary, content);
   return box;
 }
 function message(text, error = false) {
@@ -402,8 +421,233 @@ function timelineInto(parent, events) {
   scroll.append(table);
   parent.append(scroll);
 }
+// Pure projection of durable events: no runner state or inferred review verdicts.
+function compactTime(ms) {
+  if (ms === null || !Number.isFinite(ms) || ms < 0) return '\u2014';
+  const seconds = Math.floor(ms / 1000);
+  if (seconds < 60) return seconds + 's';
+  if (seconds < 3600) return Math.floor(seconds / 60) + ':' + String(seconds % 60).padStart(2, '0');
+  return Math.floor(seconds / 3600) + ':' + String(Math.floor(seconds / 60) % 60).padStart(2, '0') + 'h';
+}
+function eventTime(event) {
+  const time = typeof event?.timestamp_utc === 'string' ? Date.parse(event.timestamp_utc) : NaN;
+  return Number.isFinite(time) ? time : null;
+}
+function spanTime(start, end) {
+  return start !== null && end !== null && end >= start ? end - start : null;
+}
+function sumTimes(values) {
+  return values.length && values.every(value => value !== null) ? values.reduce((a, b) => a + b, 0) : null;
+}
+function taskPresentation(data, now = Date.now()) {
+  const state = data.state || {}, c = data.controller || {};
+  const events = Array.isArray(data.events) ? data.events.filter(e => e && typeof e === 'object') : [];
+  const history = Array.isArray(state.history) ? state.history.filter(item => item && typeof item === 'object') : [];
+  const plan = Array.isArray(c.task_steps) ? c.task_steps : [];
+  const ids = [...new Set([...(data.task_ids || plan.map(t => t.id)), ...history.map(h => h.task),
+    ...events.map(e => e.task_id), ...(Array.isArray(state.completed) ? state.completed : []), state.current_task].filter(Boolean))];
+  return ids.map(id => {
+    const records = history.filter(h => h.task === id);
+    // Push/checkpoint recovery events can omit attempt. Associate them with the
+    // latest reached attempt, without altering their original evidence records.
+    let reachedTask = null, reachedAttempt = null;
+    const attributed = [];
+    events.forEach((event, index) => {
+      if (event.task_id) {
+        if (event.task_id !== reachedTask) reachedAttempt = null;
+        reachedTask = event.task_id;
+        if (event.attempt != null) reachedAttempt = event.attempt;
+      }
+      if ((event.task_id || (event.event === 'stopped' ? reachedTask : null)) === id) {
+        attributed.push({event, index, number:event.attempt ?? reachedAttempt ?? records.at(-1)?.attempt ?? 1});
+      }
+    });
+    const groups = [];
+    attributed.forEach(entry => {
+      if (!groups.length || entry.event.event === 'task_started' || groups.at(-1).number !== entry.number) {
+        groups.push({number:entry.number, entries:[], record:null});
+      }
+      groups.at(-1).entries.push(entry);
+    });
+    records.forEach(record => {
+      // An interrupted session can reuse an attempt number on Resume. Its
+      // eventual history record belongs only to the last matching session.
+      const number = record.attempt ?? 1;
+      const group = groups.filter(g => g.number === number && !g.record).at(-1);
+      if (group) group.record = record;
+      else groups.push({number, entries:[], record});
+    });
+    groups.sort((a, b) => Number(a.number) - Number(b.number));
+    const attempts = groups.map(({number, entries, record}, session) => {
+      const own = entries.map(e => e.event);
+      const lastIndex = entries.at(-1)?.index ?? -1;
+      const live = c.active === true && !c.uncertain && session === groups.length - 1
+        && !events.slice(lastIndex + 1).some(e => ['resume_started', 'stopped', 'task_started'].includes(e.event))
+        && own.length > 0 && !['stopped', 'checkpoint_stopped', 'correction_requested', 'task_completed'].includes(own.at(-1)?.event)
+        && (state.current_task === id || ['push_started', 'checkpoint_started'].includes(own.at(-1)?.event));
+      const phaseFor = e => e.actor === 'Codex A' ? 'Codex A' : String(e.event || '').startsWith('test_') ? 'Tests'
+        : e.actor === 'Codex B' ? 'Codex B' : String(e.event || '').startsWith('checkpoint_') ? 'Commit'
+        : String(e.event || '').startsWith('push_') ? 'Push' : null;
+      const terminal = e => ['stopped', 'checkpoint_stopped', 'correction_requested', 'task_completed'].includes(e.event);
+      const decision = record?.review?.decision || own.filter(e => e.event === 'review_finished').at(-1)?.outcome;
+      const approved = String(decision || '').toLowerCase() === 'approved';
+      const tests = Array.isArray(record?.tests) ? record.tests.filter(t => t && typeof t === 'object') : [];
+      const phases = ['Codex A', 'Tests', 'Codex B', 'Commit', 'Push'].map(name => {
+        const relevant = own.filter(e => phaseFor(e) === name);
+        let status = 'Waiting', open = null;
+        const intervals = [];
+        let missing = false;
+        own.forEach(e => {
+          if (phaseFor(e) === name) {
+            if (String(e.event || '').endsWith('_started')) {
+              if (open) { intervals.push(null); }
+              open = e; status = 'Running';
+            } else if (String(e.event || '').endsWith('_finished') || e.event === 'checkpoint_committed') {
+              // review_process_finished ends work, but success is not a verdict.
+              if (open) { intervals.push(spanTime(eventTime(open), eventTime(e))); open = null; }
+              else if (e.event !== 'review_finished') missing = true;
+              status = e.outcome === 'timed_out' ? 'Timed out' : ['failed', 'rejected'].includes(e.outcome) ? 'Failed'
+                : name === 'Codex B' ? (e.event === 'review_finished' && e.outcome === 'approved' ? 'Approved' : 'Waiting for Codex B')
+                : name === 'Push' ? 'Pushed to GitHub' : name === 'Commit' ? 'Committed locally' : 'Passed';
+            }
+          }
+          if (open && terminal(e)) { intervals.push(spanTime(eventTime(open), eventTime(e))); open = null; status = 'Stopped'; }
+        });
+        if (open) {
+          intervals.push(live ? spanTime(eventTime(open), now) : null);
+          if (!live) status = 'Interrupted';
+        }
+        if (!relevant.length) {
+          if (name === 'Codex B') status = approved ? 'Approved' : 'Review not recorded';
+          if (name === 'Codex A' && record?.a_exit != null) status = record.a_timed_out ? 'Timed out' : record.a_exit === 0 ? 'Passed' : 'Failed';
+          if (name === 'Tests' && tests.length) status = tests.some(t => t.timed_out) ? 'Timed out' : tests.some(t => t.exit_code !== 0) ? 'Failed' : 'Passed';
+        }
+        if (name === 'Codex B' && decision) status = approved ? 'Approved' : 'Rejected';
+        if (name === 'Commit' && record?.commit) status = 'Committed locally';
+        const configured = plan.find(t => t.id === id)?.test_count;
+        if (name === 'Tests' && configured === 0 && !relevant.length) status = 'Not configured';
+        const started = relevant.filter(e => e.event === 'test_started');
+        const currentTest = started.at(-1)?.metadata?.index;
+        const total = configured ?? relevant.find(e => Number.isInteger(e.metadata?.total))?.metadata.total;
+        const label = name === 'Tests' && currentTest ? 'Tests ' + currentTest + (Number.isInteger(total) ? '/' + total : '') : name;
+        if (name === 'Tests' && relevant.length) {
+          const finished = relevant.filter(e => e.event === 'test_finished');
+          const failed = finished.find(e => ['failed', 'timed_out'].includes(e.outcome));
+          const advanced = own.some(e => ['Codex B', 'Commit'].includes(phaseFor(e)));
+          if (open && live) status = 'Running';
+          else if (failed) status = failed.outcome === 'timed_out' ? 'Timed out' : 'Failed';
+          else if (!advanced && (!Number.isInteger(total) || finished.length < total) && !['Stopped', 'Interrupted'].includes(status)) status = live ? 'Running' : 'Incomplete';
+        }
+        if (name === 'Push' && !relevant.length) status = state.auto_push == null
+          ? (state.auto_push === null ? 'Off' : 'Not recorded') : state.auto_push === false ? 'Off' : 'Waiting';
+        const failures = name === 'Tests' ? relevant.filter(e => e.event === 'test_finished' && ['failed', 'timed_out'].includes(e.outcome)).length : 0;
+        return {name, label, status, failures, duration:missing ? null : sumTimes(intervals)};
+      });
+      // Sum active sessions and recovery intervals. A resume is a boundary,
+      // never evidence of work throughout the preceding stopped interval.
+      const intervals = [];
+      const entryIndexes = new Set(entries.map(entry => entry.index));
+      let activeStart = null, recovery = false;
+      const close = end => {
+        intervals.push(spanTime(eventTime(activeStart), eventTime(end)));
+        activeStart = null;
+      };
+      events.forEach((e, index) => {
+        if (activeStart && ['resume_started', 'task_started'].includes(e.event)) {
+          intervals.push(null); activeStart = null;
+        }
+        if (!entryIndexes.has(index)) return;
+        if (e.event === 'task_started') { activeStart = e; recovery = false; }
+        else if (!activeStart && String(e.event || '').endsWith('_started') && phaseFor(e)) {
+          activeStart = e; recovery = true;
+        }
+        if (activeStart && (terminal(e) || recovery && ['checkpoint_committed', 'push_finished'].includes(e.event))) close(e);
+      });
+      if (activeStart) intervals.push(live ? spanTime(eventTime(activeStart), now) : null);
+      const duration = sumTimes(intervals);
+      const commit = record?.commit || own.filter(e => e.event === 'checkpoint_committed').at(-1)?.metadata?.commit;
+      const stop = own.filter(e => e.event === 'stopped').at(-1);
+      return {number, session, record, decision, events:own, phases, duration, approved, commit, live, stop};
+    });
+    const current = attempts.at(-1);
+    const last = current?.events.at(-1);
+    const publicationFailure = last?.event === 'push_finished' && last.outcome === 'failed';
+    const publicationPending = state.publication?.task === id && state.publication?.outcome === 'pending'
+      && state.publication?.error_code && current?.phases.find(p => p.name === 'Push')?.status !== 'Pushed to GitHub';
+    const stopped = ['stopped', 'checkpoint_stopped'].includes(last?.event) || publicationFailure
+      || c.active === false && (publicationPending || ['stopped', 'running', 'checkpointing'].includes(state.status) && state.current_task === id);
+    const lastStage = current?.phases.filter(p => !['Waiting', 'Review not recorded', 'Not configured', 'Not recorded', 'Off'].includes(p.status)).at(-1)?.name;
+    // B's verdict is evidence of review only. Completion requires a checkpoint.
+    const committed = current?.commit || (state.completed || []).includes(id);
+    const status = stopped ? 'Stopped' : current?.live
+      ? (current.phases.find(p => p.name === 'Codex B')?.status === 'Waiting for Codex B' ? 'Waiting for review' : 'Running')
+      : committed && current?.approved ? 'Approved' : attempts.length ? 'Waiting for review' : 'Waiting';
+    const reason = stopped ? (publicationFailure ? last.metadata?.reason : null)
+      || (publicationPending ? state.publication.error_code : null)
+      || (last?.event === 'checkpoint_stopped' ? last.metadata?.reason : null) || current?.stop?.metadata?.reason
+      || (current?.record?.error ? 'Attempt failed. Open Error (original) for details.' : null)
+      || (c.error ? 'Runner stopped. Open run diagnostics for details.' : 'Run interrupted.') : null;
+    return {id, attempts, current, status, lastStage, reason, duration:sumTimes(attempts.map(a => a.duration))};
+  });
+}
+function renderTasks(parent, data, focusedKey) {
+  const tasks = taskPresentation(data);
+  const total = data.task_count ?? data.controller?.task_count;
+  parent.append(el('p', (data.state?.completed?.length ?? 0) + ' / ' + (total ?? 'Unknown') + ' completed', 'task-progress'));
+  const list = el('section', undefined, 'task-list');
+  list.setAttribute('aria-label', 'Plan tasks');
+  tasks.forEach(task => {
+    const row = el('details', undefined, 'task-row');
+    const key = 'task-' + task.id;
+    row.detailKey = key;
+    row.open = expanded.has(key);
+    row.ontoggle = () => { if (row.open) expanded.add(key); else expanded.delete(key); };
+    const summary = el('summary');
+    summary.taskFocus = key;
+    summary.append(el('span', task.id, 'task-heading'), el('span', task.status, task.status === 'Approved' ? 'task-meta green' : 'task-meta'));
+    summary.append(el('span', task.attempts.length + ' attempt' + (task.attempts.length === 1 ? '' : 's') + ' | Total ' + compactTime(task.duration), 'task-meta'));
+    const current = task.current;
+    if (current?.commit) summary.append(el('span', 'Local commit ' + current.commit.slice(0, 8), 'task-meta'));
+    const strip = el('div', undefined, 'phase-strip');
+    (current?.phases || ['Codex A','Tests','Codex B','Commit','Push'].map(name => ({name, label:name, status:name === 'Push' && data.state?.auto_push === null ? 'Off' : 'Waiting', duration:null}))).forEach(phase => {
+      strip.append(el('span', phase.label + (phase.status === 'Off' ? ' off' : ': ' + phase.status) + (phase.failures && phase.status === 'Running' ? ' (' + phase.failures + ' earlier failed)' : '') + (phase.duration !== null ? ' ' + compactTime(phase.duration) : ' | \u2014')));
+    });
+    summary.append(strip);
+    if (current && task.attempts.length > 1) summary.append(el('span', 'Current attempt ' + current.number + ' | ' + compactTime(current.duration), 'task-meta'));
+    if (task.reason) summary.append(el('div', 'STOPPED' + (task.lastStage ? ' at ' + task.lastStage : '') + ': ' + task.reason + ' | Check evidence, then Resume.', 'task-stop'));
+    row.append(summary);
+    task.attempts.forEach(attempt => {
+      const item = attempt.record;
+      const decision = attempt.decision;
+      const section = el('section', undefined, 'attempt ' + (decision === 'APPROVED' ? 'approved' : decision === 'REJECTED' ? 'rejected' : ''));
+      section.append(el('h3', 'Attempt ' + attempt.number + ' | ' + compactTime(attempt.duration) + ' | Codex B: ' + (decision || 'Review not recorded')));
+      if (attempt.commit) section.append(el('p', 'Local commit: ' + attempt.commit, 'path green'));
+      (Array.isArray(item?.tests) ? item.tests.filter(t => t && typeof t === 'object') : []).forEach(test => section.append(el('p', 'Test ' + test.index + ': exit ' + (test.exit_code ?? 'unknown') + ', timed out: ' + (test.timed_out ?? 'unknown'))));
+      const attemptKey = key + '-' + attempt.number + '-' + attempt.session;
+      if (item?.feedback) section.append(detail('Feedback (original)', item.feedback, attemptKey + '-feedback'));
+      if (item?.error) section.append(detail('Error (original)', item.error, attemptKey + '-error'));
+      if (item?.review) section.append(detail('Codex B summary and verdict (original)', JSON.stringify(item.review, null, 2), attemptKey + '-verdict'));
+      if (item) section.append(detail('Full attempt record', JSON.stringify(item, null, 2), attemptKey + '-record'));
+      const timing = detail('Step timing and original events / evidence', JSON.stringify(attempt.phases, null, 2), attemptKey + '-events');
+      timelineInto(timing, attempt.events);
+      section.append(timing);
+      row.append(section);
+    });
+    list.append(row);
+  });
+  if (!tasks.length) list.append(el('p', 'No task records available.', 'task-progress'));
+  const evidence = detail('All run evidence files', 'Original files for this selected run.', 'task-files');
+  filesInto(evidence, data.files || []);
+  if (data.controller?.error) evidence.append(detail('Run diagnostics (original snapshot)', JSON.stringify({error:data.controller.error, exit_code:data.controller.exit_code, process_history:data.controller.process_history}, null, 2), 'task-diagnostics'));
+  parent.append(list, evidence);
+  const restore = node => {
+    if (focusedKey && node.taskFocus === focusedKey) node.focus();
+    Array.from(node.children || []).forEach(restore);
+  };
+  restore(parent);
+}
 function render(data) {
-  evidenceViewer.hidden = page !== 'logs';
+  evidenceViewer.hidden = page === 'overview';
   document.getElementById('logs-message').hidden = page === 'overview';
   document.getElementById('header-context').hidden = page === 'overview';
   document.getElementById('dashboard-header').className = 'top' + (page === 'overview' ? ' overview-top' : '');
@@ -425,7 +669,7 @@ function render(data) {
       && ![...(c.github?.local || []), ...(c.github?.remote || []).map(name => name.replace(/^origin\//, ''))].includes(preferences.branch)) {
     document.getElementById('preferences-notice').textContent = 'Saved branch is unavailable. Fetch branches or choose another feature branch.';
   }
-  const key = page + JSON.stringify(data);
+  const key = page + JSON.stringify(data) + (page === 'tasks' && c.active === true ? Math.floor(Date.now() / 1000) : '');
   updateControls();
   if (runPresentation(data).label === 'Completed' && document.getElementById('message').textContent.startsWith('Launch accepted.')) message('');
   if (renderKey === key) return;
@@ -524,12 +768,24 @@ function render(data) {
   badge.className = 'pill ' + presentation.color;
   if (presentation.label === 'Completed' && document.getElementById('message').textContent.startsWith('Launch accepted.')) message('');
   updateControls();
+  // Read native state before replacing nodes: toggle events can be delivered
+  // after a snapshot refresh, especially when navigating with the keyboard.
+  if (evidenceRoot === data.root && page === 'tasks') {
+    const remember = node => {
+      if (node.detailKey) {
+        if (node.open) expanded.add(node.detailKey); else expanded.delete(node.detailKey);
+      }
+      Array.from(node.children || []).forEach(remember);
+    };
+    remember(app);
+  }
   if (evidenceRoot !== data.root) {
     evidenceViewer.replaceChildren();
     exportResult = null;
     expanded.clear();
     evidenceRoot = data.root;
   }
+  const taskFocus = document.activeElement?.taskFocus;
   app.replaceChildren();
   if (page === 'overview') {
     const state = data.state || {};
@@ -601,11 +857,11 @@ function render(data) {
   }
   if (!c.logs && !data.root) {
     if (page !== 'overview') {
-      const empty = el('section', undefined, 'empty');
-      empty.append(el('p', page === 'tasks' ? 'No task history yet. Start or open a run.' : 'No run evidence yet. Start or open a run.'));
+      const empty = el('section', undefined, page === 'tasks' ? 'muted' : 'empty');
+      empty.append(el('p', page === 'tasks' ? 'No run loaded.' : 'No run evidence yet. Start or open a run.'));
       const setup = el('button', 'Go to run setup');
       setup.onclick = () => navigate('overview');
-      empty.append(setup);
+      if (page !== 'tasks') empty.append(setup);
       app.append(empty);
     }
     if (c.error) app.append(el('div', c.error, 'warning'));
@@ -613,41 +869,17 @@ function render(data) {
   }
   const state = data.state || {};
   const events = data.events || [];
-  const history = Array.isArray(state.history) ? state.history.filter(item => item && typeof item === 'object') : [];
-  const completed = Array.isArray(state.completed) ? state.completed : null;
   const reconciled = presentation.label === 'Completed' || c.active === false && !c.uncertain && state.status === 'checkpointing';
-  if (c.error && !reconciled) app.append(el('div', c.error, 'notice warning'));
+  if (page !== 'tasks' && c.error && !reconciled) app.append(el('div', c.error, 'notice warning'));
   if (data.state_error) app.append(el('div', data.state_error, 'warning'));
-  if (data.empty) app.append(el('div', 'No run state or events found. Select a project and plan to START, or inspect available raw files in Logs.', 'empty'));
+  if (data.empty && page !== 'tasks') app.append(el('div', 'No run state or events found. Select a project and plan to START, or inspect available raw files in Logs.', 'empty'));
   if (c.logs && !data.exists && !data.state_error) app.append(el('div', 'Log directory is missing or unavailable.', 'warning'));
-  if (state.pending_checkpoint) app.append(el('div', 'A checkpoint is pending reconciliation. No completion is inferred.', 'warning'));
-  if (state.auto_push && page !== 'overview') app.append(el('div', 'This run automatically pushes approved tasks to origin/' + state.auto_push.branch + '. Resume preserves this setting.', 'notice'));
-  if (state.publication?.outcome === 'pending') app.append(el('div', 'Approved locally, push pending. Resolve connectivity or permissions, then use Resume (Retry Push). The same SHA is retried before any further tasks; Codex is not rerun for the approved task. Remote divergence requires manual review.', 'warning'));
+  if (state.pending_checkpoint && page !== 'tasks') app.append(el('div', 'A checkpoint is pending reconciliation. No completion is inferred.', 'warning'));
+  if (state.auto_push && page === 'logs') app.append(el('div', 'This run automatically pushes approved tasks to origin/' + state.auto_push.branch + '. Resume preserves this setting.', 'notice'));
+  if (state.publication?.outcome === 'pending' && page !== 'tasks') app.append(el('div', 'Approved locally, push pending. Resolve connectivity or permissions, then use Resume (Retry Push). The same SHA is retried before any further tasks; Codex is not rerun for the approved task. Remote divergence requires manual review.', 'warning'));
   if (page === 'logs') (data.event_errors || []).forEach(error => app.append(el('div', error, 'warning')));
   if (page === 'tasks') {
-    const tasks = panel('Tasks and attempt history');
-    tasks.append(el('div', 'Current task: ' + (state.current_task || 'No task in progress'), 'value'));
-    const row = el('div', undefined, 'tasks');
-    (completed || []).forEach(task => row.append(el('span', task, 'pill green')));
-    if (!completed?.length) row.append(el('span', 'No completed tasks recorded', 'muted'));
-    tasks.append(row);
-    if (!history.length) tasks.append(el('p', 'No completed attempts recorded yet. Live test/review activity appears in Logs.', 'muted'));
-    history.forEach((item, index) => {
-      const decision = item.review && item.review.decision;
-      const outcome = String(decision || '').toLowerCase();
-      const attempt = el('section', undefined, 'attempt ' + (outcome === 'approved' ? 'approved' : outcome === 'rejected' ? 'rejected' : ''));
-      const verdict = el('div', decision || 'Review not recorded', 'pill ' + (outcome === 'approved' ? 'green' : outcome === 'rejected' ? 'red' : 'muted'));
-      attempt.append(verdict);
-      if (item.commit) attempt.append(el('p', 'Local commit: ' + item.commit, 'path green'));
-      attempt.append(el('h3', (item.task || 'Unknown task') + ' | Attempt ' + (item.attempt ?? 'unknown') + ' | Codex B: ' + (decision || 'No verdict recorded')));
-      (Array.isArray(item.tests) ? item.tests : []).filter(test => test && typeof test === 'object').forEach(test => attempt.append(el('p', 'Test ' + test.index + ': exit ' + (test.exit_code ?? 'unknown') + ', timed out: ' + (test.timed_out ?? 'unknown'))));
-      if (item.feedback) attempt.append(detail('Feedback (original)', item.feedback, 'feedback-' + index));
-      if (item.error) attempt.append(detail('Error (original)', item.error, 'error-' + index));
-      if (item.review) attempt.append(detail('Codex B summary and verdict (original)', JSON.stringify(item.review, null, 2), 'verdict-' + index));
-      attempt.append(detail('Full attempt record', JSON.stringify(item, null, 2), 'attempt-' + index));
-      tasks.append(attempt);
-    });
-    app.append(tasks);
+    renderTasks(app, data, taskFocus);
   } else {
     if (c.exit_code != null || c.error || c.process_history?.length) app.append(detail('Process history - prior exits and diagnostics', JSON.stringify({previous_child_exit_code:c.exit_code, diagnostic:c.error, history:c.process_history || [], note:'Historical process results do not replace the current durable run outcome.'}, null, 2), 'process-history'));
     const timeline = panel('Durable event timeline');
@@ -1076,6 +1308,7 @@ class Bridge:
                     try:
                         tasks, plan_sha = load_tasks(Path(paths["plan"]))
                         status["task_count"] = len(tasks)
+                        status["task_steps"] = [{"id": t["id"], "test_count": len(t["test_commands"])} for t in tasks]
                     except Exception as exc:
                         errors["plan"] = str(exc)
                 state = read_run(self._root).get("state") if self._root else None
@@ -1083,6 +1316,7 @@ class Bridge:
                     # A newly selected plan cannot supply counts for a different
                     # inspected run. Prefer its durable manifest or Unknown.
                     status.pop("task_count", None)
+                    status.pop("task_steps", None)
                 status["validation_errors"] = errors
                 status["preflight"] = self._controller.preflight()
                 status["start_ready"] = bool(

@@ -335,6 +335,21 @@ class DesktopBridgeTests(unittest.TestCase):
         self.assertFalse(bridge.resume()["ok"])
         popen.assert_not_called()
 
+    def test_task_steps_only_come_from_the_matching_saved_plan(self):
+        self.plan = self.root / "plan.json"
+        self.plan.write_text(json.dumps({"tasks":[
+            {"id":"one", "prompt":"First", "test_commands":[["fake-test"], ["fake-check"]]},
+            {"id":"two", "prompt":"Second"}]}), encoding="utf-8")
+        self.bridge.open_run(str(self.logs))
+        self.bridge.select_plan(str(self.plan))
+        state = {"plan_sha256":hashlib.sha256(self.plan.read_bytes()).hexdigest()}
+        (self.logs / "state.json").write_text(json.dumps(state))
+        self.assertEqual(self.bridge.snapshot()["controller"]["task_steps"],
+                         [{"id":"one", "test_count":2}, {"id":"two", "test_count":0}])
+        state["plan_sha256"] = "different-plan"
+        (self.logs / "state.json").write_text(json.dumps(state))
+        self.assertNotIn("task_steps", self.bridge.snapshot()["controller"])
+
     def test_native_enum_and_legacy_constants(self):
         for module in (SimpleNamespace(FileDialog=SimpleNamespace(OPEN=10, FOLDER=20)),
                        SimpleNamespace(OPEN_DIALOG=10, FOLDER_DIALOG=20)):
