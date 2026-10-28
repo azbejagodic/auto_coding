@@ -10,7 +10,7 @@ from auto_coding.desktop_reader import read_run, read_evidence
 from auto_coding.desktop_control import DesktopController
 from auto_coding.desktop_settings import DesktopSettings, clean_preferences
 from auto_coding.simple_run import load_tasks
-from auto_coding.debug_export import export_debug, WARNING
+from auto_coding.debug_export import export_debug, export_run, WARNING
 
 
 HTML = r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Auto-Coding</title><style>
@@ -103,6 +103,14 @@ pre{font:14px/1.6 Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere
 .run-row .run-label{flex:1;min-width:180px}
 .run-row details{width:100%;margin:0}
 .run-row button{padding:6px 12px}
+.run-download{width:145px;flex:none;background:#8bc3ff;border-color:#b8dbff;color:#10283f;font-weight:700}
+.run-download:hover:enabled{background:#b8dbff}
+.run-label small{display:block}
+.run-result{width:100%}
+.run-list{max-height:65vh;overflow-y:auto}
+.logs-top #header-context .label,.logs-top #selected-project{display:none}
+.logs-top>div:last-child{display:flex;align-items:center;gap:12px}
+.logs-top #refresh{margin-top:0!important}
 .activity-row{border-top:1px solid #536174;margin:0;font-size:14px}
 .activity-row>summary{padding:6px 0}
 .logs-status p{margin:6px 0}
@@ -234,7 +242,6 @@ progress{width:100%;height:12px;accent-color:#72adf9}
 <details id="secondary-controls">
 <summary>Repository tools and preflight diagnostics</summary>
 <div class="controls">
-<button id="open-run">Open Run</button>
 <button id="list-github">My repositories</button>
 <select id="github-repositories" aria-label="Authenticated repositories" hidden></select>
 </div>
@@ -251,9 +258,13 @@ progress{width:100%;height:12px;accent-color:#72adf9}
 <summary>Preflight diagnostics</summary>
 <p class="muted">Start and Resume require native confirmation. Local Codex CLI authentication is required. Closing this window leaves the runner alive.</p>
 <pre id="preflight-details" tabindex="0" aria-label="Preflight diagnostics"></pre>
+<div id="lock-recovery"></div>
 <div id="run-folder" class="path muted"></div>
 </details>
 </details>
+</section>
+<section id="run-selection" hidden aria-label="Saved run selection">
+<button id="open-run">Open Run</button>
 </section>
 <div id="logs-message" class="notice" role="status" aria-live="polite" hidden></div>
 <div id="evidence-viewer">
@@ -276,9 +287,7 @@ function panel(title) {
   p.append(el('h2', title));
   return p;
 }
-let logQuery = '';
 let recentRuns = {runs:[]};
-let exportResult = null;
 function runPresentation(data) {
   const c = data.controller || {}, state = data.state || {};
   if (c.uncertain || (c.active !== false && c.active !== true)) return {label:'Unknown child status', color:'amber'};
@@ -673,12 +682,10 @@ function renderTasks(parent, data, focusedKey) {
   restore(parent);
 }
 function render(data) {
-  evidenceViewer.hidden = page === 'overview';
+  evidenceViewer.hidden = page !== 'tasks';
   document.getElementById('logs-message').hidden = page === 'overview';
-  document.getElementById('header-context').hidden = page !== 'tasks';
-  document.getElementById('dashboard-header').className = 'top' + (page === 'overview' ? ' overview-top' : '');
-  const searchFocused = document.activeElement?.id === 'log-search';
-  const searchCursor = searchFocused ? document.activeElement.selectionStart : null;
+  document.getElementById('header-context').hidden = page === 'overview';
+  document.getElementById('dashboard-header').className = 'top' + (page === 'overview' ? ' overview-top' : page === 'logs' ? ' logs-top' : '');
   latest = data;
   const c = data.controller || {};
   const preferences = data.preferences || {};
@@ -793,8 +800,19 @@ function render(data) {
   if (statusLine && (diagnostics.includes(document.getElementById('message').textContent)
       || document.getElementById('message').textContent === statusLine)) message('');
   document.getElementById('preflight-details').textContent = JSON.stringify({branch:git.branch, clean:git.clean, start_ready:c.start_ready, resume_ready:c.resume_ready, diagnostics}, null, 2);
+  const recovery = document.getElementById('lock-recovery');
+  recovery.replaceChildren();
+  (git.locks || []).forEach(lock => {
+    if (!lock.recoverable) return;
+    const suffix = lock.path?.endsWith('.job.lock') ? '.job.lock' : '.lock';
+    const button = el('button', 'Archive verified completed lock');
+    button.disabled = busy || !ready || c.active !== false || c.uncertain;
+    button.onclick = () => historyAction('recover_workspace_lock', suffix);
+    recovery.append(button);
+  });
   document.getElementById('run-setup').hidden = page !== 'overview';
-  document.getElementById('logs-tools').hidden = page !== 'logs';
+  document.getElementById('run-selection').hidden = page !== 'tasks';
+  document.getElementById('logs-tools').hidden = page !== 'tasks';
   const badge = document.getElementById('header-state');
   badge.textContent = presentation.label;
   badge.className = 'pill ' + presentation.color;
@@ -813,7 +831,6 @@ function render(data) {
   }
   if (evidenceRoot !== data.root) {
     evidenceViewer.replaceChildren();
-    exportResult = null;
     expanded.clear();
     evidenceRoot = data.root;
   }
@@ -839,84 +856,34 @@ function render(data) {
     return;
   }
   if (page === 'logs') {
-    const selected = panel('Selected run');
-    selected.className += ' logs-status';
-    selected.append(el('p', 'Run status: ' + presentation.label));
-    if (data.root || c.logs) {
-      const state = data.state || {};
-      selected.append(el('p', [state.branch || state.auto_push?.branch || 'Branch not recorded',
-        (state.completed?.length ?? 'Unknown') + ' / ' + (data.task_count ?? c.task_count ?? 'Unknown') + ' completed'].join(' · ')));
-      const failure = [...(data.events || [])].reverse().find(event => event.metadata?.reason
-        && (['stopped', 'checkpoint_stopped'].includes(event.event) || ['failed', 'timed_out', 'error'].includes(event.outcome)));
-      const stopped = c.active !== true && (['stopped', 'checkpointing'].includes(state.status)
-        || state.pending_checkpoint || state.publication?.outcome === 'pending');
-      if (stopped && failure) selected.append(el('p', 'Stop reason: ' + failure.metadata.reason, 'red'));
-      if (statusLine) selected.append(el('p', statusLine, 'warning'));
-      selected.append(detail('Run details', JSON.stringify({path:data.root || c.logs, state:data.state,
-        controller:c, task_count:data.task_count}, null, 2), 'selected-run'));
-    } else selected.append(el('p', 'No run selected.', 'muted'));
-    app.append(selected);
-    const library = panel('Recent runs');
-    const importRun = el('button', 'Open / Import run folder');
-    importRun.disabled = busy || !ready || c.active !== false || c.uncertain;
-    importRun.onclick = () => act('open_run');
-    library.append(importRun);
-    if (recentRuns.error) library.append(el('p', recentRuns.error, 'warning'));
-    if (!recentRuns.runs.length) library.append(el('p', 'No saved runs found. Start a run or explicitly import an older run folder. Only managed runs and folders you open are listed.', 'muted'));
-    [...recentRuns.runs].sort((a, b) => (Date.parse(b.time) || 0) - (Date.parse(a.time) || 0)).forEach(run => {
+    const runs = [...recentRuns.runs];
+    const current = data.root || c.logs;
+    if (current && !runs.some(run => run.path === current)) runs.push({path:current,
+      plan_filename:(c.plan || '').split(/[\\/]/).pop(), run_id:current.split(/[\\/]/).pop(),
+      status:c.active !== false || c.uncertain ? 'running' : data.state?.status || 'unknown'});
+    runs.sort((a, b) => (Date.parse(b.time) || 0) - (Date.parse(a.time) || 0));
+    const list = el('div', undefined, 'run-list');
+    list.setAttribute('aria-label', 'Run downloads');
+    if (!runs.length) list.append(el('p', 'No saved runs found.', 'muted'));
+    runs.forEach(run => {
       const row = el('section', undefined, 'run-row');
-      row.append(el('span', [run.time || 'Time not recorded', run.branch || 'Branch not recorded',
-        run.completed == null ? 'Completed tasks not recorded' : run.completed + ' / ' + (run.total ?? 'Unknown') + ' completed',
-        'Status: ' + run.status].join(' · '), 'run-label'));
-      const open = el('button', 'Open / View');
-      open.disabled = busy || !ready || c.active !== false || c.uncertain || run.status === 'missing';
-      open.onclick = () => historyAction('open_recent_run', run.path);
-      const forget = el('button', 'Forget history entry');
-      forget.disabled = busy || !ready;
-      forget.onclick = () => historyAction('forget_run', run.path);
-      const full = detail('Details', JSON.stringify(run, null, 2), 'run-' + run.path);
-      full.append(el('p', 'Runs and logs are kept until you deliberately delete them. Forget removes only the history entry; log files stay on disk.', 'muted'), forget);
-      row.append(open, full); library.append(row);
+      const label = el('div', undefined, 'run-label');
+      label.append(el('span', run.plan_filename || 'Run ' + (run.run_id || '').replace(/^run-/, '').slice(0, 8)));
+      const active = ['running', 'unknown'].includes(run.status)
+        || run.path === current && (c.active !== false || c.uncertain);
+      const state = {completed:'Completed', stopped:'Stopped', running:'Running', unknown:'Status unknown', unavailable:'Status unavailable', missing:'Unavailable'}[run.status] || 'Stopped';
+      label.append(el('small', active ? state + ' - Available when run stops' : state + (run.time ? ' - ' + run.time.slice(0, 10) : ''), 'muted'));
+      const download = el('button', 'Download ZIP', 'primary run-download');
+      download.disabled = busy || !ready || active || run.status === 'missing';
+      download.onclick = () => downloadRun(run.path);
+      row.append(label, download);
+      if (runDownloads[run.path]) row.append(el('small', runDownloads[run.path], 'run-result'));
+      list.append(row);
     });
-    app.append(library);
-  }
-  if (page === 'logs') {
-    const exports = disclosure('Download Logs / Export Debug Package', 'exports', 'panel');
-    exports.append(el('p', 'Inspect before sharing every ZIP. Run identifiers and filenames may be private.', 'warning'));
-    exports.append(el('p', 'DEBUG REPORT (recommended default): bounded structured state, timeline, test results and review decisions plus inventory. Prompts, output and free-form review text are omitted. This is not a guarantee of perfect redaction.'));
-    exports.append(el('p', 'FULL RAW LOGS: allowed files from this run only; prompts, review text and subprocess output may contain private data/API keys. Requires an extra native confirmation.', 'warning'));
-    [['standard', 'Export DEBUG REPORT (default)'], ['raw', 'Export FULL RAW LOGS']].forEach(([mode, label]) => {
-      const button = el('button', label);
-      button.disabled = busy || !ready || !data.root || !data.exists;
-      button.onclick = () => exportLogs(mode);
-      exports.append(button);
-    });
-    if (!data.root || !data.exists) exports.append(el('p', 'Select an available run using Open / View or Open / Import run folder to export.'));
-    if (exportResult) {
-      exports.append(el('pre', exportResult));
-      if (window.pywebview.api.open_export_folder) {
-        const folder = el('button', 'Open export destination folder');
-        folder.disabled = busy || !ready;
-        folder.onclick = async () => {
-          const result = await window.pywebview.api.open_export_folder();
-          if (!result.ok) message(result.error, true);
-        };
-        exports.append(folder);
-      }
-    }
-    app.append(exports);
-  }
-  if (page === 'logs') {
-    for (const lock of c.preflight?.locks || []) {
-      const entry = detail(lock.message, lock.path + '\n' + lock.instructions, 'workspace-lock-' + lock.path);
-      if (lock.recoverable) {
-        const recover = el('button', 'Archive verified completed lock');
-        recover.disabled = busy || !ready || c.active !== false || c.uncertain;
-        recover.onclick = () => historyAction('recover_workspace_lock', lock.path.endsWith('.job.lock') ? '.job.lock' : '.lock');
-        entry.append(recover);
-      }
-      app.append(entry);
-    }
+    app.append(list);
+    if (runs.length) app.append(el('small', 'ZIPs can contain private prompts, code and output. Share carefully.', 'muted'));
+    if (recentRuns.error) app.append(el('small', recentRuns.error, 'warning'));
+    return;
   }
   if (!c.logs && !data.root) {
     if (page !== 'overview') {
@@ -943,55 +910,6 @@ function render(data) {
   if (page === 'logs') (data.event_errors || []).forEach(error => app.append(el('div', error, 'warning')));
   if (page === 'tasks') {
     renderTasks(app, data, taskFocus);
-  } else {
-    if (c.exit_code != null || c.error || c.process_history?.length) app.append(detail('Process history - prior exits and diagnostics', JSON.stringify({previous_child_exit_code:c.exit_code, diagnostic:c.error, history:c.process_history || [], note:'Historical process results do not replace the current durable run outcome.'}, null, 2), 'process-history'));
-    const timeline = panel('Recent activity');
-    const filters = el('div', undefined, 'filters');
-    const label = el('label', 'Search actor, outcome or event');
-    const search = el('input'); search.id = 'log-search'; search.setAttribute('type', 'search'); search.setAttribute('aria-label', 'Search actor, outcome or event');
-    search.value = logQuery;
-    label.append(search); filters.append(label); timeline.append(filters);
-    const results = el('div');
-    const draw = () => {
-      results.replaceChildren();
-      const query = logQuery.toLowerCase();
-      const filtered = events.filter(event => JSON.stringify(event).toLowerCase().includes(query));
-      results.append(el('p', filtered.length + ' of ' + events.length + ' events', 'muted'));
-      // Summarize paired starts in the compact view only. The complete recorded
-      // stream below is neither grouped nor rewritten, including unknown events.
-      const finished = new Set();
-      const meaningful = [...filtered].reverse().filter(event => {
-        // Saved JSON records can have non-string event names. Keep those
-        // records visible and unchanged; only named events can form pairs.
-        if (typeof event.event !== 'string') return true;
-        const name = event.event;
-        const key = suffix => JSON.stringify([name.slice(0, -suffix.length), event.actor, event.task_id, event.attempt]);
-        if (name.endsWith('_finished')) finished.add(key('_finished'));
-        return !name.endsWith('_started') || !finished.has(key('_started'));
-      });
-      eventRowsInto(results, meaningful.slice(0, 5), 'recent');
-      if (!filtered.length) timelineInto(results, []);
-      const all = disclosure('Show all events (' + filtered.length + ')', 'all-events');
-      all.append(el('p', 'Every matching recorded event, newest first. Expand an event for its exact UTC timestamp, original JSON and evidence.', 'muted'));
-      eventRowsInto(all, [...filtered].reverse(), 'all');
-      results.append(all);
-    };
-    search.oninput = () => { logQuery = search.value; draw(); };
-    draw(); timeline.append(results);
-    app.append(timeline);
-    const files = disclosure('Raw evidence files', 'raw-files', 'panel');
-    files.append(el('p', 'Select a file to read its original text below. Display is bounded to 1 MB per file.', 'muted'));
-    (data.files || []).forEach(file => { const row = el('p'); filesInto(row, [file]); files.append(row); });
-    if (!data.files?.length) files.append(el('p', 'No raw files listed.', 'muted'));
-    app.append(files);
-    if (searchFocused) { search.focus(); search.setSelectionRange(searchCursor, searchCursor); }
-    else if (taskFocus) {
-      const restore = node => {
-        if (node.taskFocus === taskFocus) node.focus();
-        Array.from(node.children || []).forEach(restore);
-      };
-      restore(app);
-    }
   }
 }
 function navigate(name) {
@@ -1001,18 +919,14 @@ function navigate(name) {
   if (latest) render(latest);
   if (name === 'logs') refresh(false);
 }
-async function exportLogs(mode) {
-  if (busy || !ready || !latest?.root || !latest?.exists) return;
-  exportResult = null;
-  busy = true; updateControls(); renderKey = null; render(latest);
+const runDownloads = {};
+async function downloadRun(path) {
+  if (busy || !ready) return;
+  busy = true; renderKey = null; render(latest);
   try {
-    if (refreshing) await refreshing;
-    const result = await window.pywebview.api.export_logs(mode);
-    if (result.ok && !result.cancelled) {
-      exportResult = 'Created: ' + result.path + '\nContents: ' + result.contents.join(', ') + '\n' + result.warning + '\n' + JSON.stringify(result.inventory, null, 2);
-      message('ZIP created: ' + result.path + '. Inspect before sharing.');
-    } else message(result.cancelled ? 'Export cancelled. No ZIP created.' : result.error, !result.cancelled);
-  } catch (error) { message('Export failed: ' + error, true); }
+    const result = await window.pywebview.api.download_run(path);
+    runDownloads[path] = result.ok ? result.message : result.error || 'Export failed. No ZIP saved.';
+  } catch (error) { runDownloads[path] = 'Export failed: ' + error; }
   finally { busy = false; renderKey = null; render(latest); updateControls(); }
 }
 async function historyAction(method, path) {
@@ -1173,11 +1087,11 @@ class NativeDialogs:
     def confirm_export(self, message):
         return self._window.create_confirmation_dialog("Confirm debug package export", message)
 
-    def save_export(self):
+    def save_export(self, filename="debug-report.zip"):
         enum = getattr(self._webview, "FileDialog", None)
         kind = getattr(enum, "SAVE") if enum is not None else self._webview.SAVE_DIALOG
         result = self._window.create_file_dialog(kind, allow_multiple=False,
-                    save_filename="debug-report.zip", file_types=("ZIP archives (*.zip)",))
+                    save_filename=filename, file_types=("ZIP archives (*.zip)",))
         return result[0] if result and not isinstance(result, str) else result
 
 
@@ -1362,6 +1276,40 @@ class Bridge:
                 result = export_debug(self._root, destination, mode,
                                       excluded_roots=(self._controller.repo,))
                 self._export_folder = Path(result["path"]).parent
+                return result
+            except Exception as exc:
+                return self._failure(exc)
+
+    def download_run(self, path):
+        """Export a known history row without changing the selected/live run."""
+        from auto_coding.run_history import RunHistory
+        import re
+        with self._lock:
+            try:
+                known = {item['path'] for item in self.recent_runs()['runs']}
+                if self._root is not None:
+                    known.add(str(self._root))
+                if path not in known:
+                    raise ValueError('Unknown run. Refresh the run list.')
+                summary = RunHistory.summary(path)
+                if summary['status'] in {'running', 'unknown'}:
+                    raise ValueError('Available when run stops')
+                if self._controller.logs is not None and Path(path) == self._controller.logs:
+                    process = self._controller.process
+                    if process is not None and process.poll() is None:
+                        raise ValueError('Available when run stops')
+                if self._dialogs is None:
+                    raise ValueError('Native Save As dialog is unavailable.')
+                label = re.sub(r'[^A-Za-z0-9_.-]', '-', summary.get('plan_filename') or Path(path).name)[:70]
+                date = re.sub(r'[^0-9-]', '', (summary.get('time') or '')[:10])
+                run_label = re.sub(r'[^A-Za-z0-9_-]', '', summary['run_id'].removeprefix('run-'))[:8]
+                destination = self._dialogs.save_export(f'{label}-{date or "run"}-{run_label}.zip')
+                if not destination:
+                    return {'ok': False, 'cancelled': True, 'error': 'Export cancelled. No ZIP saved.'}
+                if not isinstance(destination, str):
+                    raise ValueError('Invalid native Save As result.')
+                result = export_run(path, destination, excluded_roots=(self._controller.repo,))
+                self._export_folder = Path(result['path']).parent
                 return result
             except Exception as exc:
                 return self._failure(exc)

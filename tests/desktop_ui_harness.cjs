@@ -70,13 +70,14 @@ const assertCards = (status, completed, child) => {
   assert.equal(get('app').children.length, 1, 'Overview ends with only the status row');
   assert.deepEqual(cards.children.map(card => card.children[0].textContent), ['RUN STATUS', 'COMPLETED TASKS', 'CHILD PROCESS']);
   assert.deepEqual(cards.children.map(card => card.children[1].textContent), [status, completed, child]);
-  assert(get('logs-tools').hidden, 'Secondary controls are absent from Overview');
+  assert(get('logs-tools').hidden, 'Overview retains its compact setup and status row');
 };
 (async () => {
   assert(get('start').disabled);
   await listeners.pywebviewready(); await flush();
   if (mode === 'tasks') { await taskContracts(); return; }
   if (mode === 'logs') { await logsContracts(); return; }
+  if (mode === 'reopen') { await reopenContracts(); return; }
   if (mode === 'saved' || mode === 'stale') {
     assert.equal(get('github-repo').value, 'owner/repo');
     assert.equal(get('attempts').value, '7');
@@ -119,6 +120,14 @@ const assertCards = (status, completed, child) => {
   assert.equal(calls.length, 0, 'Initialization never connects, launches or pushes');
   assert(!contents().includes('Ready for your first run'));
   assert.equal(get('run-setup').hidden, false);
+  const beforeLocalSelection = structuredClone(data);
+  await click('nav-tasks');
+  assert(!get('logs-tools').hidden);
+  assert(!get('browse-project').disabled);
+  await click('browse-project');
+  assert.equal(calls.at(-1)[0], 'select_repo');
+  data = beforeLocalSelection; calls.length = 0;
+  await click('nav-overview'); await poll();
   // Durable status, completion, and current activity are independent snapshot facts.
   const baseline = structuredClone(data);
   for (const [state, active, uncertain, total, expected] of [
@@ -176,7 +185,7 @@ const assertCards = (status, completed, child) => {
     assert(get('start').disabled && get('resume').disabled && get('push-approved').disabled);
     assertCards(saved ? 'Stopped' : 'Idle', 'Unknown', 'Inactive');
   }
-  // Owner diagnostics stay concise in Overview; recovery is scoped to Logs.
+  // Recovery and local repository tools are reachable on Tasks; Logs is downloads only.
   for (const recoverable of [false, true]) {
     data = structuredClone(baseline);
     const diagnosis = {path:'managed/checkout.job.lock', recoverable,
@@ -191,9 +200,24 @@ const assertCards = (status, completed, child) => {
     assert.equal(get('preflight').children.length, 1);
     assert.equal(get('push-reason').textContent, '');
     assert(!contents().includes('Archive verified completed lock'));
+    await click('nav-tasks');
+    assert(!get('logs-tools').hidden);
+    const recovery = walk(get('lock-recovery')).filter(node => node.tag === 'button');
+    assert.equal(recovery.length, recoverable ? 1 : 0);
+    if (recoverable) {
+      api.recover_workspace_lock = async suffix => {
+        calls.push(['recover_workspace_lock', suffix]);
+        return {ok:true, archive:'managed/archived.lock'};
+      };
+      assert(!recovery[0].disabled);
+      await recovery[0].onclick(); await flush();
+      assert.deepEqual(calls.at(-1), ['recover_workspace_lock', '.job.lock']);
+      assert(get('message').textContent.includes('Lock archived:'));
+    }
     await click('nav-logs');
-    assert(contents().includes(diagnosis.instructions));
-    assert.equal(!!walk(get('app')).find(node => node.tag === 'button' && node.textContent === 'Archive verified completed lock'), recoverable);
+    assert(get('logs-tools').hidden);
+    assert(!contents().includes(diagnosis.instructions));
+    assert(!walk(get('app')).some(node => node.tag === 'button' && node.textContent === 'Archive verified completed lock'));
     await click('nav-overview');
   }
   data = structuredClone(baseline);
@@ -209,8 +233,8 @@ const assertCards = (status, completed, child) => {
   const initial = structuredClone(data);
   await click('nav-logs');
   assert.equal(get('nav-logs')['aria-current'], 'page');
-  assert(contents().includes('Inspect before sharing'));
-  assert(walk(get('app')).find(node => node.textContent === 'Export DEBUG REPORT (default)').disabled);
+  assert(contents().includes('No saved runs found.'));
+  assert.equal(walk(get('app')).filter(node => node.textContent === 'Download ZIP').length, 0);
   await click('nav-overview');
   await click('list-github');
   assert(get('message').textContent.includes('Enter OWNER/REPO manually'));
@@ -482,33 +506,9 @@ const assertCards = (status, completed, child) => {
   await poll();
   assert(walk(get('app')).some(node => node.tag === 'details' && node.open && node.textContent.includes('Feedback (original)')));
   await click('nav-logs');
-  for (const text of ['Codex B', 'rejected', '2026-10-25T11:00:00Z', 'gone.txt (missing)', 'Line 2: corrupt event', '<script>bad()</script>']) assert(contents().includes(text), text);
-  const search = walk(get('app')).find(node => node.tag === 'input');
-  search.value = 'no matching actor'; search.oninput();
-  assert(contents().includes('0 of 2 events'));
-  assert(!contents().includes('review_finished'));
-  search.value = 'rejected'; search.oninput();
-  assert(contents().includes('2 of 2 events'));
-  search.value = ''; search.oninput();
-  search.focus(); search.setSelectionRange(0, 0);
-  data.events.push({...data.events[0], seq:3});
-  await poll();
-  assert.equal(document.activeElement.id, 'log-search');
-  assert.equal(document.activeElement.selectionStart, 0);
-  const unchangedSearch = document.activeElement;
-  await poll();
-  assert.equal(document.activeElement, unchangedSearch, 'Unchanged polling preserves input DOM');
-  document.activeElement = null;
-  const missing = walk(get('app')).find(node => node.textContent === 'gone.txt (missing)');
-  assert.equal(typeof missing.onclick, 'undefined');
-  const link = walk(get('app')).find(node => node.textContent === 'review.json (available)');
-  await link.onclick(); await flush();
-  const viewer = get('evidence-viewer').children[0];
-  assert(get('evidence-viewer').textContent.includes('<img src=x onerror=bad()>'));
-  await poll(); await click('nav-overview'); await poll();
-  assert.equal(get('evidence-viewer').children[0], viewer);
-  assert(get('evidence-viewer').hidden, 'Selected raw rejection evidence stays out of Overview');
-  assert.equal(evidenceReads, 1, 'Polling must not reload evidence');
+  assert(!contents().includes('Recent activity'));
+  assert(get('evidence-viewer').hidden);
+  await click('nav-overview');
   data.controller.active = false; data.controller.exit_code = 0;
   await poll();
   assert.equal(get('header-state').textContent, 'Unknown run state');
@@ -537,8 +537,8 @@ const assertCards = (status, completed, child) => {
   delete data.task_count; await poll();
   assert(!contents().includes('Runner stopped with exit code 1'));
   await click('nav-logs');
-  assert(contents().includes('Runner stopped with exit code 1'));
-  assert(contents().includes('Prior process failure'));
+  assert(!contents().includes('Runner stopped with exit code 1'));
+  assert(!contents().includes('Prior process failure'));
   await click('nav-overview');
   get('message').textContent = 'Launch accepted. Waiting for durable runner progress.';
   await poll();
@@ -551,10 +551,7 @@ const assertCards = (status, completed, child) => {
   const primary = walk(get('app')).filter(node => node.className === 'notice warning');
   assert.equal(primary.length, 0, 'No mixed success/failure headline');
   await click('nav-logs');
-  const processHistory = walk(get('app')).find(node => node.tag === 'details' && node.textContent.includes('Process history'));
-  assert.equal(processHistory.open, false);
-  assert(processHistory.textContent.includes('exit code 1'));
-  assert(processHistory.textContent.includes('previous_child_exit_code'));
+  assert(!walk(get('app')).some(node => node.tag === 'details'));
   await click('nav-overview');
   get('message').textContent = 'Old launch warning';
   await click('refresh');
@@ -587,70 +584,9 @@ const assertCards = (status, completed, child) => {
   await poll();
   assertCards('Unknown', 'Unknown', 'Inactive');
   await click('nav-logs');
-  assert.equal(get('logs-tools').hidden, false);
-  assert(contents().includes('No events recorded'));
-  assert(contents().includes('state.json is corrupt'));
-  assert(contents().includes('legacy.txt (available)'));
-  data.controller.active = true; await poll();
-  assert(get('auto-push').indeterminate, 'Missing active state must not be reported as policy OFF');
-  data.controller.active = false; await poll();
-  assert.equal(get('evidence-viewer').children.length, 0, 'Changing runs must clear old evidence');
-  api.evidence = async () => ({ok:false, text:'Evidence file is missing.'});
-  await walk(get('app')).find(node => node.textContent === 'legacy.txt (available)').onclick();
-  assert(get('evidence-viewer').textContent.includes('Evidence file is missing.'));
-  let savedRuns = [{path:'external/legacy', run_id:'<img onerror=bad()>', repo:'saved/repo',
-    branch:null, time:null, status:'unknown', completed:null},
-    {path:'missing/run', run_id:'Missing run', status:'missing', completed:2}];
-  api.recent_runs = async () => ({runs:structuredClone(savedRuns)});
-  api.open_recent_run = async path => { calls.push(['open_recent_run', path]);
-    data.root = data.controller.logs = path; return {ok:true}; };
-  api.forget_run = async path => { calls.push(['forget_run', path]); savedRuns = savedRuns.filter(run => run.path !== path); return {ok:true}; };
-  await poll();
-  assert(contents().includes('Recent runs'));
-  assert(contents().includes('<img onerror=bad()>'));
-  assert(contents().includes('Completed tasks not recorded'));
-  assert(contents().includes('Time not recorded'));
-  assert(contents().includes('Status: missing'));
-  assert(contents().includes('kept until you deliberately delete them'));
-  let openButtons = walk(get('app')).filter(node => node.tag === 'button' && node.textContent === 'Open / View');
-  assert(!openButtons[0].disabled && openButtons[1].disabled);
-  const launchesBeforeHistory = calls.filter(call => ['start', 'resume', 'checkout_github_branch'].includes(call[0])).length;
-  await openButtons[0].onclick(); await flush();
-  assert.deepEqual(calls.at(-1), ['open_recent_run', 'external/legacy']);
-  assert.equal(get('evidence-viewer').children.length, 0, 'Switching runs clears selected raw evidence');
-  data.controller.active = true; await poll();
-  assert(walk(get('app')).filter(node => node.tag === 'button' && node.textContent === 'Open / View').every(node => node.disabled));
-  assert(walk(get('app')).find(node => node.textContent === 'Open / Import run folder').disabled);
-  data.controller.active = false; await poll();
-  await walk(get('app')).find(node => node.tag === 'button' && node.textContent === 'Forget history entry').onclick(); await flush();
-  assert.deepEqual(calls.at(-1), ['forget_run', 'external/legacy']);
-  assert(!contents().includes('<img onerror=bad()>'));
-  assert.equal(calls.filter(call => ['start', 'resume', 'checkout_github_branch'].includes(call[0])).length, launchesBeforeHistory);
-  // Export uses only the selected run and mode. It must not refresh controller
-  // status (which can invoke Git), inspect evidence, or launch/publish anything.
-  data.exists = true; await poll();
-  let exportOutcome = {ok:true, path:'C:/exports/<img onerror=bad()>.zip', contents:['debug-report.json'],
-    inventory:[{name:'<script>bad()</script>', action:'omitted', reason:'sensitive'}], warning:'Inspect before sharing'};
-  api.export_logs = async mode => { calls.push(['export_logs', mode]); return exportOutcome; };
-  const beforeExportSnapshots = snapshotReads;
-  const beforeExportEvidence = evidenceReads;
-  const standard = () => walk(get('app')).find(node => node.textContent === 'Export DEBUG REPORT (default)');
-  const raw = () => walk(get('app')).find(node => node.textContent === 'Export FULL RAW LOGS');
-  assert(!standard().disabled);
-  await standard().onclick(); await flush();
-  assert.deepEqual(calls.at(-1), ['export_logs', 'standard']);
-  assert.equal(snapshotReads, beforeExportSnapshots);
-  assert.equal(evidenceReads, beforeExportEvidence);
-  assert(contents().includes('Created: C:/exports/<img onerror=bad()>.zip'));
-  assert(contents().includes('<script>bad()</script>'));
-  exportOutcome = {ok:true, cancelled:true};
-  await raw().onclick(); await flush();
-  assert.deepEqual(calls.at(-1), ['export_logs', 'raw']);
-  assert(get('message').textContent.includes('Export cancelled'));
-  exportOutcome = {ok:false, error:'Disk full <img onerror=bad()>'};
-  await standard().onclick(); await flush();
-  assert(get('message').textContent.includes('Disk full <img onerror=bad()>'));
-  assert(!standard().disabled);
+  assert(get('logs-tools').hidden);
+  assert(!contents().includes('legacy.txt'));
+  await logsContracts();
   failStatus = true; await poll();
   assert(get('start').disabled && get('resume').disabled);
   assert(get('message').textContent.includes('status unavailable'));
@@ -659,51 +595,75 @@ const assertCards = (status, completed, child) => {
   console.log('Dashboard button, navigation, polling, evidence and state contracts passed');
 })().catch(error => { console.error(error); process.exitCode = 1; });
 
-async function logsContracts() {
-  // desktop_reader accepts arbitrary JSON values in the event field. These
-  // saved records must not prevent Logs or its evidence actions from rendering.
-  data.root = data.controller.logs = 'saved/non-string-events';
-  data.exists = true;
-  data.state = {status:'stopped', completed:[]};
-  data.files = [{label:'Review', path:'review.txt', status:'available'}];
-  data.events = [42, null, false, 0, {name:'process_finished'}, ['process_started'],
-    'process_started', 'process_finished'].map((name, index) => ({
-      seq:index + 1, event:name, actor:'controller', outcome:'failed',
-      timestamp_utc:'2026-10-25T11:00:00.123456Z', task_id:'one', attempt:1,
-      metadata:{reason:'Exact saved-run failure', original:index},
-      _evidence_status:structuredClone(data.files)
-    }));
-  const originals = structuredClone(data.events);
-  await click('nav-logs');
-  assert(contents().includes('Recent activity'));
-  assert(contents().includes('Stop reason: Exact saved-run failure'));
-  assert(contents().includes('Raw evidence files'));
-  let all = walk(get('app')).find(node => node.detailKey === 'all-events');
-  assert.equal(all.open, false, 'Complete stream is collapsed by default');
-  all.open = true; all.ontoggle();
-  const rows = all.children.filter(node => node.className === 'activity-row');
-  assert.equal(rows.length, originals.length);
-  assert.deepEqual(rows.map(row => JSON.parse(walk(row).find(node => node.tag === 'pre').textContent)),
-    [...originals].reverse(), 'Every raw event retains its original JSON values');
-  for (const row of rows) {
-    row.open = true; row.ontoggle();
-    assert(row.textContent.includes('2026-10-25T11:00:00.123456Z'));
-    assert(row.textContent.includes('controller'));
-    assert(row.textContent.includes('Attempt 1'));
-    await walk(row).find(node => node.textContent === 'review.txt (available)').onclick();
-    assert(get('evidence-viewer').textContent.includes('original evidence: review.txt'));
+async function reopenContracts() {
+  // Restart with no selected run: users must be able to reach the native picker.
+  assert.equal(data.root, '');
+  for (const view of ['overview', 'logs', 'tasks']) {
+    await click('nav-' + view);
+    assert.equal(get('run-selection').hidden, view !== 'tasks');
   }
-  const rawFiles = walk(get('app')).find(node => node.detailKey === 'raw-files');
-  rawFiles.open = true; rawFiles.ontoggle();
-  await walk(rawFiles).find(node => node.textContent === 'review.txt (available)').onclick();
-  const search = walk(get('app')).find(node => node.id === 'log-search');
-  search.value = '"event":42'; search.oninput();
-  assert(contents().includes('1 of 8 events'));
-  all = walk(get('app')).find(node => node.detailKey === 'all-events');
-  assert.equal(all.children.filter(node => node.className === 'activity-row').length, 1);
-  search.value = ''; search.oninput();
-  assert(contents().includes('8 of 8 events'));
-  assert.deepEqual(data.events, originals, 'Grouping and searching never mutate saved records');
+  assert(!get('open-run').disabled);
+  api.open_run = async () => {
+    calls.push(['open_run']);
+    data.root = data.controller.logs = 'saved/reopened-run';
+    data.controller.repo = 'saved/project'; data.controller.plan = 'saved/plan.json';
+    data.controller.resume_ready = true;
+    data.controller.preflight = {branch:'feature/reopened', clean:true, errors:[]};
+    data.exists = true; data.task_ids = ['restored'];
+    data.state = {status:'stopped', completed:[], history:[{task:'restored', attempt:1, feedback:'saved feedback'}]};
+    return {ok:true};
+  };
+  await click('open-run');
+  assert.deepEqual(calls.at(-1), ['open_run']);
+  assert(walk(get('app')).some(n => n.className === 'task-row'));
+  assert(contents().includes('saved feedback'));
+  await click('nav-overview');
+  assert(!get('resume').disabled);
+  await click('resume');
+  assert.equal(calls.at(-1)[0], 'resume');
+  await click('nav-logs');
+  assert(get('run-selection').hidden);
+  assert(walk(get('app')).filter(n => n.tag === 'button').every(n => n.textContent === 'Download ZIP'));
+}
+
+async function logsContracts() {
+  data.root = data.controller.logs = 'saved/run-one';
+  data.controller.active = false; data.controller.uncertain = false;
+  data.exists = true; data.state = {status:'stopped', completed:[]};
+  data.events = [{event:42, metadata:{reason:'Technical details stay in ZIP'}}];
+  const originals = structuredClone(data.events);
+  const runs = [{path:'saved/run-one', run_id:'private-long-uuid-one', plan_filename:'first.json', status:'stopped', time:'2026-10-28T12:00:00Z'},
+    {path:'saved/run-two', run_id:'private-long-uuid-two', plan_filename:'second.json', status:'completed', time:'2026-10-27T12:00:00Z'},
+    {path:'saved/run-three', run_id:'private-long-uuid-three', plan_filename:'active.json', status:'running'}];
+  api.recent_runs = async () => ({runs:structuredClone(runs)});
+  let outcome = {ok:true, message:'ZIP saved.'};
+  api.download_run = async path => { calls.push(['download_run',path]); return outcome; };
+  await click('nav-logs'); await poll();
+  const buttons = () => walk(get('app')).filter(n => n.tag === 'button');
+  assert.equal(buttons().length, 3);
+  assert(buttons().every(n => n.textContent === 'Download ZIP'));
+  assert(buttons()[2].disabled);
+  assert.equal(walk(get('app')).filter(n => n.className === 'run-row').length, 3);
+  assert(contents().indexOf('first.json') < contents().indexOf('second.json'));
+  for (const text of ['Selected run','Recent activity','Raw evidence','Technical details','private-long-uuid','Open / View']) assert(!contents().includes(text));
+  assert(!walk(get('app')).some(n => ['pre','details','input'].includes(n.tag)));
+  assert(get('logs-tools').hidden && get('evidence-viewer').hidden);
+  const beforeReads = evidenceReads, beforeSnapshots = snapshotReads;
+  await buttons()[1].onclick(); await flush();
+  assert.deepEqual(calls.at(-1), ['download_run','saved/run-two']);
+  assert.equal(data.root, 'saved/run-one');
+  assert.equal(evidenceReads, beforeReads); assert.equal(snapshotReads, beforeSnapshots);
+  assert(contents().includes('ZIP saved.'));
+  outcome = {ok:false, cancelled:true, error:'Export cancelled. No ZIP saved.'};
+  await buttons()[0].onclick(); await flush();
+  assert(contents().includes('Export cancelled. No ZIP saved.'));
+  outcome = {ok:false, error:'Disk full <img onerror=bad()>'};
+  await buttons()[0].onclick(); await flush();
+  assert(contents().includes('Disk full <img onerror=bad()>'));
+  assert(!buttons()[0].disabled);
+  assert.deepEqual(data.events, originals);
+  assert.equal(get('page-title').textContent, 'Logs');
+  const reads = snapshotReads; await click('refresh'); assert(snapshotReads > reads);
 }
 
 async function taskContracts() {

@@ -1,4 +1,4 @@
-"""Bounded, read-only export of one flat runner log directory. No GUI or processes."""
+"""Read-only run evidence exports and the compatible bounded debug report."""
 from __future__ import annotations
 
 import datetime
@@ -44,7 +44,7 @@ def _root_identity(root):
     return info.st_dev, info.st_ino
 
 
-def _read(root, name, root_id):
+def _read(root, name, root_id, *, max_bytes=MAX_FILE):
     """Do not publish bytes unless both descriptor and path remain the same regular file.
 
     O_NOFOLLOW/O_NONBLOCK also prevent link/FIFO races on platforms providing them.
@@ -56,7 +56,7 @@ def _read(root, name, root_id):
     before = path.lstat()
     if not _regular(before) or path.resolve(strict=True) != path:
         raise ValueError("Nonregular, linked or redirected file")
-    if before.st_size > MAX_FILE:
+    if max_bytes is not None and before.st_size > max_bytes:
         raise ValueError("Individual file size limit exceeded")
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0)
                  | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
@@ -64,9 +64,9 @@ def _read(root, name, root_id):
         opened = os.fstat(stream.fileno())
         if not _regular(opened) or _identity(before) != _identity(opened):
             raise ValueError("File changed before reading")
-        data = stream.read(MAX_FILE + 1)
+        data = stream.read(max_bytes + 1 if max_bytes is not None else -1)
         after = os.fstat(stream.fileno())
-    if (len(data) > MAX_FILE or _identity(before) != _identity(after)
+    if ((max_bytes is not None and len(data) > max_bytes) or _identity(before) != _identity(after)
             or _identity(before) != _identity(path.lstat())
             or path.resolve(strict=True) != path or _root_identity(root) != root_id):
         raise ValueError("File changed during reading; retry when run is stopped")
@@ -272,6 +272,187 @@ def export_debug(root, destination, mode="standard", *, excluded_roots=()):
         return {"ok": True, "path": str(destination), "mode": mode,
                 "inventory": report["inventory"], "warning": WARNING,
                 "contents": ["debug-report.json"] + (["raw/ (allowed stable runner files)"] if mode == "raw" else [])}
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def export_run(root, destination, *, excluded_roots=()):
+    """Archive all regular evidence in one stopped run, without redaction or truncation.
+
+    References are indexed, never followed. Stable descriptor reads and no-clobber
+    publication use the same safeguards as the legacy debug exporter.
+    """
+    from auto_coding.run_history import RunHistory
+
+    root = Path(root).absolute()
+    root_id = _root_identity(root)
+    if os.path.lexists(root / '.git'):
+        raise ValueError('Select a run evidence directory, not a repository checkout')
+    summary = RunHistory.summary(str(root))
+    # History deliberately bounds metadata reads for cheap listing. That limit
+    # must never turn a large, still-running state into an exportable run.
+    state = None
+    desktop = None
+    if (root / 'state.json').exists():
+        try:
+            state = json.loads(_read(root, 'state.json', root_id, max_bytes=None))
+        except (ValueError, UnicodeError):
+            state = None  # Preserve corrupt stopped evidence in the ZIP.
+    # Corrupt state must not hide a live desktop PID from the history summary.
+    if (root / 'desktop-run.json').exists():
+        try:
+            desktop = json.loads(_read(root, 'desktop-run.json', root_id))
+        except (OSError, ValueError):
+            raise ValueError('Available when run stops (desktop activity is unknown)')
+        if isinstance(desktop, dict) and desktop.get('status') in {'running', 'launching'}:
+            from auto_coding.run_history import DesktopPID
+            if DesktopPID.active(desktop.get('pid')) is not False:
+                raise ValueError('Available when run stops')
+    if (isinstance(state, dict) and state.get('status') in {'running', 'initializing'}
+            and not (isinstance(desktop, dict) and desktop.get('status') == 'stopped')):
+        raise ValueError('Available when run stops')
+    if summary['status'] in {'running', 'unknown'}:
+        raise ValueError('Available when run stops (run activity cannot yet be ruled out)')
+    destination = validate_destination(destination, root, excluded_roots)
+    report = {'format_version': 1, 'run_id': summary['run_id'], 'status': summary['status'],
+              'task_ids': [], 'attempts': [], 'inventory': [], 'missing_artifacts': [],
+              'excluded': [], 'metadata_errors': [], 'plan': 'plan unavailable',
+              'note': 'All available stable run evidence; references outside this run are never read.'}
+    included = set()
+    references = {'state.json', 'events.jsonl', 'run-manifest.json'}
+    temporary = None
+
+    def evidence_references(value):
+        if isinstance(value, str):
+            references.add(value)
+        elif isinstance(value, dict):
+            for child in value.values():
+                evidence_references(child)
+        elif isinstance(value, list):
+            for child in value:
+                evidence_references(child)
+
+    def index(value):
+        if isinstance(value, dict):
+            evidence = value.get('evidence')
+            if isinstance(evidence, dict):
+                evidence_references(evidence)
+            task = value.get('task') or value.get('task_id')
+            if isinstance(task, str) and task not in report['task_ids']:
+                report['task_ids'].append(task)
+            if isinstance(task, str) and type(value.get('attempt')) is int:
+                attempt = {'task_id': task, 'attempt': value['attempt']}
+                if attempt not in report['attempts']:
+                    report['attempts'].append(attempt)
+            for child in value.values():
+                index(child)
+        elif isinstance(value, list):
+            for child in value:
+                index(child)
+
+    def files(folder):
+        # Do not follow symlinks/junctions, even when their targets are in the run.
+        for path in sorted(folder.iterdir(), key=lambda p: p.name):
+            name = path.relative_to(root).as_posix()
+            info = path.lstat()
+            reason = None
+            if path.name == '.git' or (path.is_dir() and os.path.lexists(path / '.git')):
+                reason = 'Repository contents excluded'
+            elif stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 0x400:
+                reason = 'Linked or redirected path excluded'
+            elif path.resolve(strict=True) != path:
+                reason = 'Redirected path excluded'
+            # Interrupted atomic saves (notably state.json.tmp with a pending
+            # checkpoint) are evidence too. Exclude only archives and archive
+            # temporaries, not every file with a temporary suffix.
+            elif (path.suffix.lower() == '.zip'
+                  or path.name.lower().endswith(('.zip.tmp', '.zip.part'))
+                  or re.fullmatch(r'(?:run|debug)-export-.+\.tmp', path.name)):
+                reason = 'Archive or mutable archive temporary excluded'
+            elif stat.S_ISDIR(info.st_mode):
+                yield from files(path)
+                continue
+            elif not _regular(info):
+                reason = 'Nonregular or hard-linked file excluded'
+            if reason:
+                report['excluded'].append({'name': name, 'reason': reason})
+            else:
+                yield path, name, info
+
+    try:
+        fd, temp_name = tempfile.mkstemp(prefix='run-export-', suffix='.tmp', dir=destination.parent)
+        temporary = Path(temp_name)
+        with os.fdopen(fd, 'w+b') as output, zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as archive:
+            for path, name, before in files(root):
+                if name.startswith('/') or '\\' in name or '..' in Path(name).parts or ':' in name:
+                    raise ValueError('Unsafe archive member name')
+                if _root_identity(root) != root_id:
+                    raise ValueError('Run directory changed during export')
+                flags = os.O_RDONLY | getattr(os, 'O_BINARY', 0) | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0)
+                with os.fdopen(os.open(path, flags), 'rb') as source:
+                    opened = os.fstat(source.fileno())
+                    if not _regular(opened) or _identity(before) != _identity(opened):
+                        raise ValueError('Evidence changed before reading')
+                    member = zipfile.ZipInfo('run/' + name)
+                    member.compress_type = zipfile.ZIP_DEFLATED
+                    with archive.open(member, 'w', force_zip64=True) as target:
+                        while chunk := source.read(1024 * 1024):
+                            target.write(chunk)
+                    if (_identity(before) != _identity(os.fstat(source.fileno()))
+                            or _identity(before) != _identity(path.lstat()) or path.resolve() != path):
+                        raise ValueError('Evidence changed during export; retry when run stops')
+                included.add(name)
+                report['inventory'].append({'name': name, 'bytes': before.st_size})
+            # Interpret copies in the archive, so manifest metadata matches exported bytes.
+            for name in sorted(included):
+                if name not in {'state.json', 'events.jsonl', 'run-manifest.json', 'desktop-run.json'}:
+                    continue
+                try:
+                    raw = archive.read('run/' + name)
+                    records = raw.splitlines() if name.endswith('.jsonl') else [raw]
+                    for record in records:
+                        if not record.strip():
+                            continue
+                        try:
+                            value = json.loads(record)
+                        except (ValueError, UnicodeError) as exc:
+                            report['metadata_errors'].append({'name': name, 'error': type(exc).__name__})
+                            continue
+                        index(value)
+                        if isinstance(value, dict) and name in {'state.json', 'run-manifest.json'}:
+                            if name == 'run-manifest.json' or report['run_id'] == root.name:
+                                report['run_id'] = value.get('run_id') or report['run_id']
+                            if isinstance(value.get('task_ids'), list):
+                                report['task_ids'] = value['task_ids']
+                except (ValueError, UnicodeError) as exc:
+                    report['metadata_errors'].append({'name': name, 'error': type(exc).__name__})
+            # Old folders can retain attempt files after state/history was lost.
+            for name in sorted(included):
+                if EVIDENCE.fullmatch(name):
+                    match = re.match(r'(.+)-([0-9]{2,})-', name)
+                    index({'task_id': match[1], 'attempt': int(match[2])})
+            report['attempts'].sort(key=lambda a: (a['task_id'], a['attempt']))
+            if not report['task_ids']:
+                report['task_ids'] = list(dict.fromkeys(a['task_id'] for a in report['attempts']))
+            report['artifact_names'] = sorted(included)
+            report['missing_artifacts'] = sorted(references - included)
+            plans = [n for n in sorted(included) if n in {'plan.json', 'plan-snapshot.json', 'task-plan.json'}]
+            if plans:
+                report['plan'] = {'artifacts': plans}
+            report['complete'] = not (report['missing_artifacts'] or report['excluded'] or report['metadata_errors'] or not plans)
+            manifest_member = zipfile.ZipInfo('manifest.json')
+            manifest_member.compress_type = zipfile.ZIP_DEFLATED
+            archive.writestr(manifest_member, json.dumps(report, indent=2))
+            archive.close()
+            output.flush()
+            os.fsync(output.fileno())
+        if _root_identity(root) != root_id:
+            raise ValueError('Run directory changed during export')
+        validate_destination(destination, root, excluded_roots)
+        os.link(temporary, destination)
+        return {'ok': True, 'path': str(destination), 'complete': report['complete'],
+                'message': 'ZIP saved.' if report['complete'] else 'ZIP saved with unavailable or excluded evidence; see manifest.json.'}
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)

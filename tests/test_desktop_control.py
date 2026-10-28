@@ -105,6 +105,7 @@ class DesktopControlTests(unittest.TestCase):
         popen.side_effect = lambda argv, **kw: FakeProcess(argv, **kw)
         result = self.controller.start()
         self.assertTrue(result["ok"], result)
+        self.assertEqual((self.controller.logs / "plan-snapshot.json").read_bytes(), self.plan.read_bytes())
         args, kwargs = popen.call_args
         src = str(Path(__file__).resolve().parents[1] / "src")
         self.assertEqual(args[0], [__import__("sys").executable, "-B", "-m", "auto_coding.simple_run",

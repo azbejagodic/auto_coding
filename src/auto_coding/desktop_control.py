@@ -336,6 +336,7 @@ class DesktopController:
                 logs = runs_dir / ("run-" + uuid.uuid4().hex)
                 logs.mkdir(exist_ok=False)
                 self.logs = logs
+                (logs / "plan-snapshot.json").write_bytes(self.plan.read_bytes())
                 self.process_history = []
                 self.exit_code = None
                 self._metadata(logs)

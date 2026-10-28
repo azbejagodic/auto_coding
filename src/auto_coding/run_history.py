@@ -118,12 +118,15 @@ class RunHistory:
             def label(value):
                 return value[:2048] if isinstance(value, str) else None
             result.update(run_id=label(manifest.get("run_id") or state.get("run_id")) or root.name,
+                          plan_filename=Path((label(desktop.get("plan")) or "").replace("\\", "/")).name or None,
                           repo=label(state.get("repo") or manifest.get("target_repo") or desktop.get("repo")),
                           branch=label(state.get("branch") or (state.get("auto_push") or {}).get("branch")),
                           time=label(manifest.get("start_time_utc") or state.get("created_utc")),
                           completed=len(state["completed"]) if isinstance(state.get("completed"), list) else None,
                           total=len(manifest["task_ids"]) if isinstance(manifest.get("task_ids"), list) else None)
             status = state.get("status")
+            if status in {"failed", "error"}:
+                status = "stopped"
             if desktop.get("status") in {"running", "launching"}:
                 active = DesktopPID.active(desktop.get("pid"))
                 # Desktop metadata can outlive the dashboard while the runner
@@ -133,6 +136,10 @@ class RunHistory:
                     status = "running"
                 elif active is not False or status not in {"completed", "stopped"}:
                     status = "unknown"
+            elif desktop.get("status") == "stopped" and status != "completed":
+                # The desktop observes process exit even when abnormal termination
+                # leaves the runner's last durable state marked running.
+                status = "stopped"
             result["status"] = status if status in {"completed", "stopped", "running"} else "unknown"
         except (OSError, ValueError, TypeError, AttributeError, RuntimeError):
             result["status"] = "unavailable"

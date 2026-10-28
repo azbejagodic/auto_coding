@@ -65,7 +65,7 @@ class DesktopUITests(unittest.TestCase):
                       'Project folder', 'Task plan', 'Repository', 'Open Run',
                       "'Awaiting recovery'", "'Completed', color:'green'",
                       "'Idle', color:'muted'", "'Unknown run state'",
-                      'Search actor, outcome or event', '1 MB per file',
+                      'Run downloads', 'Download ZIP',
                       "content.setAttribute('tabindex', '0')"):
             self.assertIn(token, HTML)
         for unsafe in ('innerHTML', 'outerHTML', 'insertAdjacentHTML', '<script src=',
@@ -104,7 +104,7 @@ class DesktopUITests(unittest.TestCase):
             self.assertEqual(markup.nodes[name][0], "details")
             self.assertNotIn("open", markup.nodes[name][1])
         self.assertIn("checked", markup.nodes["auto-push"][1])
-        # Primary form order remains native; secondary tools live in Logs.
+        # Primary form order remains native.
         order = list(markup.nodes)
         for first, second in zip(("github-repo", "github-branch", "plan-path", "attempts", "start"),
                                  ("github-branch", "plan-path", "attempts", "start", "secondary-controls")):
@@ -120,10 +120,15 @@ class DesktopUITests(unittest.TestCase):
         setup = HTML.split('<section class="panel" id="run-setup"', 1)[1].split('</section>', 1)[0]
         tail = setup.split('<label class="push-policy">', 1)[1]
         self.assertEqual(tail.strip(), '<input id="auto-push" type="checkbox" checked> Automatically push approved tasks</label>')
-        for name in ('open-run', 'secondary-controls', 'local-project', 'launch-details', 'list-github'):
+        for name in ('secondary-controls', 'local-project', 'launch-details', 'list-github'):
             self.assertNotIn('id="' + name + '"', setup)
             logs = HTML.split('<section id="logs-tools"', 1)[1].split('</section>', 1)[0]
             self.assertIn('id="' + name + '"', logs)
+        selection = HTML.split('<section id="run-selection"', 1)[1].split('</section>', 1)[0]
+        self.assertIn('<button id="open-run">Open Run</button>', selection)
+        self.assertEqual(HTML.count('id="open-run"'), 1)
+        self.assertNotIn('id="open-run"', setup)
+        self.assertNotIn('id="open-run"', logs)
         for removed in ('auto-push-note', 'run-history', 'More controls and diagnostics', 'New run: automatic push'):
             self.assertNotIn(removed, HTML)
         self.assertIn("[['RUN STATUS', status], ['COMPLETED TASKS', count], ['CHILD PROCESS', child]]", HTML)
@@ -249,17 +254,34 @@ class DesktopUITests(unittest.TestCase):
                     self.assertTrue(page.locator('#' + name).is_visible())
                     self.assertEqual(page.locator('details #' + name).count(), 0)
                 page.locator('#nav-logs').click()
-                page.locator('#secondary-controls > summary').click()
-                self.assertTrue(page.locator('#list-github').is_visible())
-                self.assertTrue(page.locator('#open-run').is_visible())
-                page.locator('#launch-details > summary').click()
-                self.assertTrue(page.locator('#preflight-details').is_visible())
-                self.assertIn('feature/ui', page.locator('#preflight-details').inner_text())
-                self.assertIn('Recent runs', page.locator('#app').inner_text())
-                page.get_by_text('Download Logs / Export Debug Package', exact=True).click()
-                self.assertIn('Export DEBUG REPORT', page.locator('#app').inner_text())
+                self.assertFalse(page.locator('#logs-tools').is_visible())
+                self.assertIn('No saved runs found.', page.locator('#app').inner_text())
                 page.locator('#nav-overview').click()
                 self.assertFalse(page.locator('#secondary-controls').is_visible())
+                # Verify native disclosures really expose local selection and
+                # recovery on Tasks, rather than merely retaining bridge APIs.
+                page.locator('#nav-tasks').click()
+                page.locator('#secondary-controls > summary').click()
+                page.locator('#local-project > summary').click()
+                self.assertTrue(page.locator('#browse-project').is_visible())
+                page.locator('#browse-project').click()
+                page.wait_for_function("calls.at(-1)[0] === 'select_repo'")
+                page.evaluate("""async () => {
+                  fixture.controller.preflight.locks = [{path:'managed/project.job.lock', recoverable:true}];
+                  pywebview.api.recover_workspace_lock = async suffix => {
+                    calls.push(['recover_workspace_lock', suffix]);
+                    fixture.controller.preflight.locks = [];
+                    return {ok:true, archive:'managed/archived.lock'};
+                  };
+                  await refresh(false);
+                }""")
+                page.locator('#launch-details > summary').click()
+                page.locator('#lock-recovery button').click()
+                page.wait_for_function("calls.at(-1)[0] === 'recover_workspace_lock'")
+                self.assertEqual(page.evaluate('calls.at(-1)[1]'), '.job.lock')
+                page.wait_for_function("document.getElementById('lock-recovery').children.length === 0")
+                page.evaluate("document.getElementById('secondary-controls').open = false")
+                page.locator('#nav-overview').click()
                 # Measure the steady Overview after transient selection feedback.
                 page.evaluate("message(''); window.scrollTo(0, 0)")
                 for width, height in ((960, 620), (1000, 620), (1366, 680), (1280, 720), (1600, 900), (640, 480), (390, 720)):
@@ -314,8 +336,8 @@ class DesktopUITests(unittest.TestCase):
                 self.assertTrue(page.locator('#fetch-github').is_visible())
                 page.locator('#fetch-github').click()
                 page.locator('#nav-logs').click()
-                page.locator('#list-github').click()
-                page.locator('#github-repositories').select_option('owner/other')
+                page.evaluate("document.getElementById('list-github').click()")
+                page.evaluate("() => { const select = document.getElementById('github-repositories'); select.value = 'owner/other'; select.dispatchEvent(new Event('change')); }")
                 page.wait_for_function("fixture.controller.repository === 'owner/other'")
                 self.assertEqual(page.locator('#github-repositories img').count(), 0)
                 page.locator('#nav-overview').click()
@@ -357,8 +379,8 @@ class DesktopUITests(unittest.TestCase):
                 page.locator('#push-approved').click()
                 page.wait_for_function("calls.some(c => c[0] === 'push') && !document.getElementById('browse-project').disabled")
                 page.locator('#nav-logs').click()
-                page.locator('#local-project > summary').click()
-                page.locator('#browse-project').click()
+                # Legacy selection handlers remain available to bridge integrations.
+                page.evaluate("document.getElementById('browse-project').click()")
                 page.wait_for_function("document.getElementById('logs-message').textContent.includes('Cancelled')")
                 self.assertTrue(page.locator('#logs-message').is_visible())
                 self.assertEqual(page.evaluate('fixture.controller.repo'), 'C:/workspace')
@@ -442,143 +464,82 @@ class DesktopUITests(unittest.TestCase):
             finally:
                 browser.close()
 
-    def test_logs_compact_history_events_and_recovery(self):
+    def test_logs_compact_downloads_and_small_viewports(self):
         try:
             from playwright.sync_api import sync_playwright
         except ImportError:
-            self.skipTest("Playwright absent; rendered Logs checks unavailable")
+            self.skipTest('Playwright absent')
         with sync_playwright() as playwright:
             try:
                 browser = playwright.chromium.launch(headless=True)
             except Exception as exc:
-                self.skipTest(f"Chromium unavailable: {exc}")
+                self.skipTest(f'Chromium unavailable: {exc}')
             try:
-                page = browser.new_page(viewport={"width": 960, "height": 600})
+                page = browser.new_page(viewport={'width':960, 'height':600})
                 failures = []
                 page.on('pageerror', lambda error: failures.append(str(error)))
                 page.route('**/*', lambda route: route.abort())
                 page.set_content(HTML)
                 page.evaluate("""() => {
                   window.calls = [];
+                  window.runs = [];
                   window.fixture = {root:'', exists:false, events:[], controller:{active:false,
                     uncertain:false, preflight:{errors:[]}}};
-                  window.runs = [];
-                  window.pywebview = {api:{
-                    snapshot:async()=>structuredClone(fixture),
+                  window.pywebview = {api:{snapshot:async()=>structuredClone(fixture),
                     recent_runs:async()=>({runs:structuredClone(runs)}),
-                    open_recent_run:async path=>{calls.push(['open',path]); fixture.root=path; return {ok:true};},
-                    open_run:async()=>{calls.push(['import']); return {ok:true};},
-                    forget_run:async path=>{calls.push(['forget',path]); runs=runs.filter(r=>r.path!==path); return {ok:true};},
-                    evidence:async path=>{calls.push(['evidence',path]); return {ok:true,text:'Original review text'};},
-                    export_logs:async mode=>{calls.push(['export',mode]); return {ok:true,path:'debug.zip',contents:['debug-report.json'],inventory:[],warning:'Inspect before sharing'};}
-                  }};
+                    download_run:async path=>{calls.push(['download',path]); return {ok:true,message:'ZIP saved.'};}}};
                   window.dispatchEvent(new Event('pywebviewready'));
                 }""")
                 page.locator('#nav-logs').click()
-                self.assertIn('No saved runs found', page.locator('#app').inner_text())
-                self.assertIn('No run selected', page.locator('#app').inner_text())
+                self.assertEqual(page.locator('#app').inner_text(), 'No saved runs found.')
                 page.evaluate("""async () => {
-                  runs = [
-                    {run_id:'old-full-uuid',path:'C:/private/older',repo:'C:/checkout/old',branch:'feature/old',time:'2026-10-24T11:00:00Z',completed:3,total:3,status:'completed'},
-                    {run_id:'new-full-uuid',path:'C:/private/current',repo:'C:/checkout/current',branch:'feature/current',time:'2026-10-25T11:00:00Z',completed:1,total:3,status:'stopped'}];
-                  Object.assign(fixture, {root:'C:/private/current',exists:true,task_count:3,
-                    state:{run_id:'new-full-uuid',branch:'feature/current',status:'stopped',completed:['one']},
-                    files:[{label:'Review',path:'review.txt',status:'available'}]});
-                  fixture.controller.logs=fixture.root;
-                  fixture.controller.preflight={branch:'feature/current',clean:true,errors:['Checkpoint recovery requires inspection']};
-                  fixture.events=Array.from({length:28}, (_,i)=>({seq:i+1,
-                    timestamp_utc:'2026-10-25T11:00:'+String(i).padStart(2,'0')+'Z',
-                    actor:'Codex A',task_id:'one',attempt:1,event:i%2?'process_finished':'process_started',
-                    outcome:i%2?'success':'started',metadata:{original:i},
-                    _evidence_status:[{label:'Review',path:'review.txt',status:'available'}]}));
-                  fixture.events.push({seq:29,timestamp_utc:'2026-10-25T11:01:00.123456Z',
-                    actor:'controller',task_id:'one',attempt:1,event:'stopped',outcome:'failed',
-                    metadata:{reason:'Exact checkpoint error <script>unsafe()</script>',extra:'preserved'}});
+                  runs = [{path:'C:/runs/old',run_id:'old-private-uuid',plan_filename:'older.json',status:'completed',time:'2026-10-24T12:00:00Z'},
+                    {path:'C:/runs/new',run_id:'new-private-uuid',plan_filename:'current.json',status:'stopped',time:'2026-10-25T12:00:00Z'},
+                    {path:'C:/runs/active',plan_filename:'active.json',status:'running',time:'2026-10-26T12:00:00Z'}];
+                  fixture.events=[{event:'review_finished',reason:'Private feedback'}];
                   await refresh(false);
                 }""")
-                body = page.locator('#app').inner_text()
-                self.assertIn('Run status: Stopped', body)
-                self.assertIn('Stop reason: Exact checkpoint error <script>unsafe()</script>', body)
-                self.assertIn('Checkpoint recovery requires inspection', body)
-                self.assertNotIn('new-full-uuid', body)
-                self.assertNotIn('C:/private', body)
-                self.assertNotIn('C:/checkout', body)
-                page.evaluate("fixture.state.status='checkpointing'; refresh(false)")
-                self.assertIn('Run status: Awaiting recovery', page.locator('#app').inner_text())
-                self.assertIn('Stop reason: Exact checkpoint error', page.locator('#app').inner_text())
-                page.evaluate("fixture.state.status='stopped'; refresh(false)")
                 rows = page.locator('.run-row')
-                self.assertIn('feature/current', rows.first.inner_text())
-                self.assertIn('1 / 3 completed', rows.first.inner_text())
-                self.assertIn('feature/old', rows.last.inner_text())
-                self.assertIn('Status: completed', rows.last.inner_text())
-                rows.first.locator('summary').click()
-                self.assertIn('new-full-uuid', rows.first.inner_text())
-                self.assertIn('C:/private/current', rows.first.inner_text())
-                self.assertIn('C:/checkout/current', rows.first.inner_text())
-                page.get_by_text('Run details', exact=True).click()
-                self.assertIn('new-full-uuid', page.locator('#app').inner_text())
-                self.assertEqual(page.locator('.activity-row:visible').count(), 5)
-                recent = page.locator('.activity-row:visible')
-                self.assertIn('stopped', recent.first.inner_text())
-                self.assertNotIn('process_started', '\n'.join(recent.all_inner_texts()))
-                all_summary = page.get_by_text('Show all events (29)', exact=True)
-                all_summary.focus()
+                self.assertEqual(rows.count(), 3)
+                self.assertIn('active.json', rows.first.inner_text())
+                self.assertTrue(rows.first.get_by_role('button', name='Download ZIP').is_disabled())
+                self.assertIn('Available when run stops', rows.first.inner_text())
+                self.assertEqual(page.locator('#app button').count(), 3)
+                self.assertEqual(page.locator('#app details, #app pre, #app input').count(), 0)
+                for text in ('Private feedback', 'private-uuid', 'Selected run', 'Recent activity', 'C:/runs'):
+                    self.assertNotIn(text, page.locator('#app').inner_text())
+                button = rows.nth(1).get_by_role('button', name='Download ZIP')
+                button.focus()
                 page.keyboard.press('Enter')
-                all_events = all_summary.locator('..')
-                self.assertEqual(all_events.locator(':scope > .activity-row').count(), 29)
-                self.assertTrue(all_events.evaluate("""node => {
-                  const originals = [...node.querySelectorAll(':scope > .activity-row pre')]
-                    .map(pre => JSON.parse(pre.textContent));
-                  return JSON.stringify(originals) === JSON.stringify([...fixture.events].reverse());
-                }"""), 'Every event retains every original field without reinterpretation')
+                page.wait_for_function("calls.some(c=>c[1]==='C:/runs/new')")
+                self.assertIn('ZIP saved.', rows.nth(1).inner_text())
+                self.assertEqual(page.locator('#page-title').inner_text(), 'Logs')
+                self.assertTrue(page.locator('#page-title').is_visible())
                 for width, height in ((960,600), (640,480), (390,720)):
-                    page.set_viewport_size({'width':width, 'height':height})
+                    page.set_viewport_size({'width':width,'height':height})
                     self.assertTrue(page.evaluate('document.documentElement.scrollWidth <= innerWidth'))
-                page.set_viewport_size({'width':960, 'height':600})
-                first = all_events.locator(':scope > .activity-row').first
-                first.locator(':scope > summary').click()
-                self.assertIn('2026-10-25T11:01:00.123456Z', first.inner_text())
-                self.assertIn('controller', first.inner_text())
-                self.assertIn('Attempt 1', first.inner_text())
-                first.get_by_text('Original event', exact=True).click()
-                self.assertIn('"extra": "preserved"', first.inner_text())
-                # Polling preserves nested disclosures and keyboard focus.
-                first.locator(':scope > summary').focus()
-                page.evaluate('refresh(false)')
-                self.assertTrue(all_summary.locator('..').evaluate('(node)=>node.open'))
-                self.assertEqual(page.evaluate('document.activeElement.textContent'), first.locator(':scope > summary').inner_text())
-                last = all_events.locator(':scope > .activity-row').last
-                last.locator(':scope > summary').click()
-                last.get_by_text('review.txt (available)', exact=True).click()
-                self.assertIn('Original review text', page.locator('#evidence-viewer').inner_text())
-                search = page.locator('#log-search')
-                search.fill('"original":0')
-                self.assertIn('1 of 29 events', page.locator('#app').inner_text())
-                search.fill('no matching actor')
-                self.assertIn('0 of 29 events', page.locator('#app').inner_text())
-                search.fill('')
-                page.get_by_text('Download Logs / Export Debug Package', exact=True).click()
-                page.get_by_role('button', name='Export DEBUG REPORT (default)', exact=True).click()
-                page.wait_for_function("calls.some(c=>c[0]==='export' && c[1]==='standard')")
-                page.get_by_role('button', name='Export FULL RAW LOGS', exact=True).click()
-                page.wait_for_function("calls.some(c=>c[0]==='export' && c[1]==='raw')")
-                page.locator('#secondary-controls > summary').click()
-                page.locator('#launch-details > summary').click()
-                self.assertIn('feature/current', page.locator('#preflight-details').inner_text())
-                page.get_by_role('button', name='Open / Import run folder', exact=True).click()
-                page.wait_for_function("calls.some(c=>c[0]==='import')")
-                rows.last.get_by_role('button', name='Open / View', exact=True).click()
-                page.wait_for_function("calls.some(c=>c[0]==='open' && c[1]==='C:/private/older')")
-                self.assertEqual(rows.count(), 2, 'Opening/importing never removes older history')
-                rows.first.locator('summary').click()
-                rows.first.get_by_role('button', name='Forget history entry', exact=True).click()
-                page.wait_for_function('runs.length === 1')
-                self.assertIn('feature/old', rows.first.inner_text())
-                self.assertEqual(page.locator('#app script').count(), 0)
-                for width, height in ((960,600), (640,480), (390,720)):
-                    page.set_viewport_size({'width':width, 'height':height})
-                    self.assertTrue(page.evaluate('document.documentElement.scrollWidth <= innerWidth'))
+                    sizes = page.locator('.run-download').evaluate_all('(nodes)=>nodes.map(n=>n.getBoundingClientRect().width)')
+                    self.assertEqual(len(set(sizes)), 1)
+                self.assertFalse(page.locator('#logs-tools').is_visible())
+                self.assertFalse(page.locator('#evidence-viewer').is_visible())
+                self.assertFalse(page.locator('#open-run').is_visible())
+                page.evaluate("""() => {
+                  pywebview.api.open_run = async () => {
+                    calls.push(['open_run']);
+                    fixture.root = fixture.controller.logs = 'C:/runs/reopened';
+                    fixture.exists = true;
+                    fixture.task_ids = ['restored'];
+                    fixture.state = {status:'stopped', completed:[], history:[]};
+                    return {ok:true};
+                  };
+                }""")
+                page.locator('#nav-tasks').click()
+                self.assertTrue(page.locator('#open-run').is_visible())
+                page.locator('#open-run').click()
+                page.wait_for_function("fixture.root === 'C:/runs/reopened' && document.querySelector('.task-row')")
+                self.assertIn('restored', page.locator('#app').inner_text())
+                page.locator('#nav-overview').click()
+                self.assertFalse(page.locator('#open-run').is_visible())
                 self.assertEqual(failures, [])
             finally:
                 browser.close()
@@ -603,7 +564,7 @@ class DesktopUITests(unittest.TestCase):
             syntax = subprocess.run([node, "--check", str(js)], capture_output=True,
                                     text=True, timeout=20)
             self.assertEqual(syntax.returncode, 0, syntax.stderr)
-            for mode in ('normal', 'saved', 'stale', 'tasks', 'logs'):
+            for mode in ('normal', 'saved', 'stale', 'tasks', 'logs', 'reopen'):
                 result = subprocess.run([node, str(fixture), str(js), mode], capture_output=True,
                                         text=True, encoding="utf-8", errors="replace", timeout=20)
                 self.assertEqual(result.returncode, 0, mode + result.stdout + result.stderr)
