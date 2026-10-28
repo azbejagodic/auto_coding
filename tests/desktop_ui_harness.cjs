@@ -95,7 +95,55 @@ const assertCards = (status, completed, child) => {
     await poll(); assertCards(...expected);
     data.controller.exit_code = 1; await poll(); assertCards(...expected);
   }
+  // Reopening saved runs must render one warning from overlapping state sources.
+  for (const [active, uncertain, error, expected] of [
+    [true, false, 'An Auto-Coding runner is active or uncertain for this checkout.', 'A run is already in progress. Check Tasks for its status.'],
+    [false, false, 'An Auto-Coding runner is active or uncertain for this checkout.', 'This run may still be active. Check Logs before starting another.'],
+    [null, true, 'Unknown launch; inspect logs', 'This run may still be active. Check Logs before starting another.'],
+    [false, false, 'Runner stopped with exit code 7; inspect state.json and events.jsonl.', 'Runner stopped with exit code 7; inspect state.json and events.jsonl.'],
+  ]) {
+    data.state = {status:'stopped'}; data.exists = true;
+    data.root = data.controller.logs = 'mock/saved';
+    Object.assign(data.controller, {active, uncertain, error});
+    data.controller.preflight.errors = [error, error];
+    get('message').textContent = error;
+    await poll();
+    assert.equal(get('preflight').textContent, expected);
+    assert.equal(get('preflight').children.length, 1);
+    for (const id of ['start-reason', 'resume-reason', 'push-reason', 'message']) assert.equal(get(id).textContent, '');
+    assert(get('preflight-details').textContent.includes(error));
+    assert(get('start').disabled && get('resume').disabled);
+    assertCards('Stopped', 'Unknown', active === true ? 'Running' : uncertain ? 'Unknown' : 'Inactive');
+  }
+  // The real managed-repository preflight and push-eligibility paths can report
+  // the same checkout lock without setting controller.error or uncertainty.
+  for (const saved of [false, true]) {
+    data = structuredClone(baseline);
+    const lock = 'An Auto-Coding runner is active or uncertain for this checkout.';
+    Object.assign(data.controller, {repository:'owner/repo', repo:'managed/checkout',
+      active:false, uncertain:false, push:{eligible:false, reason:lock}});
+    data.controller.preflight.errors = [lock];
+    if (saved) {
+      data.root = data.controller.logs = 'mock/saved';
+      data.exists = true; data.state = {status:'stopped'};
+    }
+    get('message').textContent = lock;
+    await poll();
+    assert.equal(get('preflight').textContent, 'This run may still be active. Check Logs before starting another.');
+    assert.equal(get('preflight').children.length, 1);
+    for (const id of ['start-reason', 'resume-reason', 'push-reason', 'message']) assert.equal(get(id).textContent, '');
+    assert(get('preflight-details').textContent.includes(lock), 'Original lock remains in Logs diagnostics');
+    assert(get('start').disabled && get('resume').disabled && get('push-approved').disabled);
+    assertCards(saved ? 'Stopped' : 'Idle', 'Unknown', 'Inactive');
+  }
+  data.controller.preflight.errors = [];
+  data.controller.push.reason = 'Remote branch changed. Fetch and review; no force push.';
+  await poll();
+  assert.equal(get('push-reason').textContent, data.controller.push.reason, 'Distinct publication failures stay visible');
   data = baseline; await poll();
+  for (const id of ['preflight', 'start-reason', 'resume-reason', 'push-reason', 'message']) {
+    assert.equal(get(id).textContent, '', 'Returning to idle clears stale run warnings');
+  }
   const initial = structuredClone(data);
   await click('nav-logs');
   assert.equal(get('nav-logs')['aria-current'], 'page');
@@ -213,7 +261,7 @@ const assertCards = (status, completed, child) => {
   assert(!get('fetch-github').disabled, 'Fetch preserves dirty local work');
   data.controller.preflight.clean = true; data.controller.active = true; await poll();
   assert(get('connect-github').disabled && get('select-branch').disabled);
-  assert(get('start-reason').textContent.includes('already active'));
+  assert.equal(get('preflight').textContent, 'A run is already in progress. Check Tasks for its status.');
   const beforeActive = calls.length;
   for (const id of ['connect-github', 'browse-project', 'select-branch', 'create-branch', 'fetch-github', 'push-approved', 'start', 'resume']) await click(id);
   assert.equal(calls.length, beforeActive, 'Active runner locks workspace and launch actions');
@@ -435,7 +483,8 @@ const assertCards = (status, completed, child) => {
   data.controller.active = null; data.controller.uncertain = true; data.controller.error = 'Unknown launch; inspect logs';
   await poll();
   assert.equal(get('header-state').textContent, 'Unknown child status');
-  assert(get('preflight').textContent.includes('Unknown launch; inspect logs'));
+  assert.equal(get('preflight').textContent, 'This run may still be active. Check Logs before starting another.');
+  assert(get('preflight-details').textContent.includes('Unknown launch; inspect logs'));
   assertCards('Completed', '1 / Unknown', 'Unknown');
   assert(get('start').disabled && get('resume').disabled);
   data.root = data.controller.logs = 'C:\\legacy'; data.controller.active = false; data.controller.uncertain = false;

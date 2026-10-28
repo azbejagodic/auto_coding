@@ -367,17 +367,27 @@ class DesktopBridgeTests(unittest.TestCase):
             self.assertEqual(options["min_size"], (640, 480))
             window = webview.create_window.return_value
             window.maximize.assert_not_called()
-            callback, args = webview.start.call_args.args
-            callback(*args)
-            window.maximize.assert_called_once()
-            # Renderer limitations and older APIs cannot abort normal startup.
-            window.maximize.side_effect = NotImplementedError("renderer limitation")
-            webview.start.side_effect = lambda callback, args: callback(*args)
-            self.assertEqual(main([]), 0)
-            webview.create_window.return_value = object()
-            self.assertEqual(main([]), 0)
+            webview.start.assert_called_once_with()
+            self.assertEqual((options["width"], options["height"]), (1000, 660))
+            self.assertFalse(options.get("maximized", False))
+            self.assertFalse(options.get("minimized", False))
+            webview.create_window.assert_called_once()
             webview.create_window.side_effect = RuntimeError("window failure")
             self.assertEqual(main([]), 2)
+
+    def test_restored_geometry_uses_work_area_and_logical_coordinates(self):
+        from types import SimpleNamespace
+        from auto_coding.desktop_app import _initial_window_geometry
+        for x, y, width, height in ((0, 40, 1920, 1040), (-900, 0, 900, 620)):
+            screen = SimpleNamespace(frame=SimpleNamespace(X=x, Y=y, Width=width, Height=height), scale=1.5)
+            geometry = _initial_window_geometry(SimpleNamespace(screens=[screen]))
+            self.assertEqual(geometry["width"], min(1000, width))
+            self.assertEqual(geometry["height"], min(660, height))
+            self.assertGreaterEqual(geometry["x"], x)
+            self.assertGreaterEqual(geometry["y"], y)
+            self.assertLessEqual(geometry["x"] + geometry["width"], x + width)
+            self.assertLessEqual(geometry["y"] + geometry["height"], y + height)
+        self.assertEqual(_initial_window_geometry(SimpleNamespace(screens=[])), {"width":1000, "height":660})
 
     @patch("auto_coding.desktop_control.Popen")
     def test_real_controller_duplicate_start_and_resume_without_process_launch(self, popen):

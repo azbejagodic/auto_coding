@@ -106,13 +106,20 @@ progress{width:100%;height:12px;accent-color:#72adf9}
 #header-state{white-space:nowrap}
 #evidence-viewer:empty{display:none}
 /* Compact only the Overview setup; Tasks and Logs retain their spacing. */
-#run-setup{padding:16px;margin-bottom:12px}
-#run-setup .setup-fields{gap:12px;margin-top:12px}
+#run-setup{padding:12px;margin-bottom:12px}
+#run-setup .setup-fields{grid-template-columns:minmax(0,1fr) 100px;gap:12px;margin-top:12px}
 #run-setup .launch-row{gap:12px;margin-top:12px}
+#run-setup .launch-row button{height:48px;padding:8px 16px;white-space:nowrap}
+#run-setup #start,#run-setup #resume{width:140px;min-width:140px;font-size:18px}
+#run-setup .branch-line{gap:8px}
+#run-setup .branch-line button,#run-setup .repository-line button,#run-setup #github-repo{padding:8px 12px}
+.overview-top{margin-bottom:12px}
+#run-setup:not([hidden]) ~ #app .grid{margin:12px 0}
 #run-setup .step-title,#run-setup .field label{margin-bottom:4px}
 #run-setup .notice p{margin:6px 0}
 #run-setup .push-policy{margin-top:8px}
-#run-setup .selected-path{max-height:72px}
+#run-setup .selected-path{max-height:48px}
+#run-setup #github-state{font-size:14px;margin:4px 0}
 #run-setup:not([hidden]) ~ #app .card{padding:12px}
 #run-setup:not([hidden]) ~ #app .value{margin-top:4px}
 #github-state:empty,#start-reason:empty,#resume-reason:empty,#push-reason:empty{display:none}
@@ -122,7 +129,7 @@ progress{width:100%;height:12px;accent-color:#72adf9}
 .events{font-size:14px}
 }
 @media(max-width:760px){
-.side{position:static;width:auto;padding:12px 16px}.shell{display:block}.brand{margin:0 0 8px}.side nav{display:flex;gap:8px}.nav{margin:0;padding:10px}.main{margin-left:0;padding:16px}.top{align-items:flex-start}.top h1{font-size:24px}.repository-line{grid-template-columns:minmax(0,1fr)}.setup-fields{grid-template-columns:minmax(0,1fr)}.grid{grid-template-columns:minmax(0,1fr)}.field-line{flex-wrap:wrap}.selected-path{flex-basis:100%}.panel{padding:16px}.filters label{min-width:0}.top>div:last-child{flex-shrink:1}#header-state{white-space:normal}
+.side{position:static;width:auto;padding:12px 16px}.shell{display:block}.brand{margin:0 0 8px}.side nav{display:flex;gap:8px}.nav{margin:0;padding:10px}.main{margin-left:0;padding:16px}.top{align-items:flex-start}.top h1{font-size:24px}.repository-line{grid-template-columns:minmax(0,1fr)}#run-setup .setup-fields{grid-template-columns:minmax(0,1fr)}.grid{grid-template-columns:minmax(0,1fr)}.field-line{flex-wrap:wrap}.selected-path{flex-basis:100%}.panel{padding:16px}.filters label{min-width:0}.top>div:last-child{flex-shrink:1}#header-state{white-space:normal}
 }
 @media(prefers-reduced-motion:reduce){button{transition:none}
 }
@@ -187,14 +194,14 @@ progress{width:100%;height:12px;accent-color:#72adf9}
 </div>
 <div id="attempts-error" class="notice red" role="status" aria-live="polite"></div>
 <div class="launch-row">
-<button id="start" aria-describedby="start-reason attempts-error">Start</button>
-<button id="resume" aria-describedby="resume-reason attempts-error">Resume</button>
+<button id="start" aria-describedby="preflight start-reason attempts-error">Start</button>
+<button id="resume" aria-describedby="preflight resume-reason attempts-error">Resume</button>
 <button id="push-approved" aria-describedby="push-reason">Push Approved Commits</button>
 </div>
 <div id="start-reason" class="muted" role="status" aria-live="polite"></div>
 <div id="resume-reason" class="muted"></div>
 <div id="push-reason" class="muted"></div>
-<div id="preflight" class="notice muted"></div>
+<div id="preflight" class="notice muted" role="status" aria-live="polite" aria-atomic="true"></div>
 <div id="message" class="notice" role="status" aria-live="polite"></div>
 <label class="push-policy"><input id="auto-push" type="checkbox"> Automatically push approved tasks</label>
 </section>
@@ -308,7 +315,13 @@ function updateControls() {
   document.getElementById('branch-base-confirm-label').hidden = !base;
   document.getElementById('create-branch').disabled ||= !base || !document.getElementById('branch-base-confirm').checked;
   document.getElementById('push-approved').disabled = locked || protectedBranch || c.preflight?.clean !== true || !c.push?.eligible;
-  document.getElementById('push-reason').textContent = c.repository && !c.push?.eligible ? c.push?.reason || '' : '';
+  const pushReason = c.push?.reason || '';
+  // Managed checkout locks can block both launch and push while this controller
+  // itself is inactive. The stable launch status already explains that blocker.
+  const launchExplainsPush = (c.preflight?.errors || []).includes('An Auto-Coding runner is active or uncertain for this checkout.')
+    || document.getElementById('preflight').textContent === pushReason;
+  document.getElementById('push-reason').textContent = c.repository && c.active === false && !c.uncertain
+    && !c.push?.eligible && !launchExplainsPush ? pushReason : '';
   const savedPush = !!latest?.state?.auto_push;
   const savedRun = !!c.logs || !!latest?.root;
   const push = document.getElementById('auto-push');
@@ -326,9 +339,7 @@ function updateControls() {
   const validAttempts = validateAttempts();
   document.getElementById('start').disabled = locked || protectedBranch || !c.start_ready || !validAttempts;
   document.getElementById('resume').disabled = locked || protectedBranch || !c.resume_ready || !validAttempts;
-  const startReason = !ready ? 'Loading repository status...' : busy ? 'Finish the current action first.'
-    : c.uncertain || c.active === null ? 'Resolve unknown child status in Logs.' : c.active ? 'A run is already active.'
-    : !validAttempts ? 'Enter 1–10 whole attempts.' : '';
+  const startReason = !ready ? 'Loading repository status...' : busy ? 'Finish the current action first.' : '';
   document.getElementById('start-reason').textContent = startReason;
   document.getElementById('resume').textContent = latest?.state?.publication?.outcome === 'pending' ? 'Retry Push' : 'Resume';
   document.getElementById('refresh').disabled = busy || !ready;
@@ -454,17 +465,31 @@ function render(data) {
   if (git.start_error) errors.push(git.start_error);
   const preflight = document.getElementById('preflight');
   preflight.replaceChildren();
-  // Hide only the routine unselected prompt; retain full diagnostics in Logs
-  // and every error from an actual failed selection or other user action.
-  const visibleErrors = errors.filter(error => c.repo || error !== 'Select a Git repository root.');
-  // Only actionable errors occupy the main view.
-  if (visibleErrors.length) [...new Set(visibleErrors)].forEach(error => preflight.append(el('p', error, 'red')));
-  else if (c.uncertain || c.active === null) preflight.append(el('p', 'Child status is unknown. Inspect this run before launching more work.', 'warning'));
-  else if (c.repo && !c.active && (git.clean === false || c.plan && !c.resume_ready && git.clean !== true)) preflight.append(el('p', 'START requires a clean working tree. Commit or discard project changes first.', 'warning'));
-  document.getElementById('preflight-details').textContent = JSON.stringify({branch:git.branch, clean:git.clean, start_ready:c.start_ready, resume_ready:c.resume_ready, diagnostics:errors}, null, 2);
+  // One stable, actionable launch status; full diagnostics remain in Logs.
+  const presentation = runPresentation(data);
+  const statusState = data.state || {};
+  const statusReconciled = presentation.label === 'Completed' || c.active === false && !c.uncertain && statusState.status === 'checkpointing';
+  const diagnostics = [...errors, c.error, data.state_error].filter(Boolean);
+  const visibleErrors = diagnostics.filter(error => c.repo || error !== 'Select a Git repository root.');
+  const checkoutLock = errors.includes('An Auto-Coding runner is active or uncertain for this checkout.');
+  let statusLine = '';
+  if (c.uncertain || c.active === null) statusLine = 'This run may still be active. Check Logs before starting another.';
+  else if (c.active === true) statusLine = 'A run is already in progress. Check Tasks for its status.';
+  else if (checkoutLock) statusLine = 'This run may still be active. Check Logs before starting another.';
+  else if (data.state_error) statusLine = data.state_error;
+  else if (c.error && !statusReconciled) statusLine = c.error;
+  else if (c.logs && !data.exists) statusLine = 'Log directory is missing or unavailable.';
+  else if (statusState.pending_checkpoint) statusLine = 'A checkpoint is pending reconciliation. Inspect Logs before resuming.';
+  else if (statusState.publication?.outcome === 'pending') statusLine = 'Approved locally, push pending. Use Resume (Retry Push); inspect Logs for details.';
+  else if (visibleErrors.length) statusLine = visibleErrors.find(error => error !== c.error) || '';
+  else if (c.repo && (git.clean === false || c.plan && !c.resume_ready && git.clean !== true)) statusLine = 'START requires a clean working tree. Commit or discard project changes first.';
+  if (statusLine) preflight.append(el('p', statusLine, c.active !== false || c.uncertain || checkoutLock ? 'warning' : 'red'));
+  // A bridge rejection may repeat the same snapshot failure. Keep its diagnostics here.
+  if (statusLine && (diagnostics.includes(document.getElementById('message').textContent)
+      || document.getElementById('message').textContent === statusLine)) message('');
+  document.getElementById('preflight-details').textContent = JSON.stringify({branch:git.branch, clean:git.clean, start_ready:c.start_ready, resume_ready:c.resume_ready, diagnostics}, null, 2);
   document.getElementById('run-setup').hidden = page !== 'overview';
   document.getElementById('logs-tools').hidden = page !== 'logs';
-  const presentation = runPresentation(data);
   const badge = document.getElementById('header-state');
   badge.textContent = presentation.label;
   badge.className = 'pill ' + presentation.color;
@@ -494,12 +519,6 @@ function render(data) {
       cards.append(card);
     });
     app.append(cards);
-    // Keep current failures above the checkbox; historical process exits stay in Logs.
-    if (c.error && !(presentation.label === 'Completed' || c.active === false && !c.uncertain && state.status === 'checkpointing')) preflight.append(el('p', c.error, 'red'));
-    if (data.state_error) preflight.append(el('p', data.state_error, 'red'));
-    if (c.logs && !data.exists && !data.state_error) preflight.append(el('p', 'Log directory is missing or unavailable.', 'warning'));
-    if (state.pending_checkpoint) preflight.append(el('p', 'A checkpoint is pending reconciliation. Inspect Logs before resuming.', 'warning'));
-    if (state.publication?.outcome === 'pending') preflight.append(el('p', 'Approved locally, push pending. Use Resume (Retry Push); inspect Logs for details.', 'warning'));
     return;
   }
   if (page === 'logs') {
@@ -1105,13 +1124,26 @@ class Bridge:
                 return {"ok": False, "text": f"Evidence could not be read: {exc}"}
 
 
-def _maximize_window(window):
-    """Run after GUI startup; pywebview waits for `shown` before maximizing."""
+def _initial_window_geometry(webview):
+    """Use logical desktop coordinates, including the Windows work area if exposed."""
+    geometry = {"width": 1000, "height": 660}
     try:
-        window.maximize()
-    except Exception as exc:
-        # Unsupported renderers must still leave a usable, resizable window.
-        print(f"Could not maximize the desktop window: {exc}", file=sys.stderr)
+        screen = webview.screens[0]
+        frame = getattr(screen, "frame", None)
+        if frame is not None and all(isinstance(getattr(frame, key, None), (int, float))
+                                     for key in ("X", "Y", "Width", "Height")):
+            x, y, width, height = frame.X, frame.Y, frame.Width, frame.Height
+        else:
+            x, y, width, height = screen.x, screen.y, screen.width, screen.height
+        width, height = int(width), int(height)
+        if width > 0 and height > 0:
+            geometry.update(width=min(1000, width), height=min(660, height))
+            geometry.update(x=int(x) + (width - geometry["width"]) // 2,
+                            y=int(y) + (height - geometry["height"]) // 2)
+    except (AttributeError, IndexError, TypeError, ValueError, RuntimeError):
+        # Older renderers center their default restored window themselves.
+        pass
+    return geometry
 
 
 def main(argv=None) -> int:
@@ -1125,9 +1157,14 @@ def main(argv=None) -> int:
         return 2
     try:
         api = Bridge(args.logs)
-        window = webview.create_window("Auto-Coding - Run Dashboard", html=HTML, js_api=api, width=1280, height=800, min_size=(640, 480), resizable=True, frameless=False, fullscreen=False)
+        geometry = _initial_window_geometry(webview)
+        minimum = (min(640, geometry["width"]), min(480, geometry["height"]))
+        window = webview.create_window(
+            "Auto-Coding - Run Dashboard", html=HTML, js_api=api, **geometry,
+            min_size=minimum, resizable=True, frameless=False, fullscreen=False,
+        )
         api._dialogs = NativeDialogs(webview, window)
-        webview.start(_maximize_window, (window,))
+        webview.start()
         return 0
     except Exception as exc:
         print(f"Could not start the desktop window. On Windows install Microsoft Edge WebView2 Runtime and pywebview: {exc}", file=sys.stderr)

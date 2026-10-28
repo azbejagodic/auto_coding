@@ -60,7 +60,7 @@ class DesktopUITests(unittest.TestCase):
                       'overflow-wrap:anywhere', ':focus-visible',
                       'prefers-reduced-motion:reduce', 'grid-template-columns:minmax(0,1fr)',
                       'aria-label="Main navigation"', 'aria-labelledby="project-label"',
-                      'aria-labelledby="plan-label"', 'aria-describedby="start-reason attempts-error"',
+                      'aria-labelledby="plan-label"', 'aria-describedby="preflight start-reason attempts-error"',
                       'id="project-path"', 'id="plan-path"', 'id="run-setup"',
                       'Project folder', 'Task plan', 'Repository', 'Open Run',
                       "'Awaiting recovery'", "'Completed', color:'green'",
@@ -96,7 +96,7 @@ class DesktopUITests(unittest.TestCase):
             tag, attrs = markup.nodes[name]
             self.assertIn(tag, ("input", "button"))  # Native Tab/Enter/Space semantics.
             self.assertNotIn("tabindex", attrs)  # No positive or negative tab-order overrides.
-        for name in ("header-state", "attempts-error"):
+        for name in ("header-state", "attempts-error", "preflight"):
             self.assertEqual(markup.nodes[name][1]["role"], "status")
             self.assertEqual(markup.nodes[name][1]["aria-live"], "polite")
         self.assertNotIn('open', markup.nodes["launch-details"][1])
@@ -178,11 +178,12 @@ class DesktopUITests(unittest.TestCase):
                   window.dispatchEvent(new Event('pywebviewready'));
                 }""")
                 page.wait_for_function("document.getElementById('connect-github').disabled === false")
-                for width, height in ((1366, 680), (1280, 640), (640, 480), (390, 720)):
+                for width, height in ((960, 600), (1000, 620), (1366, 680), (1280, 640), (640, 480), (390, 720)):
                     page.set_viewport_size({'width': width, 'height': height})
                     self.assertTrue(page.evaluate('document.documentElement.scrollWidth <= innerWidth'))
                     self.assertEqual(page.locator('#app .card').count(), 3)
-                    if width >= 1280:
+                    if width >= 960:
+                        self.assertTrue(page.evaluate('document.documentElement.scrollHeight <= innerHeight'), f'{width}x{height}')
                         for box in page.locator('#app .card').all():
                             bounds = box.bounding_box()
                             self.assertLessEqual(bounds['y'] + bounds['height'], height)
@@ -258,8 +259,9 @@ class DesktopUITests(unittest.TestCase):
                 self.assertIn('Export DEBUG REPORT', page.locator('#app').inner_text())
                 page.locator('#nav-overview').click()
                 self.assertFalse(page.locator('#secondary-controls').is_visible())
-                page.evaluate('window.scrollTo(0, 0)')
-                for width, height in ((1366, 680), (1280, 720), (1600, 900), (640, 480), (390, 720)):
+                # Measure the steady Overview after transient selection feedback.
+                page.evaluate("message(''); window.scrollTo(0, 0)")
+                for width, height in ((960, 620), (1000, 620), (1366, 680), (1280, 720), (1600, 900), (640, 480), (390, 720)):
                     page.set_viewport_size({'width': width, 'height': height})
                     self.assertTrue(page.evaluate('document.documentElement.scrollWidth <= innerWidth'), str(width))
                     boxes = []
@@ -274,7 +276,13 @@ class DesktopUITests(unittest.TestCase):
                             overlap_y = min(box['y'] + box['height'], other['y'] + other['height']) - max(box['y'], other['y'])
                             self.assertFalse(overlap_x > 0 and overlap_y > 0, 'Primary controls overlap')
                         boxes.append(box)
-                    if width >= 1280:
+                    if width >= 960:
+                        start_size = page.locator('#start').bounding_box()
+                        resume_size = page.locator('#resume').bounding_box()
+                        push_size = page.locator('#push-approved').bounding_box()
+                        self.assertEqual(start_size['width'], resume_size['width'])
+                        self.assertEqual(start_size['height'], resume_size['height'])
+                        self.assertEqual(start_size['height'], push_size['height'])
                         start = page.locator('#start').bounding_box()
                         self.assertLessEqual(start['y'] + start['height'], height, 'Primary launch visible without scrolling')
                         self.assertLess(page.locator('#github-branch').bounding_box()['y'], 400)
@@ -284,7 +292,7 @@ class DesktopUITests(unittest.TestCase):
                     self.assertEqual(page.locator('#app .card .label').all_text_contents(),
                                      ['RUN STATUS', 'COMPLETED TASKS', 'CHILD PROCESS'])
                     positions = [cards.nth(i).bounding_box() for i in range(3)]
-                    if width >= 1280:
+                    if width >= 960:
                         self.assertEqual(len({box['y'] for box in positions}), 1)
                         self.assertTrue(all(box['y'] + box['height'] <= height for box in positions),
                                         f'All three status cards fit without scrolling at {width}x{height}: {positions}')
