@@ -26,6 +26,7 @@ from auto_coding.github_workspace import (managed_job, WorkspaceError, cancel_re
 
 MAX_PLAN = 512 * 1024
 MAX_OUTPUT = 16 * 1024 * 1024
+DEFAULT_TEST_TIMEOUT = 900
 VERDICT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -40,6 +41,12 @@ VERDICT_SCHEMA = {
 
 class PilotError(Exception):
     pass
+
+
+def validate_test_timeout(value: int) -> int:
+    if type(value) is not int or not 1 <= value <= 86400:
+        raise PilotError("test timeout must be an integer from 1 to 86400 seconds")
+    return value
 
 
 def load_tasks(path: Path) -> tuple[list[dict], str]:
@@ -369,8 +376,10 @@ def publish_approved(repo, state, state_path, events):
 
 def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False, attempts=3,
         auto_push=None,
-        model_a=None, model_b=None, timeout=1800,
+        model_a=None, model_b=None, timeout=1800, test_timeout=None,
         execute: Callable = call) -> int:
+    if test_timeout is not None:
+        validate_test_timeout(test_timeout)
     tasks, plan_sha = load_tasks(plan)
     repo = safe_repo(repo, create_repo)
     if auto_push:
@@ -398,6 +407,8 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
             return 0
         if state.get("status") not in {"stopped", "checkpointing", "completed"}:
             raise PilotError("Previous run may still be active or interrupted; inspect before resuming")
+        test_timeout = validate_test_timeout(test_timeout if test_timeout is not None else
+                                             state.get("test_timeout", DEFAULT_TEST_TIMEOUT))
         manifest_path = logs / "run-manifest.json"
         if manifest_path.exists():
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -449,6 +460,7 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
     else:
         if resume:
             raise PilotError("No existing state to resume")
+        test_timeout = validate_test_timeout(test_timeout if test_timeout is not None else DEFAULT_TEST_TIMEOUT)
         manifest_path = logs / "run-manifest.json"
         timeline_path = logs / "events.jsonl"
         created = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -484,7 +496,8 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
             raise PilotError("New run requires a clean working tree; use a disposable project")
         state = {"repo": str(repo), "plan_sha256": plan_sha, "status": "initializing",
                  "completed": [], "current_task": None, "history": [], "pending_checkpoint": None,
-                 "created_utc": created, "run_id": run_id, "auto_push": auto_push}
+                 "created_utc": created, "run_id": run_id, "auto_push": auto_push,
+                 "test_timeout": test_timeout}
         manifest = {"run_id": run_id, "plan_sha256": plan_sha,
                     "task_ids": [t["id"] for t in tasks], "initial_git_head": head(repo),
                     "start_time_utc": created, "target_repo": str(repo)}
@@ -495,6 +508,8 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
             events.emit("controller", "run_started", "started", evidence={"manifest": "run-manifest.json"})
         state["status"] = "running"
         save_json(state_path, state)
+    state["test_timeout"] = test_timeout
+    save_json(state_path, state)
     if not publish_approved(repo, state, state_path, events):
         return 1
     events.emit("controller", "plan_validated", "success", metadata={"task_count": len(tasks), "plan_sha256": plan_sha})
@@ -544,19 +559,20 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
             if not files_overview(repo).strip():
                 failed.append("No changed or created project files were found after Codex A ran.")
             for index, cmd in enumerate(task["test_commands"], 1):
-                events.emit("tests", "test_started", "started", task_id=ident, attempt=attempt, metadata={"index": index})
+                events.emit("tests", "test_started", "started", task_id=ident, attempt=attempt, metadata={"index": index, "timeout_seconds": test_timeout})
                 print(f"[{ident}] Running test {index}/{len(task['test_commands'])}", flush=True)
                 test_started = time.monotonic()
-                code, output, timed = execute(cmd, repo, min(timeout, 300))
+                code, output, timed = execute(cmd, repo, test_timeout)
                 test_duration = round(time.monotonic() - test_started, 3)
                 (logs / f"{base}-test-{index}.txt").write_text(output, encoding="utf-8")
-                record["tests"].append({"index": index, "exit_code": code, "timed_out": timed})
+                record["tests"].append({"index": index, "exit_code": code, "timed_out": timed, "timeout_seconds": test_timeout})
                 events.emit("tests", "test_finished", "timed_out" if timed else ("success" if code == 0 else "failed"), task_id=ident, attempt=attempt,
-                            evidence={"output": f"{base}-test-{index}.txt"}, metadata={"index": index, "exit_code": code, "timed_out": timed, "duration_seconds": test_duration})
+                            evidence={"output": f"{base}-test-{index}.txt"}, metadata={"index": index, "exit_code": code, "timed_out": timed, "duration_seconds": test_duration, "timeout_seconds": test_timeout})
                 if code != 0 or timed:
                     # Preserve the existing repair feedback while omitting argv;
                     # event metadata contains only safe index/status details.
-                    failed.append(f"TEST {index} failed (exit {code}); see {base}-test-{index}.txt\n{output[-12000:]}")
+                    detail = f"timed out after {test_timeout} seconds" if timed else "failed"
+                    failed.append(f"TEST {index} {detail} (exit {code}); see {base}-test-{index}.txt\n{output[-12000:]}")
                     if timed:
                         break
             if failed:
@@ -564,13 +580,13 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                 record["feedback"] = feedback[-14000:]
                 state["history"].append(record)
                 save_json(state_path, state)
-                print(f"[{ident}] Tests failed; returning evidence to Codex A", flush=True)
                 if any(x["timed_out"] for x in record["tests"]):
                     state["status"] = "stopped"
                     save_json(state_path, state)
-                    events.emit("controller", "stopped", "failed", task_id=ident, attempt=attempt, metadata={"reason": "test timeout"})
-                    print("STOPPED: test timeout (not a code-repair verdict)")
+                    events.emit("controller", "stopped", "failed", task_id=ident, attempt=attempt, metadata={"reason": "test timeout", "index": index, "timeout_seconds": test_timeout})
+                    print(f"STOPPED: [{ident}] test {index} timed out after {test_timeout} seconds; see {base}-test-{index}.txt (not a Codex B rejection)")
                     return 1
+                print(f"[{ident}] Tests failed; returning evidence to Codex A", flush=True)
                 events.emit("controller", "correction_requested", "retry", task_id=ident, attempt=attempt,
                             evidence={"test_output": [f"{base}-test-{i}.txt" for i in range(1, len(record["tests"])+1)]})
                 continue
@@ -688,12 +704,12 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
 
 @managed_job
 def run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False, attempts=3,
-        model_a=None, model_b=None, timeout=1800, execute: Callable = call, auto_push=None) -> int:
+        model_a=None, model_b=None, timeout=1800, test_timeout=None, execute: Callable = call, auto_push=None) -> int:
     """Run while ensuring controlled exceptions after log creation are recorded."""
     try:
         return _run(plan, repo, logs, create_repo=create_repo, resume=resume,
                     attempts=attempts, model_a=model_a, model_b=model_b,
-                    timeout=timeout, execute=execute, auto_push=auto_push)
+                    timeout=timeout, test_timeout=test_timeout, execute=execute, auto_push=auto_push)
     except Exception as exc:
         log_dir = logs.resolve(strict=False)
         state_path = log_dir / "state.json"
@@ -758,6 +774,8 @@ def main(argv=None):
     parser.add_argument("--resume", action="store_true", help="Resume a stopped run with same task file")
     parser.add_argument("--attempts", type=int, default=3)
     parser.add_argument("--timeout", type=int, default=1800)
+    parser.add_argument("--test-timeout", type=int, default=None,
+                        help=f"Seconds per test command (1–86400; default {DEFAULT_TEST_TIMEOUT}; Resume keeps saved value unless overridden)")
     parser.add_argument("--model-a")
     parser.add_argument("--model-b")
     parser.add_argument("--auto-push-repository", help="Explicitly enable auto-push to this GitHub OWNER/REPO")
@@ -768,12 +786,18 @@ def main(argv=None):
     if not 1 <= args.attempts <= 10 or not 30 <= args.timeout <= 86400:
         cancel_reservation(args.repo, os.environ.get("AUTOCODING_JOB_RESERVATION"))
         parser.error("invalid attempts or timeout")
+    if args.test_timeout is not None:
+        try:
+            validate_test_timeout(args.test_timeout)
+        except PilotError as exc:
+            cancel_reservation(args.repo, os.environ.get("AUTOCODING_JOB_RESERVATION"))
+            parser.error(str(exc))
     if shutil.which("codex") is None:
         cancel_reservation(args.repo, os.environ.get("AUTOCODING_JOB_RESERVATION"))
         parser.error("codex command not found in PATH")
     try:
         return run(args.plan, args.repo, args.logs, create_repo=args.create_repo,
-                   resume=args.resume, attempts=args.attempts, timeout=args.timeout,
+                   resume=args.resume, attempts=args.attempts, timeout=args.timeout, test_timeout=args.test_timeout,
                    model_a=args.model_a, model_b=args.model_b,
                    auto_push=({"repository": normalize_repository(args.auto_push_repository)[0],
                                "branch": args.auto_push_branch} if args.auto_push_repository else None))

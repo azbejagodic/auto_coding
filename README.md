@@ -53,6 +53,23 @@ py -B -m auto_coding.desktop_app --logs "C:\Users\you\AutoCoding-Runs\run-<id>"
 
 Local Codex CLI authentication is required before starting. The runner inherits the currently configured CLI model and reasoning settings; the dashboard has no model override controls. Git and Codex CLI must be available to the launched Python process.
 
+Each task test command has an independent finite timeout of **900 seconds** (15 minutes).
+Use `python -B -m auto_coding.simple_run PLAN --repo REPO --logs LOGS --test-timeout 1200`
+to override it with an integer from 1 to 86400 seconds. `--timeout` still controls
+Codex A/B processes and does not cap tests. The test timeout is saved in `state.json`;
+Resume keeps it unless explicitly overridden on the CLI. Older runs without the
+setting use 900 seconds. The desktop forwards the default on Start and the saved
+value on Resume; no dashboard setting is required. A timed-out test stops the run
+with its task/test index, limit, exit code and captured output as evidence, without
+requesting another repair or a Codex B verdict. Existing uncertain-child gates remain.
+
+The desktop launches the runner from the desktop controller's own source checkout,
+putting that `src` first on `PYTHONPATH`. Editing the managed `ui` checkout does not
+update a desktop or runner already running from a separate stable `main` checkout.
+After the current job exits and any uncertain children have been inspected, launch
+the desktop from this updated checkout (using the `PYTHONPATH` command above) to use
+this behavior. This change does not alter or clear existing job/workspace locks.
+
 1. Enter a GitHub **OWNER/REPO** or GitHub URL and click **Connect repository**. The app creates or reopens its managed checkout. **My repositories** optionally lists repositories when `gh` is authenticated; manual entry works without `gh`. Choose a feature branch and click **Select branch**, or use **New Branch**, enter its name, and click **Create branch**. Choose the remote base (normally `origin/main`); every base, including `origin/main`, requires the explicit confirmation checkbox. New branches start from that freshly fetched base. Commit or discard outstanding changes before branch changes or START. Main, master and detached HEAD cannot run tasks.
 2. For existing local projects, **Git actions and saved runs > Local folder fallback** retains Project folder **Browse**. Otherwise the managed checkout is selected automatically. Click **Browse** beside Task plan and select the intended TXT, MD or JSON plan. TXT/MD represents one task; JSON can include ordered tasks and explicit test command argv arrays (see `examples`). Keep the plan outside the target checkout, or commit it before starting. Browsing, opening and cancelling selection never launch work. Full paths, branch, working tree and validation errors appear in the dashboard.
 3. Enter a whole-number total attempt limit from **1 through 10** (default **3**). Invalid or empty entries explain why START and RESUME are disabled. Optionally select **Automatically push approved tasks** before START. Review the native confirmation containing the repo, branch, plan and publication policy. Cancelling does not launch anything. Approved task checkpoints are committed locally before any optional push. There is no automatic merge or force-push. Overview follows **Repository and branch → Task plan → Attempts → Start**, with a launch reason beside Start. **Fetch Branches**, **Select Branch**, and **New Branch** appear beside the branch dropdown; **Push Approved Commits** appears beside Start and Resume. **Git actions and saved runs** contains Open Run, My repositories and the local folder fallback. **Launch safeguards and diagnostics** holds detailed checks. The automatic push checkbox shows the active run policy; new runs default to OFF, changing the setup clears the opt-in, and Resume keeps its saved policy.

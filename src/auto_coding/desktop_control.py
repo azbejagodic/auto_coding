@@ -18,7 +18,7 @@ import uuid
 from auto_coding.background_process import background_options
 from auto_coding.desktop_reader import read_run, read_evidence
 from auto_coding.run_history import RunHistory
-from auto_coding.simple_run import PilotError, load_tasks
+from auto_coding.simple_run import DEFAULT_TEST_TIMEOUT, PilotError, load_tasks, validate_test_timeout
 from auto_coding.github_workspace import (GitHubWorkspaceManager, storage_root, serialized_launch,
     managed_lock, reserve_job, cancel_reservation)
 
@@ -358,12 +358,15 @@ class DesktopController:
         # A reservation belongs only to this launch, never to a parent runner.
         env.pop("AUTOCODING_JOB_RESERVATION", None)
         env["PYTHONPATH"] = src + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+        state = read_run(self.logs).get("state", {}) if resume else {}
+        test_timeout = validate_test_timeout(state.get("test_timeout", DEFAULT_TEST_TIMEOUT))
         argv = [sys.executable, "-B", "-m", "auto_coding.simple_run", "--repo", str(self.repo),
-                "--logs", str(self.logs), "--attempts", str(attempts)]
+                "--logs", str(self.logs), "--attempts", str(attempts),
+                "--test-timeout", str(test_timeout)]
         if resume: argv.append("--resume")
         config = None
         if resume:
-            config = read_run(self.logs).get("state", {}).get("auto_push")
+            config = state.get("auto_push")
         elif auto_push:
             config = {"repository": self.repository, "branch": self.preflight()["branch"]}
         if config:

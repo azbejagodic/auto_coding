@@ -321,6 +321,124 @@ class CheckpointAndRecoveryTests(unittest.TestCase):
             {"id": "second", "prompt": "Make second file"}
         ]}), encoding="utf-8")
 
+    def test_test_timeout_default_and_custom_are_independent_of_codex(self):
+        import auto_coding.simple_run as runner
+        tasks = json.loads(self.plan.read_text())
+        for task in tasks['tasks']:
+            task['test_commands'] = [['fake-test', task['id']], ['another-test']]
+        self.plan.write_text(json.dumps(tasks))
+        for limit in (None, 1234):
+            with self.subTest(limit=limit):
+                self.repo = self.root / f'target-{limit}'
+                self.logs = self.root / f'logs-{limit}'
+                codex, _ = self.make_executor()
+                calls = []
+                def fake(argv, cwd, timeout, *, prompt=None):
+                    calls.append((argv, cwd, timeout))
+                    if prompt is None:
+                        return 0, 'test stdout and stderr', False
+                    return codex(argv, cwd, timeout, prompt=prompt)
+                self.assertEqual(run(self.plan, self.repo, self.logs, create_repo=True,
+                                     timeout=30, test_timeout=limit, execute=fake), 0)
+                expected = runner.DEFAULT_TEST_TIMEOUT if limit is None else limit
+                self.assertEqual(expected, 900 if limit is None else 1234)
+                self.assertEqual([t for a, c, t in calls if a[0] != 'codex'], [expected] * 4)
+                self.assertEqual([t for a, c, t in calls if a[0] == 'codex'], [30] * 4)
+                self.assertTrue(all(c == self.repo for a, c, t in calls))
+                state = json.loads((self.logs / 'state.json').read_text())
+                self.assertEqual(state['test_timeout'], expected)
+                self.assertEqual((self.logs / 'second-01-test-2.txt').read_text(), 'test stdout and stderr')
+
+    def test_test_timeout_stops_and_resume_preserves_limit_and_approved_checkpoint(self):
+        import auto_coding.simple_run as runner
+        tasks = json.loads(self.plan.read_text())
+        tasks['tasks'][1]['test_commands'] = [['hung-test'], ['must-not-run']]
+        self.plan.write_text(json.dumps(tasks))
+        codex, seen = self.make_executor()
+        tests = []
+        hung = True
+        def fake(argv, cwd, timeout, *, prompt=None):
+            if prompt is not None:
+                return codex(argv, cwd, timeout, prompt=prompt)
+            tests.append((argv, timeout))
+            with patch.object(runner.subprocess, 'run') as process, patch.object(runner, 'mark_process_uncertain') as uncertain:
+                if hung:
+                    process.side_effect = subprocess.TimeoutExpired(argv, timeout, output=b'partial stdout/stderr')
+                else:
+                    process.return_value = subprocess.CompletedProcess(argv, 0, 'ok')
+                result = runner.call(argv, cwd, timeout)
+                self.assertEqual(process.call_args.args, (argv,))
+                self.assertEqual(process.call_args.kwargs['timeout'], 1200)
+                self.assertEqual(process.call_args.kwargs['stdout'], subprocess.PIPE)
+                self.assertEqual(process.call_args.kwargs['stderr'], subprocess.STDOUT)
+                self.assertEqual(uncertain.call_count, int(hung))
+                return result
+        with patch('builtins.print') as printed:
+            self.assertEqual(run(self.plan, self.repo, self.logs, create_repo=True,
+                                 timeout=30, test_timeout=1200, execute=fake), 1)
+        self.assertEqual(tests, [(['hung-test'], 1200)])
+        self.assertEqual([role for role, p in seen], ['a', 'b', 'a'])
+        self.assertTrue(any('[second] test 1 timed out after 1200 seconds' in str(c) for c in printed.call_args_list))
+        state = json.loads((self.logs / 'state.json').read_text())
+        self.assertEqual(state['status'], 'stopped')
+        self.assertEqual(state['completed'], ['first'])
+        checkpoint = state['history'][0]['commit']
+        self.assertEqual(state['history'][-1]['tests'], [
+            {'index': 1, 'exit_code': 124, 'timed_out': True, 'timeout_seconds': 1200}])
+        self.assertIsNone(state['history'][-1]['review'])
+        self.assertIn('partial stdout/stderr', (self.logs / 'second-01-test-1.txt').read_text())
+        events = [json.loads(line) for line in (self.logs / 'events.jsonl').read_text().splitlines()]
+        self.assertEqual(events[-1]['metadata'], {'reason': 'test timeout', 'index': 1, 'timeout_seconds': 1200})
+        finished = [e for e in events if e['event'] == 'test_finished'][0]
+        self.assertEqual(finished['outcome'], 'timed_out')
+        self.assertEqual(finished['metadata']['exit_code'], 124)
+        hung = False
+        self.assertEqual(run(self.plan, self.repo, self.logs, resume=True, timeout=30, execute=fake), 0)
+        self.assertEqual([t for a, t in tests], [1200, 1200, 1200])
+        state = json.loads((self.logs / 'state.json').read_text())
+        self.assertEqual(state['history'][0]['commit'], checkpoint)
+        self.assertEqual(state['completed'], ['first', 'second'])
+        self.assertEqual([role for role, p in seen], ['a', 'b', 'a', 'a', 'b'])
+
+    def test_legacy_resume_default_and_explicit_override(self):
+        tasks = json.loads(self.plan.read_text())
+        tasks['tasks'][1]['test_commands'] = [['fake-test']]
+        self.plan.write_text(json.dumps(tasks))
+        codex, _ = self.make_executor(fail_second=True)
+        self.assertEqual(run(self.plan, self.repo, self.logs, create_repo=True, execute=codex), 1)
+        state_path = self.logs / 'state.json'
+        state = json.loads(state_path.read_text())
+        state.pop('test_timeout')
+        state_path.write_text(json.dumps(state))
+        limits = []
+        def fake(argv, cwd, timeout, *, prompt=None):
+            if prompt is None:
+                limits.append(timeout)
+                return 124, 'timeout', True
+            return codex(argv, cwd, timeout, prompt=prompt)
+        self.assertEqual(run(self.plan, self.repo, self.logs, resume=True, execute=fake), 1)
+        self.assertEqual(run(self.plan, self.repo, self.logs, resume=True, test_timeout=1500, execute=fake), 1)
+        self.assertEqual(limits, [900, 1500])
+        self.assertEqual(json.loads(state_path.read_text())['test_timeout'], 1500)
+
+    def test_test_timeout_cli_wiring_and_invalid_values(self):
+        import auto_coding.simple_run as runner
+        args = [str(self.plan), '--repo', str(self.repo), '--logs', str(self.logs)]
+        with patch.object(runner.shutil, 'which', return_value='codex'), patch.object(runner, 'run', return_value=0) as invoked:
+            self.assertEqual(runner.main(args + ['--test-timeout', '1234', '--timeout', '60']), 0)
+            self.assertEqual(invoked.call_args.kwargs['test_timeout'], 1234)
+            self.assertEqual(invoked.call_args.kwargs['timeout'], 60)
+            invoked.reset_mock()
+            for value in ('0', '-1', '86401', '1.5', 'nan', 'inf', 'no'):
+                with self.subTest(value=value), patch('sys.stderr'), self.assertRaises(SystemExit) as exc:
+                    runner.main(args + ['--test-timeout', value])
+                self.assertEqual(exc.exception.code, 2)
+            invoked.assert_not_called()
+        for value in (0, -1, 86401, 1.5, float('nan'), float('inf'), True, '900'):
+            with self.subTest(value=value), patch('sys.stderr'), self.assertRaises(PilotError):
+                run(self.plan, self.repo, self.logs, create_repo=True, test_timeout=value,
+                    execute=lambda *a, **kw: self.fail('Invalid timeout must not execute'))
+
     def make_executor(self, fail_second=False, write_second=True):
         seen = []
         def fake(argv, cwd, timeout, *, prompt=None):

@@ -109,7 +109,7 @@ class DesktopControlTests(unittest.TestCase):
         src = str(Path(__file__).resolve().parents[1] / "src")
         self.assertEqual(args[0], [__import__("sys").executable, "-B", "-m", "auto_coding.simple_run",
                                    "--repo", str(self.repo), "--logs", str(self.controller.logs),
-                                   "--attempts", "3", str(self.plan)])
+                                   "--attempts", "3", "--test-timeout", "900", str(self.plan)])
         self.assertFalse(kwargs["shell"])
         self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
         self.assertEqual(kwargs["stderr"], subprocess.STDOUT)
@@ -125,6 +125,23 @@ class DesktopControlTests(unittest.TestCase):
         self.controller.process = None
         self.assertTrue(self.controller.start()["ok"])
         self.assertNotEqual(self.controller.logs, json.loads((self.runs / next(p.name for p in self.runs.iterdir() if p != self.controller.logs) / "desktop-run.json").read_text())["logs"])
+
+    @patch("auto_coding.desktop_control.Popen", side_effect=FakeProcess)
+    def test_resume_forwards_saved_test_timeout_from_same_checkout(self, popen):
+        from auto_coding.simple_run import load_tasks
+        self.assertTrue(self.controller.start()["ok"])
+        (self.controller.logs / 'state.json').write_text(json.dumps({
+            'status': 'stopped', 'repo': str(self.repo),
+            'plan_sha256': load_tasks(self.plan)[1], 'completed': [], 'history': [],
+            'test_timeout': 1234}))
+        self.controller.process.code = 1
+        self.controller.job_status()
+        self.assertTrue(self.controller.resume()["ok"])
+        argv = popen.call_args.args[0]
+        self.assertEqual(argv[argv.index('--test-timeout') + 1], '1234')
+        self.assertIn('--resume', argv)
+        src = str(Path(__file__).resolve().parents[1] / 'src')
+        self.assertEqual(popen.call_args.kwargs['env']['PYTHONPATH'].split(__import__('os').pathsep)[0], src)
 
     @patch("auto_coding.desktop_control.Popen")
     def test_dirty_and_default_branch_are_blocked(self, popen):
