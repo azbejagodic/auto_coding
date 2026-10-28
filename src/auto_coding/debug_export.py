@@ -90,6 +90,8 @@ def _time(value):
 
 
 ENUMS = {
+    "reason": {"git index lock", "test timeout"},
+    "interruption": {"git index lock"},
     "status": {"stopped", "completed", "running", "checkpointing", "launching"},
     "decision": {"APPROVED", "REJECTED", "approved", "rejected"},
     "actor": {"controller", "Codex A", "Codex B", "tests", "test", "Git"},
@@ -100,7 +102,7 @@ ENUMS = {
               "correction_requested", "push_started", "push_finished", "resume_started",
               "resume_reconciled", "plan_validated", "process_started", "process_finished",
               "review_process_finished", "checkpoint_recovered", "checkpoint_committed",
-              "checkpoint_stopped", "task_completed"},
+              "checkpoint_stopped", "task_completed", "index_lock_retry", "index_lock_finished"},
 }
 
 

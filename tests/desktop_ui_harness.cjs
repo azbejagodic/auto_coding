@@ -176,6 +176,28 @@ const assertCards = (status, completed, child) => {
     assert(get('start').disabled && get('resume').disabled && get('push-approved').disabled);
     assertCards(saved ? 'Stopped' : 'Idle', 'Unknown', 'Inactive');
   }
+  // Owner diagnostics stay concise in Overview; recovery is scoped to Logs.
+  for (const recoverable of [false, true]) {
+    data = structuredClone(baseline);
+    const diagnosis = {path:'managed/checkout.job.lock', recoverable,
+      message:'Recovery needed — previous run may still have a child process; inspect Logs',
+      instructions:recoverable ? 'Completion verified.' : 'Leave this lock untouched.'};
+    data.controller.preflight = {errors:[diagnosis.message], locks:[diagnosis]};
+    data.controller.repo = 'managed/checkout';
+    data.controller.repository = 'owner/repo';
+    data.controller.push = {eligible:false, reason:'An Auto-Coding runner is active or uncertain for this checkout.'};
+    await poll();
+    assert.equal(get('preflight').textContent, diagnosis.message);
+    assert.equal(get('preflight').children.length, 1);
+    assert.equal(get('push-reason').textContent, '');
+    assert(!contents().includes('Archive verified completed lock'));
+    await click('nav-logs');
+    assert(contents().includes(diagnosis.instructions));
+    assert.equal(!!walk(get('app')).find(node => node.tag === 'button' && node.textContent === 'Archive verified completed lock'), recoverable);
+    await click('nav-overview');
+  }
+  data = structuredClone(baseline);
+  data.controller.repository = 'owner/repo';
   data.controller.preflight.errors = [];
   data.controller.push.reason = 'Remote branch changed. Fetch and review; no force push.';
   await poll();

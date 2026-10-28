@@ -11,11 +11,123 @@ import re
 import subprocess
 import time
 import uuid
+import threading
 from functools import wraps
 from auto_coding.background_process import background_options
 
 
 _uncertain_process = ContextVar("autocoding_uncertain_process", default=None)
+_held_locks = ContextVar("autocoding_owned_locks", default=frozenset())
+_lock_records = {}
+_lock_guard = threading.RLock()
+
+
+def _identity(path):
+    info = path.lstat()
+    if path.is_symlink() or getattr(info, "st_file_attributes", 0) & 0x400:
+        raise OSError("Redirected lock directory")
+    return info.st_dev, info.st_ino
+
+
+def _own_lock(path, token=None, *, previous=None):
+    """Only call after successfully creating a directory or claiming a reservation."""
+    token = token or uuid.uuid4().hex
+    identity = _identity(path)
+    created = False
+    try:
+        owner = path / "owner"
+        if previous is not None:
+            if owner.read_text(encoding="ascii") != previous:
+                raise WorkspaceError("busy", "Reservation ownership changed; leave the lock untouched.")
+            owner.write_text(token, encoding="ascii")
+        else:
+            with owner.open("x", encoding="ascii") as stream:
+                created = True
+                stream.write(token)
+    except OSError:
+        # No child has started; only remove the directory we just acquired.
+        if previous is None and _identity(path) == identity:
+            if created:
+                owner.unlink()
+            if not any(path.iterdir()):
+                path.rmdir()
+        raise
+    with _lock_guard:
+        _lock_records[str(path)] = (identity, token, False)
+    return identity, token
+
+
+def _release_lock(path, ownership):
+    """Release our own clean gate. Keep proof in memory if filesystem cleanup fails."""
+    identity, token = ownership
+    with _lock_guard:
+        try:
+            if (_identity(path) != identity or (path / "uncertain").exists()
+                    or (path / "owner").read_text(encoding="ascii") != token):
+                return
+            _lock_records[str(path)] = (identity, token, True)
+            (path / "owner").unlink()
+            path.rmdir()
+            _lock_records.pop(str(path), None)
+        except OSError:
+            # No automatic archive, force unlock, or deletion of unknown contents.
+            pass
+
+
+def diagnose_lock(path):
+    """Read-only. A dead PID or old timestamp is never proof about descendants."""
+    path = Path(path)
+    if not path.exists() and not path.is_symlink():
+        return None
+    recoverable = False
+    active = False
+    try:
+        identity = _identity(path)
+        contents = {p.name for p in path.iterdir()}
+        record = _lock_records.get(str(path))
+        token = (path / "owner").read_text(encoding="ascii") if "owner" in contents else None
+        if record and record[0] == identity and token in {None, record[1]}:
+            active = not record[2] and "uncertain" not in contents
+            recoverable = record[2] and contents <= {"owner"}
+            if path.name.endswith(".lock") and not path.name.endswith(".job.lock"):
+                # A launch can finish while its reserved runner is still alive
+                # or waiting for handoff. Completion of the launcher alone is
+                # not proof of child quiescence.
+                job_gate = path.with_name(path.name[:-5] + ".job.lock")
+                if job_gate.exists() or job_gate.is_symlink():
+                    recoverable = False
+    except (OSError, ValueError):
+        pass
+    message = ("Recovery needed — completed operation left a workspace lock; inspect Logs" if recoverable else
+               "Another run is active — open Tasks" if active else
+               "Recovery needed — previous run may still have a child process; inspect Logs")
+    return {"path": str(path), "message": message, "recoverable": recoverable,
+            "owned_by_caller": path in _held_locks.get(),
+            "instructions": ("Archive this safely completed lock using the recovery button." if recoverable else
+                "Leave this lock untouched. Inspect runner output and the originating operation/child in Tasks. "
+                "Age, a missing parent PID, and passing tests cannot prove children exited. "
+                "Automatic recovery is refused without proof of clean completion.")}
+
+
+def recover_lock(path):
+    """Explicit recovery only for a clean operation this process witnessed finish.
+
+    Proof deliberately does not survive app restart. All other cases fail closed.
+    The guard serializes this process's release/recovery; other processes have no
+    proof and cannot recover this gate. New acquisitions only use atomic mkdir.
+    """
+    path = Path(path)
+    with _lock_guard:
+        diagnosis = diagnose_lock(path)
+        if not diagnosis or not diagnosis["recoverable"]:
+            raise WorkspaceError("recovery_refused", "Cannot prove the owning operation and all children finished; leave the lock untouched and inspect Logs.")
+        identity, token, completed = _lock_records[str(path)]
+        if _identity(path) != identity or not completed or not diagnose_lock(path)["recoverable"]:
+            raise WorkspaceError("recovery_refused", "Lock changed during inspection; leave it untouched.")
+        archive = path.with_name(path.name + ".archive-" + uuid.uuid4().hex)
+        path.rename(archive)
+        _lock_records.pop(str(path), None)
+        return str(archive)
 
 
 def mark_process_uncertain():
@@ -55,9 +167,13 @@ def reserve_job(repo):
         path.mkdir()
     except FileExistsError:
         raise WorkspaceError("busy", "An Auto-Coding runner is active or uncertain for this checkout.") from None
-    token = uuid.uuid4().hex
-    # Failure to persist ownership deliberately leaves an uncertain reservation.
-    (path / "reservation").write_text(token, encoding="ascii")
+    ownership = _own_lock(path)
+    token = ownership[1]
+    try:
+        (path / "reservation").write_text(token, encoding="ascii")
+    except OSError:
+        _release_lock(path, ownership)
+        raise
     return token
 
 
@@ -68,14 +184,20 @@ def cancel_reservation(repo, token):
     path = managed_lock(repo, ".job.lock")
     if path is None:
         return
+    operation = managed_lock(repo)
+    if operation not in _held_locks.get():
+        with checkout_lock(operation):
+            return cancel_reservation(repo, token)
     reservation = path / "reservation"
     try:
         owner = reservation.read_text(encoding="ascii")
     except FileNotFoundError:
         return  # Already claimed or released; never remove another job's lock.
-    if owner == token:
+    if (owner == token and not (path / "uncertain").exists()
+            and (path / "owner").read_text(encoding="ascii") == token):
+        ownership = (_identity(path), token)
         reservation.unlink()
-        path.rmdir()
+        _release_lock(path, ownership)
 
 
 def managed_job(method):
@@ -100,16 +222,23 @@ def managed_job(method):
         try:
             token = os.environ.get("AUTOCODING_JOB_RESERVATION")
             reservation = job_path / "reservation"
+            previous = None
             if (token and re.fullmatch(r"[0-9a-f]{32}", token)
                     and reservation.is_file()
                     and reservation.read_text(encoding="ascii") == token):
                 # Claim once, while serialized with all launches/branch changes.
+                if (job_path / "uncertain").exists():
+                    raise WorkspaceError("busy", "Recovery needed — previous run may still have a child process; inspect Logs")
+                if (job_path / "owner").read_text(encoding="ascii") != token:
+                    raise WorkspaceError("busy", "Reservation ownership changed; leave the lock untouched.")
                 reservation.unlink()
+                previous = token
             else:
                 try:
                     job_path.mkdir()
                 except FileExistsError:
                     raise WorkspaceError("busy", "An Auto-Coding runner is active or uncertain for this checkout.") from None
+            ownership = _own_lock(job_path, previous=previous)
         finally:
             operation.__exit__(None, None, None)
         defaults = method.__kwdefaults__ or {}
@@ -132,8 +261,7 @@ def managed_job(method):
             return method(plan, repo, logs, **kwargs)
         finally:
             _uncertain_process.reset(tracking)
-            if not (job_path / "uncertain").exists():
-                job_path.rmdir()
+            _release_lock(job_path, ownership)
     return wrapped
 
 
@@ -178,16 +306,18 @@ def checkout_lock(path):
         path.mkdir()
     except FileExistsError:
         raise WorkspaceError("busy", "Checkout operation is active or uncertain; inspect its workspace lock.") from None
+    ownership = _own_lock(path)
+    held = _held_locks.set(_held_locks.get() | {path})
     tracking = _uncertain_process.set(path / "uncertain")
     try:
         yield
     finally:
         _uncertain_process.reset(tracking)
+        _held_locks.reset(held)
         # A timed-out/interrupted Git process may leave hooks or filters alive.
         # Keep the same cross-process gate used by branch changes and launches;
         # neither a retry nor a new manager instance can establish quiescence.
-        if not (path / "uncertain").exists():
-            path.rmdir()
+        _release_lock(path, ownership)
 
 
 class GitHubWorkspaceManager:

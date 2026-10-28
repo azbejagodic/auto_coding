@@ -365,6 +365,7 @@ function updateControls() {
   // Managed checkout locks can block both launch and push while this controller
   // itself is inactive. The stable launch status already explains that blocker.
   const launchExplainsPush = (c.preflight?.errors || []).includes('An Auto-Coding runner is active or uncertain for this checkout.')
+    || c.preflight?.locks?.length && pushReason === 'An Auto-Coding runner is active or uncertain for this checkout.'
     || document.getElementById('preflight').textContent === pushReason;
   document.getElementById('push-reason').textContent = c.repository && c.active === false && !c.uncertain
     && !c.push?.eligible && !launchExplainsPush ? pushReason : '';
@@ -771,9 +772,15 @@ function render(data) {
   const visibleErrors = diagnostics.filter(error => c.repo || error !== 'Select a Git repository root.');
   const checkoutLock = errors.includes('An Auto-Coding runner is active or uncertain for this checkout.');
   let statusLine = '';
-  if (c.uncertain || c.active === null) statusLine = 'This run may still be active. Check Logs before starting another.';
+  const lockDiagnosis = c.preflight?.locks?.[0];
+  const stoppedReason = [...(data.events || [])].reverse().find(e => e.event === 'stopped')?.metadata?.reason;
+  if (lockDiagnosis && c.active === true) statusLine = 'Another run is active — open Tasks';
+  else if (lockDiagnosis) statusLine = lockDiagnosis.message;
+  else if (c.uncertain || c.active === null) statusLine = 'This run may still be active. Check Logs before starting another.';
   else if (c.active === true) statusLine = 'A run is already in progress. Check Tasks for its status.';
   else if (checkoutLock) statusLine = 'This run may still be active. Check Logs before starting another.';
+  else if (statusState.status === 'stopped' && stoppedReason === 'git index lock') statusLine = 'Git index.lock is still busy — inspect Logs, then Resume when the owning operation finishes.';
+  else if (statusState.status === 'stopped' && stoppedReason === 'test timeout') statusLine = 'Test process timed out — inspect Logs and child status before Resume.';
   else if (data.state_error) statusLine = data.state_error;
   else if (c.error && !statusReconciled) statusLine = c.error;
   else if (c.logs && !data.exists) statusLine = 'Log directory is missing or unavailable.';
@@ -899,6 +906,18 @@ function render(data) {
     }
     app.append(exports);
   }
+  if (page === 'logs') {
+    for (const lock of c.preflight?.locks || []) {
+      const entry = detail(lock.message, lock.path + '\n' + lock.instructions, 'workspace-lock-' + lock.path);
+      if (lock.recoverable) {
+        const recover = el('button', 'Archive verified completed lock');
+        recover.disabled = busy || !ready || c.active !== false || c.uncertain;
+        recover.onclick = () => historyAction('recover_workspace_lock', lock.path.endsWith('.job.lock') ? '.job.lock' : '.lock');
+        entry.append(recover);
+      }
+      app.append(entry);
+    }
+  }
   if (!c.logs && !data.root) {
     if (page !== 'overview') {
       const empty = el('section', undefined, page === 'tasks' ? 'muted' : 'empty');
@@ -1003,7 +1022,7 @@ async function historyAction(method, path) {
   try {
     if (refreshing) await refreshing;
     const result = await window.pywebview.api[method](path);
-    message(result.error || (method === 'forget_run' ? 'History entry forgotten. Log data remains on disk.' : 'Run opened for inspection. No work launched.'), !result.ok);
+    message(result.error || (result.archive ? 'Lock archived: ' + result.archive : method === 'forget_run' ? 'History entry forgotten. Log data remains on disk.' : 'Run opened for inspection. No work launched.'), !result.ok);
   } catch (error) { message('History action failed: ' + error, true); }
   finally { busy = false; await refresh(false); }
 }
@@ -1360,6 +1379,10 @@ class Bridge:
                 return {"ok": True}
             except Exception as exc:
                 return self._failure(exc)
+
+    def recover_workspace_lock(self, suffix):
+        with self._lock:
+            return self._controller.recover_workspace_lock(suffix)
 
     def job_status(self):
         with self._lock:

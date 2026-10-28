@@ -20,7 +20,7 @@ from auto_coding.desktop_reader import read_run, read_evidence
 from auto_coding.run_history import RunHistory
 from auto_coding.simple_run import DEFAULT_TEST_TIMEOUT, PilotError, load_tasks, validate_test_timeout
 from auto_coding.github_workspace import (GitHubWorkspaceManager, storage_root, serialized_launch,
-    managed_lock, reserve_job, cancel_reservation)
+    managed_lock, reserve_job, cancel_reservation, diagnose_lock, recover_lock)
 
 
 class DesktopController:
@@ -168,9 +168,9 @@ class DesktopController:
         if self.repo is None:
             result["errors"].append("Select a Git repository root.")
             return result
-        job_lock = managed_lock(self.repo, ".job.lock")
-        if job_lock and job_lock.exists():
-            result["errors"].append("An Auto-Coding runner is active or uncertain for this checkout.")
+        result["locks"] = self.lock_diagnostics()
+        if result["locks"]:
+            result["errors"].append(result["locks"][0]["message"])
         if self.runs_dir == self.repo or self.runs_dir.is_relative_to(self.repo):
             result["start_error"] = "Run storage must be outside the project. Select a different project or configure external run storage."
         if self._other_active_run():
@@ -193,6 +193,34 @@ class DesktopController:
         except (OSError, subprocess.TimeoutExpired) as exc:
             result["errors"].append(f"Git preflight failed: {exc}")
         return result
+
+    def lock_diagnostics(self):
+        result = []
+        for suffix in (".job.lock", ".lock"):
+            path = managed_lock(self.repo, suffix)
+            diagnosis = diagnose_lock(path) if path else None
+            if diagnosis and not diagnosis["owned_by_caller"]:
+                if self.process is not None and self.process.poll() is None:
+                    diagnosis["message"] = "Another run is active — open Tasks"
+                result.append(diagnosis)
+        return result
+
+    def recover_workspace_lock(self, suffix):
+        """Explicit Logs action; never accepts an arbitrary filesystem path."""
+        with self._lock:
+            try:
+                if suffix not in {".lock", ".job.lock"}:
+                    raise ValueError("Unsupported lock type")
+                status = self.job_status()
+                if status["active"] is not False or status["uncertain"]:
+                    raise ValueError("Recovery refused while a runner is active or child status is unknown.")
+                path = managed_lock(self.repo, suffix)
+                if path is None:
+                    raise ValueError("No managed checkout selected")
+                archive = recover_lock(path)
+                return {"ok": True, "archive": archive}
+            except (OSError, ValueError) as exc:
+                return {"ok": False, "error": str(exc)}
 
     def _validate(self):
         if self.repo is None or self.plan is None:

@@ -371,6 +371,25 @@ refresh. Absolute paths, traversal and links escaping the chosen run are rejecte
 
 ### Export a debug ZIP from Logs
 
+Git staging and local commits retry only Git's explicit `index.lock: File exists`
+contention, with quarter-second waits and a 20-second retry deadline. The timeline
+records the retry and its final result. Persistent contention stops with the exact
+Git diagnostic in Logs, preserves project changes, and never deletes Git locks or
+terminates processes. Resume keeps completed checkpoints and still requires review
+of an interrupted task. Test timeout configuration is unchanged.
+Staging-lock interruptions retain their history and separate evidence files but
+do not consume the correction budget, including on the last allowed attempt.
+Resume checkpoint failures retain the Git-lock classification and exact diagnostic.
+
+Logs also shows managed checkout/job lock paths and recovery instructions. Active
+or uncertain locks are never automatically cleared. An empty legacy lock, old age,
+or a missing parent PID cannot prove that children exited. The explicit **Archive
+verified completed lock** action appears only when this app witnessed clean
+completion, cleanup failed, and the same owned directory remains unchanged. It
+rechecks ownership and uncertainty before archiving. This proof does not survive an
+app restart; without it recovery is refused and the lock remains untouched. Inspect
+the originating run and its children before attempting manual recovery.
+
 Open **Logs → Recent runs → Open / View** to inspect an old run (or **Open / Import
 run folder** for an external legacy run). In **Download Logs / Export Debug Package**,
 choose **Export DEBUG REPORT (default)**, confirm the selected run in the native

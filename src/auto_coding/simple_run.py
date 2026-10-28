@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 import uuid
+from contextvars import ContextVar
 from typing import Callable
 from auto_coding.background_process import background_options
 from auto_coding.event_log import EventLog, EventLogError
@@ -41,6 +42,21 @@ VERDICT_SCHEMA = {
 
 class PilotError(Exception):
     pass
+
+
+class GitLockError(PilotError):
+    pass
+
+
+_git_events = ContextVar("git_lock_events", default=None)
+GIT_LOCK_DEADLINE = 20
+
+
+def _git_lock_event(event, outcome, message):
+    print(message, flush=True)
+    events = _git_events.get()
+    if events:
+        events.emit("Git", event, outcome, metadata={"reason": "git index lock", "message": message})
 
 
 def validate_test_timeout(value: int) -> int:
@@ -157,7 +173,36 @@ def files_overview(repo: Path) -> str:
 
 
 def git(repo: Path, args: list[str], timeout: int = 30) -> str:
-    rc, output, timed = call(["git", *args], repo, timeout)
+    command_index = 0
+    while args[command_index:command_index + 1] == ["-c"]:
+        command_index += 2
+    operation = args[command_index:command_index + 1]
+    retryable = operation in (["add"], ["commit"])
+    deadline = None
+    while True:
+        remaining = max(1, deadline - time.monotonic()) if deadline is not None else timeout
+        rc, output, timed = call(["git", *args], repo, min(timeout, remaining))
+        collision = (rc == 128 and not timed
+                     and bool(re.search(r"unable to create ['\"][^\r\n]*[/\\]index\.lock['\"]: file exists", output, re.I))
+                     and retryable)
+        if not collision:
+            if deadline is not None:
+                _git_lock_event("index_lock_finished", "success" if not rc and not timed else "failed",
+                                "Git index lock retry succeeded." if not rc and not timed else
+                                f"Git index lock retry stopped: {output[-1500:]}")
+            break
+        if deadline is None:
+            deadline = time.monotonic() + GIT_LOCK_DEADLINE
+            _git_lock_event("index_lock_retry", "retry", "Git index.lock is busy; retrying briefly while preserving project changes.")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            message = (f"STOPPED: Git index.lock contention persists: {output}\n"
+                       "Working tree preserved. Wait for the owning Git/editor operation to finish, "
+                       "inspect Logs and the reported lock path, then Resume. If ownership is unknown, "
+                       "leave the lock untouched; establish that no Git operation or child remains before manual recovery.")
+            _git_lock_event("index_lock_finished", "failed", message)
+            raise GitLockError(message)
+        time.sleep(min(0.25, remaining))
     if rc or timed:
         raise PilotError(f"Git {' '.join(args[:3])} failed: {output[-1500:]}")
     return output.strip()
@@ -324,10 +369,12 @@ def recover_checkpoint(repo: Path, state: dict, state_path: Path, events: EventL
                     attempt=pending["record"].get("attempt"), metadata={"recovered": True})
     try:
         committed = local_commit(repo, task)
-    except PilotError:
+    except PilotError as exc:
         if events:
             events.emit("Git", "checkpoint_stopped", "failed", task_id=task,
-                        attempt=pending["record"].get("attempt"), metadata={"reason": "checkpoint recovery failed"})
+                        attempt=pending["record"].get("attempt"),
+                        metadata={"reason": "git index lock" if isinstance(exc, GitLockError) else "checkpoint recovery failed",
+                                  "message": str(exc)})
         raise
     verify_approved_commit(repo, pending, committed)
     if events:
@@ -438,6 +485,7 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                         "task_ids": [t["id"] for t in tasks], "initial_git_head": head(repo),
                         "start_time_utc": state.get("created_utc"), "target_repo": str(repo)}
         events = EventLog(logs / "events.jsonl", run_id)
+        _git_events.set(events)
         if not manifest_path.exists():
             # Write only after the existing timeline has been validated.
             state["run_id"] = run_id
@@ -456,7 +504,8 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                 save_json(state_path, state)
             finally:
                 events.emit("controller", "stopped", "failed", evidence={"state": "state.json"},
-                            metadata={"reason": "resume reconciliation failed", "error_type": type(exc).__name__})
+                            metadata={"reason": "git index lock" if isinstance(exc, GitLockError) else "resume reconciliation failed",
+                                      "error_type": type(exc).__name__, "message": str(exc)})
             raise
         events.emit("controller", "resume_reconciled", "success", metadata={"completed_tasks": list(state["completed"])})
     else:
@@ -491,6 +540,7 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
         if not git_clean(repo):
             # Make this safety exit visible when the external log store works.
             events = EventLog(timeline_path, run_id)
+            _git_events.set(events)
             if not events.seq:
                 events.emit("controller", "run_started", "started")
             events.emit("controller", "stopped", "failed",
@@ -506,6 +556,7 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
         if not manifest_path.exists():
             save_json(manifest_path, manifest)
         events = EventLog(timeline_path, run_id)
+        _git_events.set(events)
         if not events.seq:
             events.emit("controller", "run_started", "started", evidence={"manifest": "run-manifest.json"})
         state["status"] = "running"
@@ -525,13 +576,16 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
         prior = [h for h in state["history"] if h.get("task") == ident]
         feedback = (prior[-1].get("feedback") if prior else "") or ""
         state["current_task"] = ident
-        start = len(prior) + 1
+        # Keep infrastructure interruptions as evidence without charging a
+        # correction attempt. Unreviewed work still goes through Codex B.
+        start = sum(h.get("interruption") != "git index lock" for h in prior) + 1
         for attempt in range(start, attempts + 1):
             events.emit("controller", "task_started", "started", task_id=ident, attempt=attempt)
             print(f"[{ident}] Codex A — attempt {attempt}", flush=True)
             state["status"] = "running"
             save_json(state_path, state)
-            base = f"{ident}-{attempt:02d}"
+            # Evidence must remain distinct when Resume reuses the budget slot.
+            base = f"{ident}-{len(prior) + attempt - start + 1:02d}"
             developer_msg = ("Implement this task in the current Git repository. You may create the normal "
                  "source files you need INSIDE this repository. Do not change Git history, push, "
                  "read secrets, or modify files outside it. Run appropriate tests and fix code issues "
@@ -603,11 +657,15 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                 stat, diff, diff_sha = staging_summary(repo)
             except PilotError as exc:
                 record["feedback"] = str(exc)
+                if isinstance(exc, GitLockError):
+                    record["interruption"] = "git index lock"
                 state["history"].append(record)
                 state["status"] = "stopped"
                 save_json(state_path, state)
-                events.emit("controller", "stopped", "failed", task_id=ident, attempt=attempt, metadata={"reason": "checkpoint safety"})
-                print(f"STOPPED: change checkpoint safety: {exc}")
+                events.emit("controller", "stopped", "failed", task_id=ident, attempt=attempt,
+                            metadata={"reason": "git index lock" if isinstance(exc, GitLockError) else "checkpoint safety", "message": str(exc)})
+                if not isinstance(exc, GitLockError):
+                    print(f"STOPPED: change checkpoint safety: {exc}")
                 return 1
             (logs / f"{base}-diff.txt").write_text(diff, encoding="utf-8")
             print(f"[{ident}] Codex B — independent review", flush=True)
@@ -676,9 +734,15 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                     commit = local_commit(repo, ident)
                     verify_approved_commit(repo, state["pending_checkpoint"], commit)
                 except PilotError as exc:
+                    if isinstance(exc, GitLockError):
+                        # A returned lock collision is definitive: Git did not
+                        # commit. Keep approval evidence for verified Resume.
+                        state["status"] = "stopped"
+                        save_json(state_path, state)
                     events.emit("Git", "stopped", "failed", task_id=ident, attempt=attempt,
-                                evidence={"state": "state.json"}, metadata={"reason": "checkpoint pending reconciliation", "error_type": type(exc).__name__})
-                    print(f"STOPPED: local checkpoint failed: {exc}")
+                                evidence={"state": "state.json"}, metadata={"reason": "git index lock" if isinstance(exc, GitLockError) else "checkpoint pending reconciliation", "error_type": type(exc).__name__, "message": str(exc)})
+                    if not isinstance(exc, GitLockError):
+                        print(f"STOPPED: local checkpoint failed: {exc}")
                     return 1
                 events.emit("Git", "checkpoint_committed", "success", task_id=ident, attempt=attempt, metadata={"commit": commit})
                 state["completed"].append(ident)
@@ -715,6 +779,7 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
 def run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False, attempts=3,
         model_a=None, model_b=None, timeout=1800, test_timeout=None, execute: Callable = call, auto_push=None) -> int:
     """Run while ensuring controlled exceptions after log creation are recorded."""
+    event_context = _git_events.set(None)
     try:
         return _run(plan, repo, logs, create_repo=create_repo, resume=resume,
                     attempts=attempts, model_a=model_a, model_b=model_b,
@@ -766,6 +831,9 @@ def run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False, 
             # claim a durable stopped event that could not be written.
             print(f"FATAL: could not persist failure evidence: {type(exc).__name__}: {exc}", file=sys.stderr)
         raise
+
+    finally:
+        _git_events.reset(event_context)
 
 
 def git_clean_staged(repo: Path) -> bool:
