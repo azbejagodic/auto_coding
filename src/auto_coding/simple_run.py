@@ -92,13 +92,15 @@ def save_json(path: Path, value: dict) -> None:
     temporary.replace(path)
 
 
-def call(argv: list[str], cwd: Path, timeout: int, *, prompt: str | None = None) -> tuple[int, str, bool]:
+def call(argv: list[str], cwd: Path, timeout: int, *, prompt: str | None = None,
+         env: dict[str, str] | None = None) -> tuple[int, str, bool]:
     """Capture all tool output for a diagnostic bundle; no shell execution."""
     try:
         result = subprocess.run(argv, cwd=str(cwd), input=prompt, text=True,
                                 encoding="utf-8", errors="replace",
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                timeout=timeout, check=False, shell=False, **background_options())
+                                timeout=timeout, check=False, shell=False,
+                                **({"env": env} if env is not None else {}), **background_options())
         return result.returncode, (result.stdout or "")[:MAX_OUTPUT], False
     except subprocess.TimeoutExpired as exc:
         mark_process_uncertain()
@@ -562,7 +564,14 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                 events.emit("tests", "test_started", "started", task_id=ident, attempt=attempt, metadata={"index": index, "timeout_seconds": test_timeout})
                 print(f"[{ident}] Running test {index}/{len(task['test_commands'])}", flush=True)
                 test_started = time.monotonic()
-                code, output, timed = execute(cmd, repo, test_timeout)
+                # The launcher may belong to an installed/stable copy. Pin each
+                # child's imports to this run's checkout without changing the
+                # parent environment or discarding other test/package paths.
+                test_env = os.environ.copy()
+                src = str((repo / "src").resolve())
+                inherited = test_env.get("PYTHONPATH")
+                test_env["PYTHONPATH"] = src + (os.pathsep + inherited if inherited else "")
+                code, output, timed = execute(cmd, repo, test_timeout, env=test_env)
                 test_duration = round(time.monotonic() - test_started, 3)
                 (logs / f"{base}-test-{index}.txt").write_text(output, encoding="utf-8")
                 record["tests"].append({"index": index, "exit_code": code, "timed_out": timed, "timeout_seconds": test_timeout})

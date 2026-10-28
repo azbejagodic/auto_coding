@@ -144,7 +144,7 @@ class SimpleRunnerTests(unittest.TestCase):
             {'id': 'one', 'prompt': 'Build', 'test_commands': [['py', '-B', 'test.py']]}
         ]}), encoding='utf-8')
         calls = []
-        def fake(argv, cwd, timeout, *, prompt=None):
+        def fake(argv, cwd, timeout, *, prompt=None, env=None):
             calls.append((argv, prompt))
             if argv[:2] == ['py', '-B']:
                 return (1, 'AssertionError: expected 2', False) if len([c for c in calls if c[0][:2] == ['py', '-B']]) == 1 else (0, 'OK', False)
@@ -236,7 +236,7 @@ class SimpleRunnerTests(unittest.TestCase):
         self.plan = self.root / 'task.json'
         self.plan.write_text(json.dumps({'tasks': [{'id': 'one', 'prompt': 'Build',
             'test_commands': [['python', 'check.py', '--token=' + secret]]}]}))
-        def fake(argv, cwd, timeout, *, prompt=None):
+        def fake(argv, cwd, timeout, *, prompt=None, env=None):
             if argv[:2] == ['python', 'check.py']:
                 return 0, 'ok', False
             out = Path(argv[argv.index('--output-last-message') + 1])
@@ -333,7 +333,7 @@ class CheckpointAndRecoveryTests(unittest.TestCase):
                 self.logs = self.root / f'logs-{limit}'
                 codex, _ = self.make_executor()
                 calls = []
-                def fake(argv, cwd, timeout, *, prompt=None):
+                def fake(argv, cwd, timeout, *, prompt=None, env=None):
                     calls.append((argv, cwd, timeout))
                     if prompt is None:
                         return 0, 'test stdout and stderr', False
@@ -357,7 +357,7 @@ class CheckpointAndRecoveryTests(unittest.TestCase):
         codex, seen = self.make_executor()
         tests = []
         hung = True
-        def fake(argv, cwd, timeout, *, prompt=None):
+        def fake(argv, cwd, timeout, *, prompt=None, env=None):
             if prompt is not None:
                 return codex(argv, cwd, timeout, prompt=prompt)
             tests.append((argv, timeout))
@@ -366,7 +366,7 @@ class CheckpointAndRecoveryTests(unittest.TestCase):
                     process.side_effect = subprocess.TimeoutExpired(argv, timeout, output=b'partial stdout/stderr')
                 else:
                     process.return_value = subprocess.CompletedProcess(argv, 0, 'ok')
-                result = runner.call(argv, cwd, timeout)
+                result = runner.call(argv, cwd, timeout, env=env)
                 self.assertEqual(process.call_args.args, (argv,))
                 self.assertEqual(process.call_args.kwargs['timeout'], 1200)
                 self.assertEqual(process.call_args.kwargs['stdout'], subprocess.PIPE)
@@ -411,7 +411,7 @@ class CheckpointAndRecoveryTests(unittest.TestCase):
         state.pop('test_timeout')
         state_path.write_text(json.dumps(state))
         limits = []
-        def fake(argv, cwd, timeout, *, prompt=None):
+        def fake(argv, cwd, timeout, *, prompt=None, env=None):
             if prompt is None:
                 limits.append(timeout)
                 return 124, 'timeout', True
