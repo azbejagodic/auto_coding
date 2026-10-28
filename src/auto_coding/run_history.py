@@ -92,7 +92,7 @@ class RunHistory:
     def summary(path):
         root = Path(path)
         result = {"path": path, "run_id": root.name, "status": "unknown",
-                  "repo": None, "branch": None, "time": None, "completed": None}
+                  "repo": None, "branch": None, "time": None, "completed": None, "total": None}
         try:
             # A registered directory replaced by a link must never redirect inspection.
             if root.resolve() != root:
@@ -121,7 +121,8 @@ class RunHistory:
                           repo=label(state.get("repo") or manifest.get("target_repo") or desktop.get("repo")),
                           branch=label(state.get("branch") or (state.get("auto_push") or {}).get("branch")),
                           time=label(manifest.get("start_time_utc") or state.get("created_utc")),
-                          completed=len(state["completed"]) if isinstance(state.get("completed"), list) else None)
+                          completed=len(state["completed"]) if isinstance(state.get("completed"), list) else None,
+                          total=len(manifest["task_ids"]) if isinstance(manifest.get("task_ids"), list) else None)
             status = state.get("status")
             if desktop.get("status") in {"running", "launching"}:
                 active = DesktopPID.active(desktop.get("pid"))

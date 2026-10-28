@@ -84,6 +84,17 @@ class RunHistoryTests(unittest.TestCase):
         self.assertTrue(self.bridge().open_run(str(managed))["ok"])
         self.assertEqual(len(self.bridge().recent_runs()["runs"]), 1)
 
+    def test_history_totals_use_recorded_manifest_without_changing_logs(self):
+        run = self.run_folder(self.runs / "with-manifest", {"status": "stopped", "completed": ["one"]})
+        manifest = run / "run-manifest.json"
+        manifest.write_text(json.dumps({"task_ids": ["one", "two", "three"]}), encoding="utf-8")
+        before = {p: p.read_bytes() for p in run.iterdir()}
+        row = RunHistory.summary(str(run))
+        self.assertEqual((row["completed"], row["total"]), (1, 3))
+        self.assertEqual(before, {p: p.read_bytes() for p in run.iterdir()})
+        legacy = self.run_folder(self.runs / "legacy", {"status": "completed", "completed": ["one"]})
+        self.assertIsNone(RunHistory.summary(str(legacy))["total"])
+
     def test_corrupt_index_and_atomic_write_failure_preserve_originals(self):
         history = RunHistory(self.runs)
         run = self.run_folder(self.runs / "run-ok")

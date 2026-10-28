@@ -99,6 +99,13 @@ pre{font:14px/1.6 Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere
 .attempt{border-left:4px solid #7b8b9e;margin-top:16px;padding:16px;background:#141a22;border-radius:12px}
 .attempt.approved{border-color:#7be4a5}
 .attempt.rejected{border-color:#ff9494}
+.run-row{display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px;border-top:1px solid #536174;padding:6px 0;font-size:14px}
+.run-row .run-label{flex:1;min-width:180px}
+.run-row details{width:100%;margin:0}
+.run-row button{padding:6px 12px}
+.activity-row{border-top:1px solid #536174;margin:0;font-size:14px}
+.activity-row>summary{padding:6px 0}
+.logs-status p{margin:6px 0}
 .filters{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px}
 .filters label{flex:1;min-width:180px}
 .filters input{display:block;width:100%;margin-top:8px;background:#0e1115}
@@ -303,6 +310,24 @@ function detail(title, text, key) {
   summary.taskFocus = key;
   box.append(summary, content);
   return box;
+}
+function disclosure(title, key, cls) {
+  const box = detail(title, '', key);
+  box.replaceChildren(box.children[0]);
+  if (cls) box.className = cls;
+  return box;
+}
+function eventRowsInto(parent, events, scope) {
+  events.forEach(event => {
+    const row = disclosure([event.actor, event.event, event.outcome,
+      event.task_id, event.attempt == null ? null : 'Attempt ' + event.attempt].filter(Boolean).join(' · '),
+      scope + '-event-' + (event.seq ?? event._source_order), 'activity-row');
+    row.append(el('p', 'UTC timestamp: ' + (event.timestamp_utc ?? '--')));
+    // Keep every recorded field and the original evidence actions available.
+    filesInto(row, event._evidence_status || []);
+    row.append(detail('Original event', JSON.stringify(event, null, 2), scope + '-original-' + (event.seq ?? event._source_order)));
+    parent.append(row);
+  });
 }
 function message(text, error = false) {
   for (const id of ['message', 'logs-message']) {
@@ -649,7 +674,7 @@ function renderTasks(parent, data, focusedKey) {
 function render(data) {
   evidenceViewer.hidden = page === 'overview';
   document.getElementById('logs-message').hidden = page === 'overview';
-  document.getElementById('header-context').hidden = page === 'overview';
+  document.getElementById('header-context').hidden = page !== 'tasks';
   document.getElementById('dashboard-header').className = 'top' + (page === 'overview' ? ' overview-top' : '');
   const searchFocused = document.activeElement?.id === 'log-search';
   const searchCursor = searchFocused ? document.activeElement.selectionStart : null;
@@ -770,7 +795,7 @@ function render(data) {
   updateControls();
   // Read native state before replacing nodes: toggle events can be delivered
   // after a snapshot refresh, especially when navigating with the keyboard.
-  if (evidenceRoot === data.root && page === 'tasks') {
+  if (evidenceRoot === data.root && (page === 'tasks' || page === 'logs')) {
     const remember = node => {
       if (node.detailKey) {
         if (node.open) expanded.add(node.detailKey); else expanded.delete(node.detailKey);
@@ -807,30 +832,49 @@ function render(data) {
     return;
   }
   if (page === 'logs') {
+    const selected = panel('Selected run');
+    selected.className += ' logs-status';
+    selected.append(el('p', 'Run status: ' + presentation.label));
+    if (data.root || c.logs) {
+      const state = data.state || {};
+      selected.append(el('p', [state.branch || state.auto_push?.branch || 'Branch not recorded',
+        (state.completed?.length ?? 'Unknown') + ' / ' + (data.task_count ?? c.task_count ?? 'Unknown') + ' completed'].join(' · ')));
+      const failure = [...(data.events || [])].reverse().find(event => event.metadata?.reason
+        && (['stopped', 'checkpoint_stopped'].includes(event.event) || ['failed', 'timed_out', 'error'].includes(event.outcome)));
+      const stopped = c.active !== true && (['stopped', 'checkpointing'].includes(state.status)
+        || state.pending_checkpoint || state.publication?.outcome === 'pending');
+      if (stopped && failure) selected.append(el('p', 'Stop reason: ' + failure.metadata.reason, 'red'));
+      if (statusLine) selected.append(el('p', statusLine, 'warning'));
+      selected.append(detail('Run details', JSON.stringify({path:data.root || c.logs, state:data.state,
+        controller:c, task_count:data.task_count}, null, 2), 'selected-run'));
+    } else selected.append(el('p', 'No run selected.', 'muted'));
+    app.append(selected);
     const library = panel('Recent runs');
-    library.append(el('p', 'Runs and logs are kept until you deliberately delete them. Forget removes only the history entry; log files stay on disk.', 'muted'));
     const importRun = el('button', 'Open / Import run folder');
     importRun.disabled = busy || !ready || c.active !== false || c.uncertain;
     importRun.onclick = () => act('open_run');
     library.append(importRun);
     if (recentRuns.error) library.append(el('p', recentRuns.error, 'warning'));
     if (!recentRuns.runs.length) library.append(el('p', 'No saved runs found. Start a run or explicitly import an older run folder. Only managed runs and folders you open are listed.', 'muted'));
-    recentRuns.runs.forEach(run => {
-      const row = el('section', undefined, 'attempt');
-      row.append(el('h3', run.run_id), el('p', [run.repo || 'Repository not recorded', run.branch ? 'Branch: ' + run.branch : 'Branch not recorded', run.time || 'Time not recorded', 'Status: ' + run.status, run.completed == null ? 'Completed tasks not recorded' : 'Completed tasks: ' + run.completed].join(' | ')), el('div', run.path, 'path muted'));
+    [...recentRuns.runs].sort((a, b) => (Date.parse(b.time) || 0) - (Date.parse(a.time) || 0)).forEach(run => {
+      const row = el('section', undefined, 'run-row');
+      row.append(el('span', [run.time || 'Time not recorded', run.branch || 'Branch not recorded',
+        run.completed == null ? 'Completed tasks not recorded' : run.completed + ' / ' + (run.total ?? 'Unknown') + ' completed',
+        'Status: ' + run.status].join(' · '), 'run-label'));
       const open = el('button', 'Open / View');
       open.disabled = busy || !ready || c.active !== false || c.uncertain || run.status === 'missing';
       open.onclick = () => historyAction('open_recent_run', run.path);
       const forget = el('button', 'Forget history entry');
       forget.disabled = busy || !ready;
       forget.onclick = () => historyAction('forget_run', run.path);
-      row.append(open, forget); library.append(row);
+      const full = detail('Details', JSON.stringify(run, null, 2), 'run-' + run.path);
+      full.append(el('p', 'Runs and logs are kept until you deliberately delete them. Forget removes only the history entry; log files stay on disk.', 'muted'), forget);
+      row.append(open, full); library.append(row);
     });
-    library.append(el('p', 'Showing up to 200 runs. Active or uncertain jobs keep run switching locked; their current evidence remains available below.', 'muted'));
     app.append(library);
   }
   if (page === 'logs') {
-    const exports = panel('Download Logs / Export Debug Package');
+    const exports = disclosure('Download Logs / Export Debug Package', 'exports', 'panel');
     exports.append(el('p', 'Inspect before sharing every ZIP. Run identifiers and filenames may be private.', 'warning'));
     exports.append(el('p', 'DEBUG REPORT (recommended default): bounded structured state, timeline, test results and review decisions plus inventory. Prompts, output and free-form review text are omitted. This is not a guarantee of perfect redaction.'));
     exports.append(el('p', 'FULL RAW LOGS: allowed files from this run only; prompts, review text and subprocess output may contain private data/API keys. Requires an extra native confirmation.', 'warning'));
@@ -870,19 +914,19 @@ function render(data) {
   const state = data.state || {};
   const events = data.events || [];
   const reconciled = presentation.label === 'Completed' || c.active === false && !c.uncertain && state.status === 'checkpointing';
-  if (page !== 'tasks' && c.error && !reconciled) app.append(el('div', c.error, 'notice warning'));
-  if (data.state_error) app.append(el('div', data.state_error, 'warning'));
+  if (page !== 'tasks' && c.error && !reconciled && c.error !== statusLine) app.append(el('div', c.error, 'notice warning'));
+  if (data.state_error && (page !== 'logs' || data.state_error !== statusLine)) app.append(el('div', data.state_error, 'warning'));
   if (data.empty && page !== 'tasks') app.append(el('div', 'No run state or events found. Select a project and plan to START, or inspect available raw files in Logs.', 'empty'));
   if (c.logs && !data.exists && !data.state_error) app.append(el('div', 'Log directory is missing or unavailable.', 'warning'));
   if (state.pending_checkpoint && page !== 'tasks') app.append(el('div', 'A checkpoint is pending reconciliation. No completion is inferred.', 'warning'));
-  if (state.auto_push && page === 'logs') app.append(el('div', 'This run automatically pushes approved tasks to origin/' + state.auto_push.branch + '. Resume preserves this setting.', 'notice'));
+  if (state.auto_push && page === 'logs') app.append(detail('Saved push policy', 'This run automatically pushes approved tasks to origin/' + state.auto_push.branch + '. Resume preserves this setting.', 'push-policy'));
   if (state.publication?.outcome === 'pending' && page !== 'tasks') app.append(el('div', 'Approved locally, push pending. Resolve connectivity or permissions, then use Resume (Retry Push). The same SHA is retried before any further tasks; Codex is not rerun for the approved task. Remote divergence requires manual review.', 'warning'));
   if (page === 'logs') (data.event_errors || []).forEach(error => app.append(el('div', error, 'warning')));
   if (page === 'tasks') {
     renderTasks(app, data, taskFocus);
   } else {
     if (c.exit_code != null || c.error || c.process_history?.length) app.append(detail('Process history - prior exits and diagnostics', JSON.stringify({previous_child_exit_code:c.exit_code, diagnostic:c.error, history:c.process_history || [], note:'Historical process results do not replace the current durable run outcome.'}, null, 2), 'process-history'));
-    const timeline = panel('Durable event timeline');
+    const timeline = panel('Recent activity');
     const filters = el('div', undefined, 'filters');
     const label = el('label', 'Search actor, outcome or event');
     const search = el('input'); search.id = 'log-search'; search.setAttribute('type', 'search'); search.setAttribute('aria-label', 'Search actor, outcome or event');
@@ -894,17 +938,41 @@ function render(data) {
       const query = logQuery.toLowerCase();
       const filtered = events.filter(event => JSON.stringify(event).toLowerCase().includes(query));
       results.append(el('p', filtered.length + ' of ' + events.length + ' events', 'muted'));
-      timelineInto(results, filtered);
+      // Summarize paired starts in the compact view only. The complete recorded
+      // stream below is neither grouped nor rewritten, including unknown events.
+      const finished = new Set();
+      const meaningful = [...filtered].reverse().filter(event => {
+        // Saved JSON records can have non-string event names. Keep those
+        // records visible and unchanged; only named events can form pairs.
+        if (typeof event.event !== 'string') return true;
+        const name = event.event;
+        const key = suffix => JSON.stringify([name.slice(0, -suffix.length), event.actor, event.task_id, event.attempt]);
+        if (name.endsWith('_finished')) finished.add(key('_finished'));
+        return !name.endsWith('_started') || !finished.has(key('_started'));
+      });
+      eventRowsInto(results, meaningful.slice(0, 5), 'recent');
+      if (!filtered.length) timelineInto(results, []);
+      const all = disclosure('Show all events (' + filtered.length + ')', 'all-events');
+      all.append(el('p', 'Every matching recorded event, newest first. Expand an event for its exact UTC timestamp, original JSON and evidence.', 'muted'));
+      eventRowsInto(all, [...filtered].reverse(), 'all');
+      results.append(all);
     };
     search.oninput = () => { logQuery = search.value; draw(); };
     draw(); timeline.append(results);
     app.append(timeline);
-    const files = panel('Raw evidence files');
+    const files = disclosure('Raw evidence files', 'raw-files', 'panel');
     files.append(el('p', 'Select a file to read its original text below. Display is bounded to 1 MB per file.', 'muted'));
     (data.files || []).forEach(file => { const row = el('p'); filesInto(row, [file]); files.append(row); });
     if (!data.files?.length) files.append(el('p', 'No raw files listed.', 'muted'));
     app.append(files);
     if (searchFocused) { search.focus(); search.setSelectionRange(searchCursor, searchCursor); }
+    else if (taskFocus) {
+      const restore = node => {
+        if (node.taskFocus === taskFocus) node.focus();
+        Array.from(node.children || []).forEach(restore);
+      };
+      restore(app);
+    }
   }
 }
 function navigate(name) {

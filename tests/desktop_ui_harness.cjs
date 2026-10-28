@@ -76,6 +76,7 @@ const assertCards = (status, completed, child) => {
   assert(get('start').disabled);
   await listeners.pywebviewready(); await flush();
   if (mode === 'tasks') { await taskContracts(); return; }
+  if (mode === 'logs') { await logsContracts(); return; }
   if (mode === 'saved' || mode === 'stale') {
     assert.equal(get('github-repo').value, 'owner/repo');
     assert.equal(get('attempts').value, '7');
@@ -635,6 +636,53 @@ const assertCards = (status, completed, child) => {
   assert(snapshotReads > 5);
   console.log('Dashboard button, navigation, polling, evidence and state contracts passed');
 })().catch(error => { console.error(error); process.exitCode = 1; });
+
+async function logsContracts() {
+  // desktop_reader accepts arbitrary JSON values in the event field. These
+  // saved records must not prevent Logs or its evidence actions from rendering.
+  data.root = data.controller.logs = 'saved/non-string-events';
+  data.exists = true;
+  data.state = {status:'stopped', completed:[]};
+  data.files = [{label:'Review', path:'review.txt', status:'available'}];
+  data.events = [42, null, false, 0, {name:'process_finished'}, ['process_started'],
+    'process_started', 'process_finished'].map((name, index) => ({
+      seq:index + 1, event:name, actor:'controller', outcome:'failed',
+      timestamp_utc:'2026-10-25T11:00:00.123456Z', task_id:'one', attempt:1,
+      metadata:{reason:'Exact saved-run failure', original:index},
+      _evidence_status:structuredClone(data.files)
+    }));
+  const originals = structuredClone(data.events);
+  await click('nav-logs');
+  assert(contents().includes('Recent activity'));
+  assert(contents().includes('Stop reason: Exact saved-run failure'));
+  assert(contents().includes('Raw evidence files'));
+  let all = walk(get('app')).find(node => node.detailKey === 'all-events');
+  assert.equal(all.open, false, 'Complete stream is collapsed by default');
+  all.open = true; all.ontoggle();
+  const rows = all.children.filter(node => node.className === 'activity-row');
+  assert.equal(rows.length, originals.length);
+  assert.deepEqual(rows.map(row => JSON.parse(walk(row).find(node => node.tag === 'pre').textContent)),
+    [...originals].reverse(), 'Every raw event retains its original JSON values');
+  for (const row of rows) {
+    row.open = true; row.ontoggle();
+    assert(row.textContent.includes('2026-10-25T11:00:00.123456Z'));
+    assert(row.textContent.includes('controller'));
+    assert(row.textContent.includes('Attempt 1'));
+    await walk(row).find(node => node.textContent === 'review.txt (available)').onclick();
+    assert(get('evidence-viewer').textContent.includes('original evidence: review.txt'));
+  }
+  const rawFiles = walk(get('app')).find(node => node.detailKey === 'raw-files');
+  rawFiles.open = true; rawFiles.ontoggle();
+  await walk(rawFiles).find(node => node.textContent === 'review.txt (available)').onclick();
+  const search = walk(get('app')).find(node => node.id === 'log-search');
+  search.value = '"event":42'; search.oninput();
+  assert(contents().includes('1 of 8 events'));
+  all = walk(get('app')).find(node => node.detailKey === 'all-events');
+  assert.equal(all.children.filter(node => node.className === 'activity-row').length, 1);
+  search.value = ''; search.oninput();
+  assert(contents().includes('8 of 8 events'));
+  assert.deepEqual(data.events, originals, 'Grouping and searching never mutate saved records');
+}
 
 async function taskContracts() {
   const base = Date.parse('2026-10-25T11:00:00Z');
