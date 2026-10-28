@@ -31,13 +31,11 @@ button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visi
 .nav.active{background:#1e3149;border-color:#3d6490;color:#fff}
 .side p{font-size:14px;margin-top:24px}
 .main{margin-left:210px;padding:24px 32px;flex:1;min-width:0;max-width:1700px;overflow-wrap:anywhere}
-.top{display:flex;justify-content:space-between;gap:16px;align-items:center;margin-bottom:16px}
-.overview-top{justify-content:flex-start}
-.overview-top #refresh{margin-top:0!important}
-.overview-top>div:last-child{display:flex;align-items:center;gap:12px}
-.top>div:first-child{min-width:0}
-.top>div:last-child{flex-shrink:0}
-.top h1{font-size:26px;margin:4px 0}
+.top{display:flex;justify-content:space-between;gap:16px;align-items:center;min-height:46px;margin-bottom:12px}
+.top h1{font-size:26px;line-height:1.5;margin:0;min-width:0}
+.header-actions{display:flex;align-items:center;gap:12px;margin-left:auto;flex-shrink:0}
+.header-actions .pill{min-width:112px;height:46px;display:flex;align-items:center;justify-content:center;padding:10px 12px;white-space:nowrap}
+.header-actions button{width:104px;height:46px;padding:10px 16px;flex-shrink:0}
 .muted{color:#b0bccb}
 .label{color:#b0bccb;font-size:13px;font-weight:600;letter-spacing:.06em;text-transform:uppercase}
 .panel,.card{background:#293544;border:1px solid #536174;border-radius:16px;padding:16px}
@@ -108,9 +106,6 @@ pre{font:14px/1.6 Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere
 .run-label small{display:block}
 .run-result{width:100%}
 .run-list{max-height:65vh;overflow-y:auto}
-.logs-top #header-context .label,.logs-top #selected-project{display:none}
-.logs-top>div:last-child{display:flex;align-items:center;gap:12px}
-.logs-top #refresh{margin-top:0!important}
 .activity-row{border-top:1px solid #536174;margin:0;font-size:14px}
 .activity-row>summary{padding:6px 0}
 .logs-status p{margin:6px 0}
@@ -118,8 +113,6 @@ pre{font:14px/1.6 Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere
 .filters label{flex:1;min-width:180px}
 .filters input{display:block;width:100%;margin-top:8px;background:#0e1115}
 progress{width:100%;height:12px;accent-color:#72adf9}
-.project-heading{overflow-wrap:anywhere;max-width:650px}
-#header-state{white-space:nowrap}
 #evidence-viewer:empty{display:none}
 /* Compact Tasks rows; technical evidence stays in native expanders. */
 .task-list{padding:0;border:1px solid #536174;border-radius:12px;background:#293544}
@@ -145,7 +138,6 @@ progress{width:100%;height:12px;accent-color:#72adf9}
 #run-setup #start,#run-setup #resume{width:140px;min-width:140px;font-size:18px}
 #run-setup .branch-line{gap:8px}
 #run-setup .branch-line button,#run-setup .repository-line button,#run-setup #github-repo{padding:8px 12px}
-.overview-top{margin-bottom:12px}
 #run-setup:not([hidden]) ~ #app .grid{margin:12px 0}
 #run-setup .step-title,#run-setup .field label{margin-bottom:4px}
 #run-setup .notice p{margin:6px 0}
@@ -161,7 +153,10 @@ progress{width:100%;height:12px;accent-color:#72adf9}
 .events{font-size:14px}
 }
 @media(max-width:760px){
-.side{position:static;width:auto;padding:12px 16px}.shell{display:block}.brand{margin:0 0 8px}.side nav{display:flex;gap:8px}.nav{margin:0;padding:10px}.main{margin-left:0;padding:16px}.top{align-items:flex-start}.top h1{font-size:24px}.repository-line{grid-template-columns:minmax(0,1fr)}#run-setup .setup-fields{grid-template-columns:minmax(0,1fr)}.grid{grid-template-columns:minmax(0,1fr)}.field-line{flex-wrap:wrap}.selected-path{flex-basis:100%}.panel{padding:16px}.filters label{min-width:0}.top>div:last-child{flex-shrink:1}#header-state{white-space:normal}
+.side{position:static;width:auto;padding:12px 16px}.shell{display:block}.brand{margin:0 0 8px}.side nav{display:flex;gap:8px}.nav{margin:0;padding:10px}.main{margin-left:0;padding:16px}.top h1{font-size:24px}.repository-line{grid-template-columns:minmax(0,1fr)}#run-setup .setup-fields{grid-template-columns:minmax(0,1fr)}.grid{grid-template-columns:minmax(0,1fr)}.field-line{flex-wrap:wrap}.selected-path{flex-basis:100%}.panel{padding:16px}.filters label{min-width:0}
+}
+@media(max-width:480px){
+.top{flex-wrap:wrap}
 }
 @media(prefers-reduced-motion:reduce){button{transition:none}
 }
@@ -177,15 +172,11 @@ progress{width:100%;height:12px;accent-color:#72adf9}
 </nav>
 </aside>
 <main class="main">
-<header id="dashboard-header" class="top overview-top">
-<div id="header-context" hidden>
-<div class="label">Local developer workspace</div>
+<header id="dashboard-header" class="top" aria-labelledby="page-title">
 <h1 id="page-title">Overview</h1>
-<div class="muted project-heading" id="selected-project">No project selected</div>
-</div>
-<div>
+<div class="header-actions">
 <div id="header-state" class="pill" role="status" aria-live="polite" aria-atomic="true">Idle</div>
-<button id="refresh" style="margin-top:12px">Refresh</button>
+<button id="refresh">Refresh</button>
 </div>
 </header>
 <section class="panel" id="run-setup" aria-labelledby="setup-title">
@@ -684,8 +675,6 @@ function renderTasks(parent, data, focusedKey) {
 function render(data) {
   evidenceViewer.hidden = page !== 'tasks';
   document.getElementById('logs-message').hidden = page === 'overview';
-  document.getElementById('header-context').hidden = page === 'overview';
-  document.getElementById('dashboard-header').className = 'top' + (page === 'overview' ? ' overview-top' : page === 'logs' ? ' logs-top' : '');
   latest = data;
   const c = data.controller || {};
   const preferences = data.preferences || {};
@@ -711,7 +700,6 @@ function render(data) {
     const field = document.getElementById(id);
     if (field.textContent !== value) field.textContent = value;
   });
-  document.getElementById('selected-project').textContent = c.repository || c.repo || 'No project selected';
   const connection = document.getElementById('github-state');
   const currentBranch = c.preflight?.branch;
   const publication = c.github?.error || !currentBranch ? 'Publication unknown' : c.push?.eligible ? 'Approved checkpoints pending push'

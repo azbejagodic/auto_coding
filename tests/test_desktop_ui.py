@@ -205,7 +205,7 @@ class DesktopUITests(unittest.TestCase):
                              'fetch-github', 'select-branch', 'new-branch', 'start', 'resume',
                              'push-approved', 'auto-push'):
                     self.assertTrue(page.locator('#' + name).is_visible(), name)
-                self.assertFalse(page.locator('#header-context').is_visible())
+                self.assertTrue(page.locator('#page-title').is_visible())
                 for removed in ('Repository and branch', '1. Repository', '2. Task plan', '3. Attempts',
                                 '4. Start', 'Run overview', 'Local developer workspace',
                                 'Current task'):
@@ -540,6 +540,83 @@ class DesktopUITests(unittest.TestCase):
                 self.assertIn('restored', page.locator('#app').inner_text())
                 page.locator('#nav-overview').click()
                 self.assertFalse(page.locator('#open-run').is_visible())
+                self.assertEqual(failures, [])
+            finally:
+                browser.close()
+
+    def test_common_header_rendered_geometry_state_and_refresh(self):
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            self.skipTest("Playwright absent; rendered header checks unavailable")
+        with sync_playwright() as playwright:
+            try:
+                browser = playwright.chromium.launch(headless=True)
+            except Exception as exc:
+                self.skipTest(f"Chromium unavailable: {exc}")
+            try:
+                page = browser.new_page()
+                failures = []
+                page.on('pageerror', lambda error: failures.append(str(error)))
+                page.route('**/*', lambda route: route.abort())
+                page.set_content(HTML)
+                page.evaluate("""() => {
+                  window.reads = 0;
+                  window.fixture = {root:'', events:[], state:null,
+                    controller:{active:false, uncertain:false}};
+                  window.pywebview = {api:{
+                    snapshot:async () => { reads++; return structuredClone(fixture); },
+                    recent_runs:async () => ({runs:[]})
+                  }};
+                  window.dispatchEvent(new Event('pywebviewready'));
+                }""")
+                page.wait_for_function("!document.getElementById('refresh').disabled")
+                header = page.locator('#dashboard-header')
+                for width in (960, 1000, 1100, 1250, 640, 390):
+                    page.set_viewport_size({'width':width, 'height':720})
+                    for state, label in ((None, 'Idle'), ('running', 'Running'),
+                                         ('stopped', 'Stopped'), ('completed', 'Completed')):
+                        geometry = []
+                        for view, title in (('overview', 'Overview'), ('tasks', 'Tasks'), ('logs', 'Logs')):
+                            page.locator('#nav-' + view).click()
+                            # Change the bridge data without rendering; the real button must fetch it.
+                            page.evaluate("""state => {
+                              fixture.root = state ? 'mock/run' : '';
+                              fixture.exists = !!state;
+                              fixture.state = state ? {status:state, completed:[], history:[]} : null;
+                              fixture.controller.active = state === 'running';
+                            }""", state)
+                            before = page.evaluate('reads')
+                            header.get_by_role('button', name='Refresh', exact=True).click()
+                            page.wait_for_function('before => reads > before', arg=before)
+                            self.assertEqual(header.get_by_role('heading', level=1).inner_text(), title)
+                            self.assertEqual(page.locator('main h1').count(), 1)
+                            self.assertEqual(header.get_by_role('status').count(), 1)
+                            self.assertEqual(header.get_by_role('status').inner_text(), label)
+                            self.assertEqual(page.locator('main button').filter(has_text='Refresh').count(), 1)
+                            self.assertEqual(header.locator(':scope > h1 + .header-actions').count(), 1)
+                            self.assertEqual(header.locator('.header-actions > #header-state + #refresh').count(), 1)
+                            self.assertEqual(header.get_attribute('class'), 'top')
+                            for removed in ('LOCAL DEVELOPER WORKSPACE', 'OVERVIEW PAGE', 'TASKS PAGE', 'LOGS PAGE'):
+                                self.assertNotIn(removed, page.locator('main').inner_text().upper())
+                            boxes = [page.locator(selector).bounding_box() for selector in
+                                     ('#dashboard-header', '#page-title', '#header-state', '#refresh')]
+                            outer, heading, badge, button = boxes
+                            self.assertEqual(heading['x'], outer['x'])
+                            self.assertAlmostEqual(button['x'] + button['width'], outer['x'] + outer['width'])
+                            self.assertLessEqual(badge['x'] + badge['width'], button['x'])
+                            self.assertEqual(badge['height'], button['height'])
+                            if width >= 640:
+                                self.assertLessEqual(heading['x'] + heading['width'], badge['x'])
+                                self.assertAlmostEqual(heading['y'] + heading['height']/2,
+                                                       button['y'] + button['height']/2)
+                            # Ignore title width; all other header geometry must match across pages.
+                            geometry.append([outer, {k:v for k,v in heading.items() if k != 'width'}, badge, button])
+                            self.assertTrue(page.evaluate('document.documentElement.scrollWidth <= innerWidth'))
+                            first_content = page.locator('#run-setup' if view == 'overview' else '#run-selection' if view == 'tasks' else '#app').bounding_box()
+                            self.assertLessEqual(outer['y'] + outer['height'], first_content['y'])
+                        self.assertEqual(geometry[0], geometry[1], f'{width}px {label}: Tasks differs')
+                        self.assertEqual(geometry[0], geometry[2], f'{width}px {label}: Logs differs')
                 self.assertEqual(failures, [])
             finally:
                 browser.close()

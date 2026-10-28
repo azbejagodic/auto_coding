@@ -244,7 +244,7 @@ const assertCards = (status, completed, child) => {
   get('github-repo').value = 'https:' + '//github.com/Owner/Repo.git';
   await click('connect-github');
   assert.deepEqual(calls.at(-1), ['connect_github', 'https:' + '//github.com/Owner/Repo.git']);
-  assert(get('selected-project').textContent.includes('owner/repo'));
+  assert.equal(get('project-path').textContent, 'managed/checkout');
   assert(get('github-state').textContent.includes('main | Clean'));
   assert(get('start').disabled && get('push-approved').disabled);
   assert(get('github-state').textContent.includes('Published at abc123 (cached origin/main)'));
