@@ -12,6 +12,7 @@ import subprocess
 import time
 import uuid
 from functools import wraps
+from auto_coding.process_runner import bounded_run, OutputLimitExceeded, MAX_CAPTURE_BYTES
 
 
 _uncertain_process = ContextVar("autocoding_uncertain_process", default=None)
@@ -195,7 +196,7 @@ class GitHubWorkspaceManager:
         self.workspaces = self.root / "workspaces"
         self.runs_dir = self.root / "runs"
         self.active_check = active_check
-        self.run_command = run_command or subprocess.run
+        self.run_command = run_command or bounded_run
 
     def _command(self, argv, cwd=None, allowed=(0,), *, preserve=False):
         env = os.environ.copy()
@@ -203,18 +204,27 @@ class GitHubWorkspaceManager:
         try:
             # Git emits UTF-8 paths and refs even on Windows ACP locales.
             result = self.run_command(argv, cwd=cwd, capture_output=True, text=True,
-                                      encoding="utf-8", errors="replace",
+                                      encoding="utf-8", errors="surrogateescape" if argv[0] == "git" else "replace",
                                       shell=False, timeout=120, env=env)
         except FileNotFoundError:
             raise WorkspaceError("unavailable", "Required command is unavailable.") from None
         except subprocess.TimeoutExpired:
             mark_process_uncertain()
             raise WorkspaceError("network", "Command failed or timed out; inspect connectivity.") from None
+        except OutputLimitExceeded:
+            mark_process_uncertain()
+            raise WorkspaceError("output_limit", "Command output exceeded the safe capture limit; inspect the checkout.") from None
         except OSError:
             raise WorkspaceError("network", "Command failed or timed out; inspect connectivity.") from None
         except BaseException:
             mark_process_uncertain()
             raise
+        # Injected command runners retain their existing interface, but their
+        # results must obey the same completeness rule as the production runner.
+        if (len((result.stdout or "").encode("utf-8", errors="surrogateescape"))
+                + len((result.stderr or "").encode("utf-8", errors="surrogateescape")) > MAX_CAPTURE_BYTES):
+            mark_process_uncertain()
+            raise WorkspaceError("output_limit", "Command output exceeded the safe capture limit; inspect the checkout.")
         if result.returncode not in allowed:
             # Never return command arguments, URLs or raw diagnostics (which may contain tokens).
             diagnostic = (result.stderr or "").lower()
@@ -427,7 +437,7 @@ class GitHubWorkspaceManager:
                         or parts[-1].endswith((".pem", ".key", ".p12", ".pfx"))):
                     raise WorkspaceError("sensitive", "Generated or sensitive files block publication. Inspect the checkpoint locally.")
             patch = self._command(["git", "show", "--format=", "--binary", "--no-ext-diff", commit], repo, preserve=True)
-            if hashlib.sha256(patch.encode("utf-8", errors="replace")).hexdigest() != record["diff_sha256"]:
+            if hashlib.sha256(patch.encode("utf-8", errors="surrogateescape")).hexdigest() != record["diff_sha256"]:
                 raise WorkspaceError("approval", "Checkpoint bytes differ from the approved patch; inspect before publishing.")
         return {"eligible": True, "branch": branch, "commits": len(commits), "reason": "Approved local checkpoints can be published. Remote state is rechecked on push."}
 

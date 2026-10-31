@@ -21,6 +21,7 @@ from auto_coding.event_log import EventLog, EventLogError
 from auto_coding.github_workspace import (managed_job, WorkspaceError, cancel_reservation,
                                          mark_process_uncertain, GitHubWorkspaceManager,
                                          normalize_repository)
+from auto_coding.process_runner import bounded_run, OutputLimitExceeded
 
 
 MAX_PLAN = 512 * 1024
@@ -85,19 +86,19 @@ def save_json(path: Path, value: dict) -> None:
 
 
 def call(argv: list[str], cwd: Path, timeout: int, *, prompt: str | None = None) -> tuple[int, str, bool]:
-    """Capture all tool output for a diagnostic bundle; no shell execution."""
+    """Capture complete bounded tool output; no shell execution."""
     try:
-        result = subprocess.run(argv, cwd=str(cwd), input=prompt, text=True,
-                                encoding="utf-8", errors="replace",
+        result = bounded_run(argv, cwd=str(cwd), input=prompt, text=True,
+                                encoding="utf-8", errors="surrogateescape" if argv[0] == "git" else "replace",
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 timeout=timeout, check=False, shell=False)
-        return result.returncode, (result.stdout or "")[:MAX_OUTPUT], False
+        return result.returncode, result.stdout or "", False
     except subprocess.TimeoutExpired as exc:
         mark_process_uncertain()
-        output = exc.stdout or b""
-        if isinstance(output, bytes):
-            output = output.decode("utf-8", errors="replace")
-        return 124, str(output)[-MAX_OUTPUT:] + "\nPROCESS TIMED OUT", True
+        return 124, "PROCESS TIMED OUT", True
+    except OutputLimitExceeded:
+        mark_process_uncertain()
+        return 125, "PROCESS OUTPUT EXCEEDED SAFE LIMIT", False
     except OSError as exc:
         return 127, f"Process could not start: {type(exc).__name__}", False
     except BaseException:
@@ -163,7 +164,9 @@ def git_patch(repo: Path, args: list[str]) -> str:
 
 def head(repo: Path) -> str | None:
     rc, output, timed = call(["git", "rev-parse", "--verify", "HEAD"], repo, 15)
-    return output.strip() if rc == 0 and not timed else None
+    if timed or rc not in (0, 128):
+        raise PilotError("Could not determine Git HEAD safely")
+    return output.strip() if rc == 0 else None
 
 
 def git_clean(repo: Path) -> bool:
@@ -214,7 +217,9 @@ def staging_summary(repo: Path) -> tuple[str, str, str]:
             # Handle the previous V2 failure, where a cache file is already staged.
             # Never silently unstage a file already present in a previous commit.
             if head(repo) is not None:
-                exists, _, _ = call(["git", "cat-file", "-e", f"HEAD:{item}"], repo, 15)
+                exists, _, timed = call(["git", "cat-file", "-e", f"HEAD:{item}"], repo, 15)
+                if timed or exists not in (0, 1, 128):
+                    raise PilotError("Could not verify tracked generated file safely")
                 if exists == 0:
                     raise PilotError(f"Previously tracked generated file changed: {item}; inspect manually")
             git(repo, ["rm", "-q", "-f", "--cached", "--", item])
@@ -230,7 +235,7 @@ def staging_summary(repo: Path) -> tuple[str, str, str]:
             raise PilotError(f"Sensitive file staged: {item}; inspect manually")
     # Diff is used for both the reviewer and an approval-to-commit integrity check.
     diff = git_patch(repo, ["diff", "--cached", "--binary", "--no-ext-diff"])
-    diff_hash = hashlib.sha256(diff.encode("utf-8", errors="replace")).hexdigest()
+    diff_hash = hashlib.sha256(diff.encode("utf-8", errors="surrogateescape")).hexdigest()
     stat = git(repo, ["diff", "--cached", "--stat"])
     return stat, diff, diff_hash
 
@@ -275,7 +280,7 @@ def verify_approved_commit(repo: Path, pending: dict, current: str | None) -> No
     base = pending.get("base_head")
     expected_lineage = [current, base] if base else [current]
     committed_diff = git_patch(repo, ["show", "--format=", "--binary", "--no-ext-diff", "HEAD"])
-    committed_sha256 = hashlib.sha256(committed_diff.encode("utf-8", errors="replace")).hexdigest()
+    committed_sha256 = hashlib.sha256(committed_diff.encode("utf-8", errors="surrogateescape")).hexdigest()
     if (message != f"auto-coding: {pending['task']}" or lineage != expected_lineage
             or committed_sha256 != pending.get("diff_sha256")):
         raise PilotError("Recovered checkpoint does not match the approved parent and diff; inspect manually")
@@ -307,7 +312,7 @@ def recover_checkpoint(repo: Path, state: dict, state_path: Path, events: EventL
     if git(repo, ["diff", "--name-only"]).strip() or git(repo, ["ls-files", "--others", "--exclude-standard"]).strip():
         raise PilotError("Unreviewed edits after approval: inspect before resume")
     diff = git_patch(repo, ["diff", "--cached", "--binary", "--no-ext-diff"])
-    if hashlib.sha256(diff.encode("utf-8", errors="replace")).hexdigest() != pending["diff_sha256"]:
+    if hashlib.sha256(diff.encode("utf-8", errors="surrogateescape")).hexdigest() != pending["diff_sha256"]:
         raise PilotError("Approved diff changed before checkpoint")
     if events:
         events.emit("Git", "checkpoint_started", "started", task_id=task,

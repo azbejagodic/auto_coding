@@ -19,6 +19,7 @@ from auto_coding.desktop_reader import read_run, read_evidence
 from auto_coding.simple_run import PilotError, load_tasks
 from auto_coding.github_workspace import (GitHubWorkspaceManager, storage_root, serialized_launch,
     managed_lock, reserve_job, cancel_reservation)
+from auto_coding.process_runner import bounded_run
 
 
 class DesktopController:
@@ -117,15 +118,15 @@ class DesktopController:
         try:
             repo = Path(path).expanduser().resolve(strict=True)
             if not repo.is_dir(): raise ValueError("Target must be a directory.")
-            top = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=repo, capture_output=True,
-                                 text=True, encoding="utf-8", errors="replace", shell=False)
+            top = bounded_run(["git", "rev-parse", "--show-toplevel"], cwd=repo, capture_output=True,
+                              text=True, encoding="utf-8", errors="surrogateescape", shell=False, timeout=10)
             if top.returncode or Path(top.stdout.strip()).resolve() != repo:
                 raise ValueError("Select the Git repository root, not a subdirectory.")
             self.repo = repo
             self.repository = None
             self.error = None
             return {"ok": True, "path": str(repo), "error": None}
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
             self.repo = None
             self.repository = None
             self.error = f"Repository validation failed: {exc}"
@@ -173,15 +174,15 @@ class DesktopController:
         if self._other_active_run():
             result["errors"].append("An earlier desktop run may still be active. Open its logs and wait for it to stop.")
         try:
-            branch = subprocess.run(["git", "branch", "--show-current"], cwd=self.repo,
-                                    capture_output=True, text=True, encoding="utf-8", errors="replace", shell=False, timeout=10)
+            branch = bounded_run(["git", "branch", "--show-current"], cwd=self.repo,
+                                 capture_output=True, text=True, encoding="utf-8", errors="surrogateescape", shell=False, timeout=10)
             result["branch"] = branch.stdout.strip() if not branch.returncode else None
             if not result["branch"]:
                 result["errors"].append("Select a feature branch; detached HEAD or unavailable Git branch.")
             elif result["branch"].lower() in {"main", "master"}:
                 result["errors"].append("Runs are blocked on main/master. Switch to a feature branch first.")
-            status = subprocess.run(["git", "status", "--porcelain", "--untracked-files=all"],
-                                    cwd=self.repo, capture_output=True, text=True, encoding="utf-8", errors="replace", shell=False, timeout=10)
+            status = bounded_run(["git", "status", "--porcelain", "--untracked-files=all"],
+                                 cwd=self.repo, capture_output=True, text=True, encoding="utf-8", errors="surrogateescape", shell=False, timeout=10)
             result["clean"] = not status.stdout.strip() if not status.returncode else None
             if status.returncode:
                 result["errors"].append("Could not check Git working tree.")

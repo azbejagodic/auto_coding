@@ -386,7 +386,7 @@ class DesktopBridgeTests(unittest.TestCase):
                  "plan_sha256": hashlib.sha256(self.plan.read_bytes()).hexdigest()}
         (controller.logs / "state.json").write_text(json.dumps(state))
         process.poll.return_value = None
-        with patch("auto_coding.desktop_control.subprocess.run",
+        with patch("auto_coding.desktop_control.bounded_run",
                    return_value=SimpleNamespace(returncode=0, stdout="feature/test")):
             self.assertTrue(bridge.resume()["ok"])
         self.assertEqual(popen.call_count, 2)

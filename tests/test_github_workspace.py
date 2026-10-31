@@ -714,7 +714,7 @@ class WorkspaceTests(unittest.TestCase):
         @managed_job
         def job(plan, repo, logs):
             local_commit(repo, "example")
-        with patch("auto_coding.simple_run.subprocess.run", side_effect=command):
+        with patch("auto_coding.simple_run.bounded_run", side_effect=command):
             with self.assertRaises(PilotError):
                 job(None, repo, None)
         self.assertTrue((managed_lock(repo, ".job.lock") / "uncertain").exists())
@@ -727,7 +727,7 @@ class WorkspaceTests(unittest.TestCase):
         @managed_job
         def job(plan, repo, logs):
             call(["git", "status"], repo, 15)
-        with patch("auto_coding.simple_run.subprocess.run", side_effect=KeyboardInterrupt):
+        with patch("auto_coding.simple_run.bounded_run", side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
                 job(None, repo, None)
         self.assertTrue((managed_lock(repo, ".job.lock") / "uncertain").exists())
