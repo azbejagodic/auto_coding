@@ -27,12 +27,19 @@ from auto_coding.process_runner import bounded_run, OutputLimitExceeded
 MAX_PLAN = 512 * 1024
 MAX_OUTPUT = 16 * 1024 * 1024
 MAX_REVIEW_PROCESS_ATTEMPTS = 3
+MAX_VERDICT_BYTES = 128 * 1024
+MAX_REVIEW_ISSUE_CHARS = 2000
+MAX_REVIEW_ISSUES_TOTAL = 9000
+MAX_REVIEW_SUMMARY_CHARS = 4000
+MAX_CORRECTION_CONTEXT = 14000
+MAX_TEST_FEEDBACK = 12000
 VERDICT_SCHEMA = {
     "type": "object",
     "properties": {
         "decision": {"type": "string", "enum": ["APPROVED", "REJECTED"]},
-        "issues": {"type": "array", "items": {"type": "string"}, "maxItems": 20},
-        "summary": {"type": "string"},
+        "issues": {"type": "array", "items": {"type": "string", "minLength": 1,
+                                             "maxLength": MAX_REVIEW_ISSUE_CHARS}, "maxItems": 20},
+        "summary": {"type": "string", "minLength": 1, "maxLength": MAX_REVIEW_SUMMARY_CHARS},
     },
     "required": ["decision", "issues", "summary"],
     "additionalProperties": False,
@@ -259,16 +266,24 @@ def staging_summary(repo: Path) -> tuple[str, str, str]:
 
 def checked_review(verdict_path: Path) -> dict:
     try:
-        verdict = json.loads(verdict_path.read_text(encoding="utf-8"))
+        with verdict_path.open("rb") as stream:
+            raw = stream.read(MAX_VERDICT_BYTES + 1)
+        if len(raw) > MAX_VERDICT_BYTES:
+            raise ValueError("Oversized verdict")
+        verdict = json.loads(raw.decode("utf-8"))
         if (not isinstance(verdict, dict) or set(verdict) != {"decision", "issues", "summary"}
                 or verdict["decision"] not in ("APPROVED", "REJECTED")
                 or not isinstance(verdict["issues"], list) or len(verdict["issues"]) > 20
-                or any(not isinstance(x, str) or not x.strip() for x in verdict["issues"])
+                or any(not isinstance(x, str) or not x.strip()
+                       or len(x) > MAX_REVIEW_ISSUE_CHARS for x in verdict["issues"])
+                or sum(len(x) for x in verdict["issues"]) > MAX_REVIEW_ISSUES_TOTAL
                 or (verdict["decision"] == "REJECTED" and not verdict["issues"])
-                or not isinstance(verdict["summary"], str)):
+                or (verdict["decision"] == "APPROVED" and verdict["issues"])
+                or not isinstance(verdict["summary"], str) or not verdict["summary"].strip()
+                or len(verdict["summary"]) > MAX_REVIEW_SUMMARY_CHARS):
             raise ValueError("Invalid verdict")
         return verdict
-    except (ValueError, OSError) as exc:
+    except (ValueError, OSError, UnicodeError) as exc:
         raise PilotError("Invalid or missing Codex B verdict; see event logs") from exc
 
 
@@ -389,15 +404,74 @@ def publish_approved(repo, state, state_path, events):
     return True
 
 
+def correction_context(prior: list[dict]) -> str:
+    """Keep the latest blockers complete and older review issues as a bounded checklist."""
+    if not prior:
+        return ""
+    latest = prior[-1]
+    review = latest.get("review")
+    if isinstance(review, dict) and review.get("decision") == "REJECTED":
+        issues = review["issues"]
+        current = "\n".join(f"{index}. {issue}" for index, issue in enumerate(issues, 1))
+        label = f"CURRENT CODEX B BLOCKERS (attempt {latest.get('attempt', '?')}):\n"
+        seen = {issue.strip().casefold() for issue in issues}
+    else:
+        current = latest.get("feedback") or ""
+        label = f"LATEST FAILURE (attempt {latest.get('attempt', '?')}):\n"
+        seen = set()
+    if not current:
+        current = "No detailed feedback was recorded for the latest attempt; recheck earlier issues."
+    guidance = ("Fix the reported problems in the current task. Preserve behavior that "
+                "already works and keep the change focused. Recheck earlier review issues "
+                "and fix any still present; do not rework an issue that is already fixed. "
+                "Omission from a later review is not proof that an earlier issue is resolved.\n\n")
+    base = guidance + label
+    if len(base) + len(current) > MAX_CORRECTION_CONTEXT - 250:
+        marker = "\n[Feedback shortened; full evidence remains in the run logs.]\n"
+        room = MAX_CORRECTION_CONTEXT - 250 - len(base) - len(marker)
+        current = current[:room // 2] + marker + current[-(room - room // 2):]
+    result = base + current
+    earlier = []
+    for entry in reversed(prior[:-1]):
+        verdict = entry.get("review")
+        if not isinstance(verdict, dict) or verdict.get("decision") != "REJECTED":
+            continue
+        for issue in verdict.get("issues", []):
+            key = issue.strip().casefold()
+            if key and key not in seen:
+                seen.add(key)
+                earlier.append(f"- attempt {entry.get('attempt', '?')}: {issue}")
+    if earlier:
+        heading = "\n\nEARLIER REVIEW ISSUES TO RECHECK:\n"
+        room = MAX_CORRECTION_CONTEXT - len(result) - len(heading) - 100
+        included = []
+        for line in earlier:
+            if len(line) + 1 <= room:
+                included.append(line)
+                room -= len(line) + 1
+        omitted = len(earlier) - len(included)
+        if included or omitted:
+            result += heading + "\n".join(included)
+            if omitted:
+                result += f"\n[{omitted} older review issue(s) omitted from this prompt; see run history.]"
+    return result
+
+
 def review_prompt_for(task: dict, stat: str, diff: str, tests: list[dict]) -> str:
     return ("You are Codex B, an independent READ-ONLY reviewer. Inspect the current "
         "task's STAGED diff, all relevant project files, and tests. Previous tasks are locally "
         "committed. Do not blindly trust implementer claims or test results. Reject only for "
         "substantive, reproducible blockers in the CURRENT task/slice. List ALL such blockers "
-        "together in one verdict, with reproduction evidence. Do not block approval for "
+        "together in one verdict. For EACH rejected issue, state the affected path or behavior, "
+        "a minimal reproduction, the observed and expected results, and a concrete check "
+        "that would show it is fixed. Keep each issue self-contained and concise. "
+        f"Use at most {MAX_REVIEW_ISSUES_TOTAL} characters across all issues. "
+        "Independently recheck corrected code; report blockers still present or newly introduced. "
+        "Do not block approval for "
         "optional polish, hypothetical risks, unrelated pre-existing issues or future slices. "
         "If no current blockers remain, return APPROVED with an empty issues list; put any "
-        "optional polish in summary as non-blocking suggestions. Inspect Git/credential safety "
+        "optional polish in summary as non-blocking suggestions. Put every blocker in issues, "
+        "not only in summary; the decision and issues must agree. Inspect Git/credential safety "
         "and data-loss risks carefully. Merge to Main and per-task model/reasoning selection "
         "are deferred and are not approval blockers. Do not change files.\n\nTASK:\n" + task["prompt"] +
         "\n\nCURRENT TASK CHANGES:\n" + stat + "\n\nDIFF (truncated; inspect repository for full):\n" + diff[:35000] +
@@ -542,7 +616,7 @@ def review_ready_task(repo: Path, logs: Path, state: dict, state_path: Path,
                     print(f"[{ident}] APPROVED — saved local checkpoint {commit[:8]}", flush=True)
                     return "approved" if publish_approved(repo, state, state_path, events) else "stopped"
                 feedback = "Codex B rejected:\n" + "\n".join(verdict["issues"])
-                record["feedback"] = feedback[-14000:]
+                record["feedback"] = feedback
                 state["history"].append(record)
                 state["pending_review"] = None
                 state["status"] = "running"
@@ -709,14 +783,12 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
         return 1
     events.emit("controller", "plan_validated", "success", metadata={"task_count": len(tasks), "plan_sha256": plan_sha})
     schema_path = logs / "review-schema.json"
-    if not schema_path.exists():
-        schema_path.write_text(json.dumps(VERDICT_SCHEMA, indent=2), encoding="utf-8")
+    schema_path.write_text(json.dumps(VERDICT_SCHEMA, indent=2), encoding="utf-8")
     for task in tasks:
         ident = task["id"]
         if ident in state["completed"]:
             continue
         prior = [h for h in state["history"] if h.get("task") == ident]
-        feedback = (prior[-1].get("feedback") if prior else "") or ""
         state["current_task"] = ident
         if state.get("pending_review"):
             if state["pending_review"].get("task") != ident:
@@ -728,7 +800,6 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
             if outcome == "approved":
                 continue
             prior = [h for h in state["history"] if h.get("task") == ident]
-            feedback = prior[-1].get("feedback", "")
         start = len(prior) + 1
         for attempt in range(start, attempts + 1):
             events.emit("controller", "task_started", "started", task_id=ident, attempt=attempt)
@@ -741,8 +812,9 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                  "source files you need INSIDE this repository. Do not change Git history, push, "
                  "read secrets, or modify files outside it. Run appropriate tests and fix code issues "
                  "before finishing. State exactly what you changed and tested.\n\nTASK:\n" + task["prompt"])
+            feedback = correction_context([h for h in state["history"] if h.get("task") == ident])
             if feedback:
-                developer_msg += "\n\nPREVIOUS FAILURE OR REVIEW FEEDBACK:\n" + feedback[-14000:]
+                developer_msg += "\n\nPREVIOUS FAILURE OR REVIEW FEEDBACK:\n" + feedback
             (logs / f"{base}-a-prompt.txt").write_text(developer_msg, encoding="utf-8")
             events.emit("Codex A", "process_started", "started", task_id=ident, attempt=attempt,
                         evidence={"prompt": f"{base}-a-prompt.txt", "stream": f"{base}-a-events.jsonl", "answer": f"{base}-a-answer.txt"})
@@ -772,7 +844,7 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                 return 1
             failed = []
             if not files_overview(repo).strip():
-                failed.append("No changed or created project files were found after Codex A ran.")
+                failed.append(("No changed or created project files were found after Codex A ran.", ""))
             tested_diff_sha = None
             if not failed:
                 try:
@@ -800,12 +872,21 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                 if code != 0 or timed:
                     # Preserve the existing repair feedback while omitting argv;
                     # event metadata contains only safe index/status details.
-                    failed.append(f"TEST {index} failed (exit {code}); see {base}-test-{index}.txt\n{output[-12000:]}")
+                    failed.append((f"TEST {index} failed (exit {code}); see {base}-test-{index}.txt",
+                                   output[-MAX_TEST_FEEDBACK:]))
                     if timed:
                         break
             if failed:
-                feedback = "\n\n".join(failed)
-                record["feedback"] = feedback[-14000:]
+                # Share the budget across failures so one noisy test cannot
+                # erase another test's identity or useful error tail.
+                per_failure = MAX_TEST_FEEDBACK // len(failed) - 2
+                parts = []
+                for heading, detail in failed:
+                    marker = "\n[output tail; full output is saved]\n"
+                    room = max(0, per_failure - len(heading) - len(marker))
+                    parts.append(heading + (marker + detail[-room:] if room and detail else ""))
+                feedback = "\n\n".join(parts)
+                record["feedback"] = feedback
                 state["history"].append(record)
                 save_json(state_path, state)
                 print(f"[{ident}] Tests failed; returning evidence to Codex A", flush=True)
@@ -844,7 +925,6 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                 return 1
             if outcome == "approved":
                 break
-            feedback = state["history"][-1]["feedback"]
         else:
             state["status"] = "stopped"
             save_json(state_path, state)

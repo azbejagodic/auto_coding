@@ -7,7 +7,9 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from auto_coding.simple_run import PilotError, run
+from auto_coding.simple_run import (PilotError, run, checked_review, correction_context,
+                                   MAX_CORRECTION_CONTEXT, MAX_REVIEW_ISSUE_CHARS,
+                                   MAX_REVIEW_ISSUES_TOTAL, MAX_VERDICT_BYTES)
 
 
 APPROVED = {"decision": "APPROVED", "issues": [], "summary": "OK"}
@@ -22,6 +24,7 @@ class FakeExecutor:
         self.test_calls = 0
         self.b_calls = 0
         self.a_prompts = []
+        self.b_prompts = []
 
     def __call__(self, argv, cwd, timeout, *, prompt=None):
         if argv[0] == "fake-test":
@@ -32,6 +35,7 @@ class FakeExecutor:
         answer = Path(argv[argv.index("--output-last-message") + 1])
         if "--output-schema" in argv:
             self.b_calls += 1
+            self.b_prompts.append(prompt)
             response = self.responses.pop(0) if self.responses else APPROVED
             if isinstance(response, tuple):
                 return response
@@ -157,6 +161,70 @@ class ReviewRecoveryTests(unittest.TestCase):
         self.assertEqual([e["outcome"] for e in self.events() if e["event"] == "review_finished"],
                          ["rejected", "approved"])
 
+    def test_multiple_rejections_retain_prior_fixes_and_fresh_verification(self):
+        first = {"decision": "REJECTED", "issues": ["app.py: reproduce missing reset",
+                                                    "app.py: reproduce incorrect save"],
+                 "summary": "Two blockers"}
+        second = {"decision": "REJECTED", "issues": ["app.py: reproduce incorrect save",
+                                                     "app.py: reproduce broken reload"],
+                  "summary": "Save and reload still fail"}
+        fake = FakeExecutor([first, second, APPROVED])
+        self.assertEqual(self.run_fake(fake), 0)
+        self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (3, 3, 3))
+        correction = fake.a_prompts[2]
+        for issue in ("missing reset", "incorrect save", "broken reload"):
+            self.assertEqual(correction.count(issue), 1)
+        self.assertIn("CURRENT CODEX B BLOCKERS (attempt 2)", correction)
+        self.assertIn("EARLIER REVIEW ISSUES TO RECHECK", correction)
+        self.assertIn("Preserve behavior that already works", correction)
+        self.assertIn("do not rework an issue that is already fixed", correction)
+
+    def test_failed_tests_do_not_erase_prior_reviewer_feedback(self):
+        fake = FakeExecutor([REJECTED, APPROVED])
+        def failing_correction_test(argv, cwd, timeout, *, prompt=None):
+            result = fake(argv, cwd, timeout, prompt=prompt)
+            if argv[0] == "fake-test" and fake.test_calls == 2:
+                return 1, "correction broke reset verification", False
+            return result
+        self.assertEqual(run(self.plan, self.repo, self.logs, execute=failing_correction_test), 0)
+        self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (3, 3, 2))
+        self.assertIn("Fix the implementation", fake.a_prompts[2])
+        self.assertIn("correction broke reset verification", fake.a_prompts[2])
+
+    def test_all_failed_test_summaries_survive_large_output(self):
+        self.plan.write_text(json.dumps({"tasks": [{"id": "one", "prompt": "Implement one",
+            "test_commands": [["fake-test", "first"], ["fake-test", "second"]]}]}),
+            encoding="utf-8")
+        fake = FakeExecutor()
+        def noisy_tests(argv, cwd, timeout, *, prompt=None):
+            result = fake(argv, cwd, timeout, prompt=prompt)
+            if argv[0] == "fake-test" and fake.test_calls <= 2:
+                return 1, "noise" * 5000 + f"failure-tail-{fake.test_calls}", False
+            return result
+        self.assertEqual(run(self.plan, self.repo, self.logs, execute=noisy_tests), 0)
+        self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (2, 4, 1))
+        for text in ("TEST 1 failed", "TEST 2 failed", "failure-tail-1", "failure-tail-2"):
+            self.assertIn(text, fake.a_prompts[1])
+
+    def test_reviewer_requests_actionable_independent_blockers(self):
+        fake = FakeExecutor()
+        self.assertEqual(self.run_fake(fake), 0)
+        prompt = fake.b_prompts[0]
+        for text in ("affected path or behavior", "minimal reproduction",
+                     "observed and expected results", "concrete check",
+                     "Independently recheck corrected code", "Do not blindly trust"):
+            self.assertIn(text, prompt)
+        self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (1, 1, 1))
+
+    def test_approval_with_issues_is_invalid_and_never_committed(self):
+        ambiguous = {"decision": "APPROVED", "issues": ["A blocker remains"], "summary": "Unclear"}
+        fake = FakeExecutor([ambiguous, ambiguous, ambiguous])
+        self.assertEqual(self.run_fake(fake), 1)
+        self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (1, 1, 3))
+        self.assertEqual(self.state()["completed"], [])
+        self.assertIsNone(self.state()["pending_review"]["record"]["review"])
+        self.assertFalse(any(e["event"] == "checkpoint_committed" for e in self.events()))
+
     def test_changed_staged_diff_rejects_resume(self):
         self.stopped_at_review()
         (self.repo / "app.txt").write_text("altered", encoding="utf-8")
@@ -272,6 +340,59 @@ class ReviewRecoveryTests(unittest.TestCase):
             run(self.plan, self.repo, self.logs, execute=mutating_reviewer)
         self.assertEqual(self.state()["completed"], [])
         self.assertIsNotNone(self.state()["pending_review"])
+
+
+class CorrectionContextTests(unittest.TestCase):
+    def test_missing_latest_feedback_does_not_erase_earlier_issues(self):
+        prior = [{"attempt": 1, "review": {"decision": "REJECTED", "issues": ["Unresolved reset"]}},
+                 {"attempt": 2, "feedback": ""}]
+        self.assertIn("Unresolved reset", correction_context(prior))
+
+    def test_context_is_bounded_with_complete_current_blockers_and_explicit_omissions(self):
+        current = [f"current-{index}: " + "x" * 880 for index in range(10)]
+        prior = [{"attempt": attempt, "review": {"decision": "REJECTED",
+                  "issues": [f"old-{attempt}-{index}: " + "y" * 1800 for index in range(10)]}}
+                 for attempt in range(1, 10)]
+        prior.append({"attempt": 10, "review": {"decision": "REJECTED", "issues": current}})
+        context = correction_context(prior)
+        self.assertLessEqual(len(context), MAX_CORRECTION_CONTEXT)
+        for issue in current:
+            self.assertIn(issue, context)
+        self.assertIn("older review issue(s) omitted", context)
+
+    def test_legacy_feedback_is_bounded_and_marked(self):
+        context = correction_context([{"attempt": 1, "feedback": "head" + "x" * 50000 + "tail"}])
+        self.assertLessEqual(len(context), MAX_CORRECTION_CONTEXT)
+        self.assertIn("Feedback shortened", context)
+        self.assertIn("head", context)
+        self.assertIn("tail", context)
+        self.assertEqual(correction_context([]), "")
+
+    def test_invalid_and_oversized_verdicts_fail_closed(self):
+        invalid = [
+            {"decision": "APPROVED", "issues": ["remaining blocker"], "summary": "Unclear"},
+            {"decision": "REJECTED", "issues": [], "summary": "No detail"},
+            {"decision": "REJECTED", "issues": ["   "], "summary": "Blank"},
+            {"decision": "REJECTED", "issues": ["x" * (MAX_REVIEW_ISSUE_CHARS + 1)], "summary": "Long"},
+            {"decision": "REJECTED", "issues": ["x" * 1000] * (MAX_REVIEW_ISSUES_TOTAL // 1000 + 1),
+             "summary": "Too much feedback"},
+            {"decision": "APPROVED", "issues": [], "summary": ""},
+        ]
+        with tempfile.TemporaryDirectory() as root:
+            verdict_path = Path(root) / "verdict.json"
+            for verdict in invalid:
+                with self.subTest(verdict=str(verdict)[:80]):
+                    verdict_path.write_text(json.dumps(verdict), encoding="utf-8")
+                    with self.assertRaises(PilotError):
+                        checked_review(verdict_path)
+            for raw in (b"\xff", b" " * (MAX_VERDICT_BYTES + 1)):
+                verdict_path.write_bytes(raw)
+                with self.assertRaises(PilotError):
+                    checked_review(verdict_path)
+            verdict_path.write_text(json.dumps(REJECTED), encoding="utf-8")
+            self.assertEqual(checked_review(verdict_path), REJECTED)
+            verdict_path.write_text(json.dumps(APPROVED), encoding="utf-8")
+            self.assertEqual(checked_review(verdict_path), APPROVED)
 
 
 if __name__ == "__main__":

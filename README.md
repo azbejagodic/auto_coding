@@ -123,6 +123,12 @@ Unverified process cleanup or a run interrupted while a reviewer may still be
 active requires inspection. A REJECTED verdict with specific issues starts a new
 Codex A attempt and fresh tests.
 
+Correction prompts preserve the latest blockers and include a deduplicated
+checklist of earlier review issues within a 14,000-character feedback budget.
+Older omissions are explicit in the prompt; complete verdicts remain in run history.
+Codex B is asked for a location, reproduction, expected result and fix check for
+each blocker. Contradictory or oversized verdicts are invalid responses, never approvals.
+
 Run the headless regressions without Codex, a native window or network calls:
 
 ```powershell
