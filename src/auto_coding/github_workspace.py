@@ -118,12 +118,12 @@ def managed_job(method):
             def tracked_execute(*args, **options):
                 try:
                     result = execute(*args, **options)
-                except BaseException:
-                    # The executor may have spawned a process before raising.
-                    (job_path / "uncertain").touch()
+                except BaseException as exc:
+                    if getattr(exc, "cleanup_confirmed", False) is not True:
+                        (job_path / "uncertain").touch()
                     raise
-                if result[2]:
-                    # A timed-out parent may have left tool descendants alive.
+                cleanup = getattr(result, "cleanup_confirmed", None)
+                if cleanup is False or (result[2] and cleanup is not True):
                     (job_path / "uncertain").touch()
                 return result
             kwargs["execute"] = tracked_execute
@@ -208,16 +208,21 @@ class GitHubWorkspaceManager:
                                       shell=False, timeout=120, env=env)
         except FileNotFoundError:
             raise WorkspaceError("unavailable", "Required command is unavailable.") from None
-        except subprocess.TimeoutExpired:
-            mark_process_uncertain()
+        except subprocess.TimeoutExpired as exc:
+            if getattr(exc, "cleanup_confirmed", False) is not True:
+                mark_process_uncertain()
             raise WorkspaceError("network", "Command failed or timed out; inspect connectivity.") from None
-        except OutputLimitExceeded:
-            mark_process_uncertain()
+        except OutputLimitExceeded as exc:
+            if getattr(exc, "cleanup_confirmed", False) is not True:
+                mark_process_uncertain()
             raise WorkspaceError("output_limit", "Command output exceeded the safe capture limit; inspect the checkout.") from None
-        except OSError:
+        except OSError as exc:
+            if getattr(exc, "cleanup_confirmed", None) is False:
+                mark_process_uncertain()
             raise WorkspaceError("network", "Command failed or timed out; inspect connectivity.") from None
-        except BaseException:
-            mark_process_uncertain()
+        except BaseException as exc:
+            if getattr(exc, "cleanup_confirmed", False) is not True:
+                mark_process_uncertain()
             raise
         # Injected command runners retain their existing interface, but their
         # results must obey the same completeness rule as the production runner.

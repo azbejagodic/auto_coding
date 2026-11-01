@@ -42,6 +42,15 @@ class PilotError(Exception):
     pass
 
 
+class _CallResult(tuple):
+    """Keep the public three-value result and carry verified cleanup state."""
+
+    def __new__(cls, code, output, timed_out, cleanup_confirmed=None):
+        result = super().__new__(cls, (code, output, timed_out))
+        result.cleanup_confirmed = cleanup_confirmed
+        return result
+
+
 def load_tasks(path: Path) -> tuple[list[dict], str]:
     raw = path.read_bytes()
     if not raw or len(raw) > MAX_PLAN:
@@ -94,16 +103,22 @@ def call(argv: list[str], cwd: Path, timeout: int, *, prompt: str | None = None)
                                 timeout=timeout, check=False, shell=False)
         return result.returncode, result.stdout or "", False
     except subprocess.TimeoutExpired as exc:
-        mark_process_uncertain()
-        return 124, "PROCESS TIMED OUT", True
-    except OutputLimitExceeded:
-        mark_process_uncertain()
-        return 125, "PROCESS OUTPUT EXCEEDED SAFE LIMIT", False
+        confirmed = getattr(exc, "cleanup_confirmed", False) is True
+        if not confirmed:
+            mark_process_uncertain()
+        return _CallResult(124, "PROCESS TIMED OUT", True, confirmed)
+    except OutputLimitExceeded as exc:
+        confirmed = getattr(exc, "cleanup_confirmed", False) is True
+        if not confirmed:
+            mark_process_uncertain()
+        return _CallResult(125, "PROCESS OUTPUT EXCEEDED SAFE LIMIT", False, confirmed)
     except OSError as exc:
+        if getattr(exc, "cleanup_confirmed", None) is False:
+            mark_process_uncertain()
         return 127, f"Process could not start: {type(exc).__name__}", False
-    except BaseException:
-        # Interrupted subprocess.run may leave hooks or tool descendants alive.
-        mark_process_uncertain()
+    except BaseException as exc:
+        if getattr(exc, "cleanup_confirmed", False) is not True:
+            mark_process_uncertain()
         raise
 
 
