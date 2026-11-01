@@ -20,6 +20,7 @@ from auto_coding.simple_run import PilotError, load_tasks
 from auto_coding.github_workspace import (GitHubWorkspaceManager, storage_root, serialized_launch,
     managed_lock, reserve_job, cancel_reservation)
 from auto_coding.process_runner import bounded_run
+from auto_coding.repository_activity import repository_busy
 
 
 class DesktopController:
@@ -40,31 +41,18 @@ class DesktopController:
 
     def checkout_busy(self, repo) -> bool:
         """Fail closed for a matching checkout's active or ambiguous run records."""
-        repo = Path(repo).resolve()
-        if self.repo and self.repo.resolve() == repo:
-            if self._launch_uncertain or self._selected_run_unknown() or self._selected_run_active():
-                return True
-            if self.process is not None and self.process.poll() is None:
-                return True
-            if self.logs:
-                state = read_run(self.logs).get("state")
-                if state and state.get("repo") == str(repo) and state.get("status") not in {"stopped", "completed"}:
-                    return True
-        paths = list(self.runs_dir.glob("run-*/desktop-run.json"))
-        if self.logs and (self.logs / "desktop-run.json") not in paths:
-            paths.append(self.logs / "desktop-run.json")
-        for path in paths:
-            try:
-                item = json.loads(path.read_text(encoding="utf-8"))
-                if not isinstance(item, dict): return True
-                if item.get("repo") and Path(item["repo"]).resolve() != repo: continue
-                if item.get("status") in {"launching", "running"}:
-                    # Even an absent PID may have left active descendants.
-                    return True
-            except FileNotFoundError:
-                if path.parent == self.logs: continue
-                return True
-            except (OSError, ValueError, TypeError):
+        return repository_busy(repo, self.runs_dir, selected_repo=self.repo,
+                               selected_logs=self.logs, selected_activity=self._selected_checkout_busy)
+
+    def _selected_checkout_busy(self, repo) -> bool:
+        """Adapt this controller's live state to the headless activity checker."""
+        if self._launch_uncertain or self._selected_run_unknown() or self._selected_run_active():
+            return True
+        if self.process is not None and self.process.poll() is None:
+            return True
+        if self.logs:
+            state = read_run(self.logs).get("state")
+            if state and state.get("repo") == str(repo) and state.get("status") not in {"stopped", "completed"}:
                 return True
         return False
 

@@ -13,6 +13,7 @@ import time
 import uuid
 from functools import wraps
 from auto_coding.process_runner import bounded_run, OutputLimitExceeded, MAX_CAPTURE_BYTES
+from auto_coding.repository_activity import repository_busy
 
 
 _uncertain_process = ContextVar("autocoding_uncertain_process", default=None)
@@ -332,9 +333,8 @@ class GitHubWorkspaceManager:
         if self.active_check is not None and self.active_check(repo) is not False:
             raise WorkspaceError("active_job", "An Auto-Coding job is active or uncertain for this checkout.")
         # Include legacy desktop storage and any externally selected run via callback.
-        from auto_coding.desktop_control import DesktopController
         for root in (self.runs_dir, Path.home() / "AutoCoding-Runs"):
-            if DesktopController(root).checkout_busy(repo):
+            if repository_busy(repo, root):
                 raise WorkspaceError("active_job", "An Auto-Coding job is active or uncertain for this checkout.")
         self._publication_tree(repo)
 
