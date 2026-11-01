@@ -15,13 +15,14 @@ import sys
 import threading
 import uuid
 
-from auto_coding.desktop_reader import read_run, read_evidence
+from auto_coding.desktop_reader import read_run
 from auto_coding.simple_run import PilotError, load_tasks
 from auto_coding.github_workspace import (GitHubWorkspaceManager, storage_root, serialized_launch,
     managed_lock, reserve_job, cancel_reservation)
 from auto_coding.process_runner import bounded_run
 from auto_coding.repository_activity import repository_busy
 from auto_coding.launch_preflight import launch_preflight, validate_repository_root
+from auto_coding import run_lifecycle
 
 
 class DesktopController:
@@ -161,35 +162,12 @@ class DesktopController:
 
     @staticmethod
     def _valid_pid(pid) -> bool:
-        # bool is an int in Python, but never a real process identifier.
-        return type(pid) is int and pid > 0
+        return run_lifecycle.valid_pid(pid)
 
     @staticmethod
     def _pid_active(pid) -> bool:
         if not DesktopController._valid_pid(pid): return False
-        if os.name == "nt":
-            # os.kill(pid, 0) uses TerminateProcess on Windows. Query only.
-            import ctypes
-            from ctypes import wintypes
-            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-            kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-            kernel.OpenProcess.restype = wintypes.HANDLE
-            kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
-            kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-            handle = kernel.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
-            if not handle:
-                # Access denied is uncertain; conservatively block duplicates.
-                return ctypes.get_last_error() != 87  # ERROR_INVALID_PARAMETER: PID absent
-            try:
-                code = wintypes.DWORD()
-                return not kernel.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value == 259
-            finally:
-                kernel.CloseHandle(handle)
-        try:
-            os.kill(pid, 0)
-            return True
-        except OSError:
-            return False
+        return run_lifecycle.pid_active(pid)
 
     def _other_active_run(self) -> bool:
         if not self.runs_dir.is_dir(): return False
@@ -368,31 +346,12 @@ class DesktopController:
             return self._fail(f"Could not start the local runner: {type(exc).__name__}: {exc}")
 
     def _read_metadata(self):
-        self._metadata_error = None
-        if self.logs is None:
-            return None
-        try:
-            path = self.logs / "desktop-run.json"
-            if not path.exists() and not path.is_symlink():
-                return None  # Legacy runs legitimately have no desktop metadata.
-            raw = read_evidence(self.logs, "desktop-run.json")
-            if not raw["ok"]: raise ValueError(raw["text"])
-            value = json.loads(raw["text"])
-            if not isinstance(value, dict): raise ValueError("metadata must be an object")
-            return value
-        except (OSError, ValueError) as exc:
-            self._metadata_error = f"desktop-run.json is corrupt or unreadable: {exc}"
-            return None
+        value, self._metadata_error = run_lifecycle.read_launch_metadata(self.logs)
+        return value
 
     def _metadata(self, logs: Path, pid: int | None = None, status: str = "stopped"):
-        value = {"repo": str(self.repo), "plan": str(self.plan), "logs": str(logs)}
-        if self.process_history:
-            value["process_history"] = self.process_history
-        if pid is not None: value["pid"] = pid
-        value["status"] = status
-        temp = logs / "desktop-run.json.tmp"
-        temp.write_text(json.dumps(value, indent=2), encoding="utf-8")
-        temp.replace(logs / "desktop-run.json")
+        run_lifecycle.write_launch_metadata(logs, repo=self.repo, plan=self.plan, pid=pid,
+                                           status=status, process_history=self.process_history)
 
     def _fail(self, message: str) -> dict:
         self.error = message
