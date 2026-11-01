@@ -26,6 +26,7 @@ from auto_coding.process_runner import bounded_run, OutputLimitExceeded
 
 MAX_PLAN = 512 * 1024
 MAX_OUTPUT = 16 * 1024 * 1024
+MAX_REVIEW_PROCESS_ATTEMPTS = 3
 VERDICT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -113,9 +114,10 @@ def call(argv: list[str], cwd: Path, timeout: int, *, prompt: str | None = None)
             mark_process_uncertain()
         return _CallResult(125, "PROCESS OUTPUT EXCEEDED SAFE LIMIT", False, confirmed)
     except OSError as exc:
-        if getattr(exc, "cleanup_confirmed", None) is False:
+        confirmed = getattr(exc, "cleanup_confirmed", None)
+        if confirmed is False:
             mark_process_uncertain()
-        return 127, f"Process could not start: {type(exc).__name__}", False
+        return _CallResult(127, f"Process could not start: {type(exc).__name__}", False, confirmed)
     except BaseException as exc:
         if getattr(exc, "cleanup_confirmed", False) is not True:
             mark_process_uncertain()
@@ -261,7 +263,8 @@ def checked_review(verdict_path: Path) -> dict:
         if (not isinstance(verdict, dict) or set(verdict) != {"decision", "issues", "summary"}
                 or verdict["decision"] not in ("APPROVED", "REJECTED")
                 or not isinstance(verdict["issues"], list) or len(verdict["issues"]) > 20
-                or any(not isinstance(x, str) for x in verdict["issues"])
+                or any(not isinstance(x, str) or not x.strip() for x in verdict["issues"])
+                or (verdict["decision"] == "REJECTED" and not verdict["issues"])
                 or not isinstance(verdict["summary"], str)):
             raise ValueError("Invalid verdict")
         return verdict
@@ -386,6 +389,183 @@ def publish_approved(repo, state, state_path, events):
     return True
 
 
+def review_prompt_for(task: dict, stat: str, diff: str, tests: list[dict]) -> str:
+    return ("You are Codex B, an independent READ-ONLY reviewer. Inspect the current "
+        "task's STAGED diff, all relevant project files, and tests. Previous tasks are locally "
+        "committed. Do not blindly trust implementer claims or test results. Reject only for "
+        "substantive, reproducible blockers in the CURRENT task/slice. List ALL such blockers "
+        "together in one verdict, with reproduction evidence. Do not block approval for "
+        "optional polish, hypothetical risks, unrelated pre-existing issues or future slices. "
+        "If no current blockers remain, return APPROVED with an empty issues list; put any "
+        "optional polish in summary as non-blocking suggestions. Inspect Git/credential safety "
+        "and data-loss risks carefully. Merge to Main and per-task model/reasoning selection "
+        "are deferred and are not approval blockers. Do not change files.\n\nTASK:\n" + task["prompt"] +
+        "\n\nCURRENT TASK CHANGES:\n" + stat + "\n\nDIFF (truncated; inspect repository for full):\n" + diff[:35000] +
+        "\n\nTEST RESULTS:\n" + json.dumps(tests))
+
+
+def verify_review_ready(repo: Path, logs: Path, state: dict, task: dict) -> tuple[dict, str]:
+    """Rebuild a review request only for the exact tested, staged implementation."""
+    pending = state.get("pending_review")
+    if not isinstance(pending, dict):
+        raise PilotError("Missing review-ready checkpoint")
+    if pending.get("process_uncertain"):
+        raise PilotError("Reviewer process cleanup is unverified; inspect workspace lock")
+    record = pending.get("record")
+    tests = record.get("tests") if isinstance(record, dict) else None
+    if (pending.get("task") != task["id"] or pending.get("repo") != str(repo)
+            or pending.get("plan_sha256") != state["plan_sha256"]
+            or not isinstance(pending.get("attempt"), int) or pending["attempt"] < 1
+            or not isinstance(pending.get("review_invocations"), int)
+            or pending["review_invocations"] < 0
+            or not isinstance(record, dict) or record.get("task") != task["id"]
+            or record.get("attempt") != pending["attempt"] or record.get("a_exit") != 0
+            or record.get("a_timed_out") is not False or record.get("review") is not None
+            or not isinstance(tests, list) or len(tests) != len(task["test_commands"])):
+        raise PilotError("Review-ready checkpoint does not match the task or verified tests")
+    for index, result in enumerate(tests, 1):
+        if (not isinstance(result, dict) or result.get("index") != index
+                or result.get("exit_code") != 0 or result.get("timed_out") is not False
+                or not isinstance(result.get("output_sha256"), str)):
+            raise PilotError("Review-ready checkpoint has invalid test evidence")
+        output_path = logs / f"{task['id']}-{pending['attempt']:02d}-test-{index}.txt"
+        if (not output_path.is_file() or
+                hashlib.sha256(output_path.read_bytes()).hexdigest() != result["output_sha256"]):
+            raise PilotError("Review-ready test output changed; tests must be rerun")
+    if head(repo) != pending.get("base_head"):
+        raise PilotError("Review-ready Git HEAD changed; tests must be rerun")
+    if not git_clean_staged(repo):
+        raise PilotError("Review-ready worktree has unstaged or untracked changes")
+    diff = git_patch(repo, ["diff", "--cached", "--binary", "--no-ext-diff"])
+    if (not diff or hashlib.sha256(diff.encode("utf-8", errors="surrogateescape")).hexdigest()
+            != pending.get("diff_sha256")):
+        raise PilotError("Review-ready staged diff changed; tests must be rerun")
+    stat = git(repo, ["diff", "--cached", "--stat"])
+    return record, review_prompt_for(task, stat, diff, tests)
+
+
+def review_ready_task(repo: Path, logs: Path, state: dict, state_path: Path,
+                      events: EventLog, task: dict, schema_path: Path,
+                      execute: Callable, timeout: int, model_b: str | None) -> str:
+    """Retry reviewer infrastructure independently of Codex A correction attempts."""
+    pending = state["pending_review"]
+    ident, attempt = pending["task"], pending["attempt"]
+    base = f"{ident}-{attempt:02d}"
+    for review_try in range(1, MAX_REVIEW_PROCESS_ATTEMPTS + 1):
+        record, review_prompt = verify_review_ready(repo, logs, state, task)
+        print(f"[{ident}] Codex B — independent review", flush=True)
+        ordinal = pending["review_invocations"] + 1
+        suffix = "" if ordinal == 1 else f"-retry-{ordinal}"
+        prompt_name = f"{base}-b{suffix}-prompt.txt"
+        stream_name = f"{base}-b{suffix}-events.jsonl"
+        verdict_name = f"{base}-b{suffix}-verdict.json"
+        verdict_path = logs / verdict_name
+        # A failed reviewer may have left a verdict file. Only a fresh process
+        # response from this invocation can authorize a commit.
+        if verdict_path.exists():
+            raise PilotError("Review verdict path already exists; inspect before retry")
+        pending["review_invocations"] = ordinal
+        state["status"] = "running"
+        save_json(state_path, state)
+        (logs / prompt_name).write_text(review_prompt, encoding="utf-8")
+        events.emit("Codex B", "review_started", "started", task_id=ident, attempt=attempt,
+                    evidence={"prompt": prompt_name, "diff": f"{base}-diff.txt",
+                              "stream": stream_name, "verdict": verdict_name},
+                    metadata={"review_try": review_try, "review_invocation": ordinal})
+        try:
+            result = execute(codex_argv(readonly=True, last_message=verdict_path,
+                                        schema=schema_path, model=model_b),
+                             repo, timeout, prompt=review_prompt)
+        except BaseException as exc:
+            if getattr(exc, "cleanup_confirmed", None) is not True:
+                pending["process_uncertain"] = True
+                save_json(state_path, state)
+            raise
+        code, output, timed = result
+        (logs / stream_name).write_text(output, encoding="utf-8")
+        events.emit("Codex B", "review_process_finished",
+                    "timed_out" if timed else ("success" if code == 0 else "failed"),
+                    task_id=ident, attempt=attempt, evidence={"stream": stream_name},
+                    metadata={"exit_code": code, "timed_out": timed,
+                              "review_try": review_try, "review_invocation": ordinal})
+        if (getattr(result, "cleanup_confirmed", None) is not False and
+                (not timed or getattr(result, "cleanup_confirmed", None) is True)):
+            # The reviewer has exited; a crash while parsing its verdict can
+            # safely resume by making a fresh read-only review request.
+            state["status"] = "stopped"
+            save_json(state_path, state)
+        if getattr(result, "cleanup_confirmed", None) is False:
+            reason = "Codex B process cleanup unverified"
+        elif code != 0 or timed:
+            reason = ("Codex B process cleanup unverified" if
+                      timed and getattr(result, "cleanup_confirmed", None) is not True
+                      else "Codex B process failure")
+        else:
+            try:
+                verdict = checked_review(verdict_path)
+            except PilotError:
+                reason = "invalid review verdict"
+            else:
+                # A read-only reviewer is still an external process; inspect the
+                # worktree after it exits before accepting either verdict.
+                verify_review_ready(repo, logs, state, task)
+                record["review"] = verdict
+                events.emit("Codex B", "review_finished", verdict["decision"].lower(),
+                            task_id=ident, attempt=attempt, evidence={"verdict": verdict_name})
+                if verdict["decision"] == "APPROVED" and not verdict["issues"]:
+                    record.update(base_head=head(repo), diff_sha256=pending["diff_sha256"])
+                    state["pending_checkpoint"] = {"task": ident, "base_head": pending["base_head"],
+                                                    "diff_sha256": pending["diff_sha256"], "record": record}
+                    state["pending_review"] = None
+                    state["status"] = "checkpointing"
+                    save_json(state_path, state)
+                    events.emit("Git", "checkpoint_started", "started", task_id=ident,
+                                attempt=attempt, evidence={"diff": f"{base}-diff.txt"})
+                    try:
+                        commit = local_commit(repo, ident)
+                        verify_approved_commit(repo, state["pending_checkpoint"], commit)
+                    except PilotError as exc:
+                        events.emit("Git", "stopped", "failed", task_id=ident, attempt=attempt,
+                                    evidence={"state": "state.json"},
+                                    metadata={"reason": "checkpoint pending reconciliation", "error_type": type(exc).__name__})
+                        print(f"STOPPED: local checkpoint failed: {exc}")
+                        return "stopped"
+                    events.emit("Git", "checkpoint_committed", "success", task_id=ident,
+                                attempt=attempt, metadata={"commit": commit})
+                    state["completed"].append(ident)
+                    state["history"].append(record | {"commit": commit})
+                    state["pending_checkpoint"] = None
+                    state["status"] = "stopped" if state.get("auto_push") else "running"
+                    save_json(state_path, state)
+                    events.emit("controller", "task_completed", "success", task_id=ident,
+                                attempt=attempt, metadata={"commit": commit})
+                    print(f"[{ident}] APPROVED — saved local checkpoint {commit[:8]}", flush=True)
+                    return "approved" if publish_approved(repo, state, state_path, events) else "stopped"
+                feedback = "Codex B rejected:\n" + "\n".join(verdict["issues"])
+                record["feedback"] = feedback[-14000:]
+                state["history"].append(record)
+                state["pending_review"] = None
+                state["status"] = "running"
+                save_json(state_path, state)
+                events.emit("controller", "correction_requested", "retry", task_id=ident,
+                            attempt=attempt, evidence={"verdict": verdict_name})
+                print(f"[{ident}] Rejected; returning Codex B feedback to Codex A", flush=True)
+                return "rejected"
+        if reason == "Codex B process cleanup unverified" or review_try == MAX_REVIEW_PROCESS_ATTEMPTS:
+            if reason == "Codex B process cleanup unverified":
+                pending["process_uncertain"] = True
+            state["status"] = "stopped"
+            save_json(state_path, state)
+            events.emit("controller", "stopped", "failed", task_id=ident, attempt=attempt,
+                        metadata={"reason": reason,
+                                  "review_retry_limit": review_try == MAX_REVIEW_PROCESS_ATTEMPTS})
+            print(f"STOPPED: {reason}; review-ready checkpoint preserved in {logs}")
+            return "stopped"
+        events.emit("controller", "review_retry", "retry", task_id=ident, attempt=attempt,
+                    metadata={"reason": reason, "review_try": review_try})
+    raise AssertionError("Unreachable review retry state")
+
+
 def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False, attempts=3,
         auto_push=None,
         model_a=None, model_b=None, timeout=1800,
@@ -413,6 +593,8 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
         if state.get("auto_push") != auto_push:
             raise PilotError("Auto-push settings are fixed for this run; use its original repository and branch options")
         if state.get("status") == "completed" and not auto_push:
+            if state.get("pending_review") or state.get("pending_checkpoint"):
+                raise PilotError("Completed state still has an unfinished checkpoint")
             print("Already completed; no Codex invocation needed")
             return 0
         if state.get("status") not in {"stopped", "checkpointing", "completed"}:
@@ -451,10 +633,18 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
             save_json(state_path, state)
         events.emit("controller", "resume_started", "started")
         try:
+            if state.get("pending_review") and state.get("pending_checkpoint"):
+                raise PilotError("Conflicting review and approved checkpoints")
             recover_checkpoint(repo, state, state_path, events)
+            if state.get("pending_review"):
+                pending_task = next((t for t in tasks if t["id"] == state["pending_review"].get("task")), None)
+                if pending_task is None or state["pending_review"]["task"] in state["completed"]:
+                    raise PilotError("Review-ready task is not pending in this plan")
+                verify_review_ready(repo, logs, state, pending_task)
             if state["completed"] and not git_clean(repo):
                 # Dirty changes are legitimate only when the unfinished task was attempted.
-                if not any(h["task"] not in state["completed"] for h in state["history"]):
+                if (not state.get("pending_review") and
+                        not any(h["task"] not in state["completed"] for h in state["history"])):
                     raise PilotError("Unrecognized changes after last approved checkpoint")
         except (PilotError, OSError, KeyError, TypeError, ValueError) as exc:
             state["status"] = "stopped"
@@ -503,6 +693,7 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
             raise PilotError("New run requires a clean working tree; use a disposable project")
         state = {"repo": str(repo), "plan_sha256": plan_sha, "status": "initializing",
                  "completed": [], "current_task": None, "history": [], "pending_checkpoint": None,
+                 "pending_review": None,
                  "created_utc": created, "run_id": run_id, "auto_push": auto_push}
         manifest = {"run_id": run_id, "plan_sha256": plan_sha,
                     "task_ids": [t["id"] for t in tasks], "initial_git_head": head(repo),
@@ -514,7 +705,7 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
             events.emit("controller", "run_started", "started", evidence={"manifest": "run-manifest.json"})
         state["status"] = "running"
         save_json(state_path, state)
-    if not publish_approved(repo, state, state_path, events):
+    if not state.get("pending_review") and not publish_approved(repo, state, state_path, events):
         return 1
     events.emit("controller", "plan_validated", "success", metadata={"task_count": len(tasks), "plan_sha256": plan_sha})
     schema_path = logs / "review-schema.json"
@@ -527,6 +718,17 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
         prior = [h for h in state["history"] if h.get("task") == ident]
         feedback = (prior[-1].get("feedback") if prior else "") or ""
         state["current_task"] = ident
+        if state.get("pending_review"):
+            if state["pending_review"].get("task") != ident:
+                raise PilotError("Review-ready task is out of sequence")
+            outcome = review_ready_task(repo, logs, state, state_path, events, task,
+                                        schema_path, execute, timeout, model_b)
+            if outcome == "stopped":
+                return 1
+            if outcome == "approved":
+                continue
+            prior = [h for h in state["history"] if h.get("task") == ident]
+            feedback = prior[-1].get("feedback", "")
         start = len(prior) + 1
         for attempt in range(start, attempts + 1):
             events.emit("controller", "task_started", "started", task_id=ident, attempt=attempt)
@@ -534,6 +736,7 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
             state["status"] = "running"
             save_json(state_path, state)
             base = f"{ident}-{attempt:02d}"
+            task_head = head(repo)
             developer_msg = ("Implement this task in the current Git repository. You may create the normal "
                  "source files you need INSIDE this repository. Do not change Git history, push, "
                  "read secrets, or modify files outside it. Run appropriate tests and fix code issues "
@@ -559,17 +762,39 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                 events.emit("controller", "stopped", "failed", task_id=ident, attempt=attempt, evidence={"state": "state.json"}, metadata={"reason": "Codex A process failure"})
                 print(f"STOPPED: Codex A process failed; logs: {logs}")
                 return 1
+            if head(repo) != task_head:
+                record["feedback"] = "Git HEAD changed during Codex A implementation"
+                state["history"].append(record)
+                state["status"] = "stopped"
+                save_json(state_path, state)
+                events.emit("controller", "stopped", "failed", task_id=ident, attempt=attempt,
+                            metadata={"reason": "Git HEAD changed during implementation"})
+                return 1
             failed = []
             if not files_overview(repo).strip():
                 failed.append("No changed or created project files were found after Codex A ran.")
+            tested_diff_sha = None
+            if not failed:
+                try:
+                    _, _, tested_diff_sha = staging_summary(repo)
+                except PilotError as exc:
+                    record["feedback"] = str(exc)
+                    state["history"].append(record)
+                    state["status"] = "stopped"
+                    save_json(state_path, state)
+                    events.emit("controller", "stopped", "failed", task_id=ident,
+                                attempt=attempt, metadata={"reason": "checkpoint safety"})
+                    return 1
             for index, cmd in enumerate(task["test_commands"], 1):
                 events.emit("tests", "test_started", "started", task_id=ident, attempt=attempt, metadata={"index": index})
                 print(f"[{ident}] Running test {index}/{len(task['test_commands'])}", flush=True)
                 test_started = time.monotonic()
                 code, output, timed = execute(cmd, repo, min(timeout, 300))
                 test_duration = round(time.monotonic() - test_started, 3)
-                (logs / f"{base}-test-{index}.txt").write_text(output, encoding="utf-8")
-                record["tests"].append({"index": index, "exit_code": code, "timed_out": timed})
+                output_path = logs / f"{base}-test-{index}.txt"
+                output_path.write_text(output, encoding="utf-8")
+                record["tests"].append({"index": index, "exit_code": code, "timed_out": timed,
+                                        "output_sha256": hashlib.sha256(output_path.read_bytes()).hexdigest()})
                 events.emit("tests", "test_finished", "timed_out" if timed else ("success" if code == 0 else "failed"), task_id=ident, attempt=attempt,
                             evidence={"output": f"{base}-test-{index}.txt"}, metadata={"index": index, "exit_code": code, "timed_out": timed, "duration_seconds": test_duration})
                 if code != 0 or timed:
@@ -595,6 +820,9 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                 continue
             try:
                 stat, diff, diff_sha = staging_summary(repo)
+                if (head(repo) != task_head or tested_diff_sha != diff_sha
+                        or not git_clean_staged(repo)):
+                    raise PilotError("Implementation changed during tests; rerun tests on the final staged diff")
             except PilotError as exc:
                 record["feedback"] = str(exc)
                 state["history"].append(record)
@@ -604,92 +832,19 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                 print(f"STOPPED: change checkpoint safety: {exc}")
                 return 1
             (logs / f"{base}-diff.txt").write_text(diff, encoding="utf-8")
-            print(f"[{ident}] Codex B — independent review", flush=True)
-            review_prompt = ("You are Codex B, an independent READ-ONLY reviewer. Inspect the current "
-                "task's STAGED diff, all relevant project files, and tests. Previous tasks are locally "
-                "committed. Do not blindly trust implementer claims or test results. Reject only for "
-                "substantive, reproducible blockers in the CURRENT task/slice. List ALL such blockers "
-                "together in one verdict, with reproduction evidence. Do not block approval for "
-                "optional polish, hypothetical risks, unrelated pre-existing issues or future slices. "
-                "If no current blockers remain, return APPROVED with an empty issues list; put any "
-                "optional polish in summary as non-blocking suggestions. Inspect Git/credential safety "
-                "and data-loss risks carefully. Merge to Main and per-task model/reasoning selection "
-                "are deferred and are not approval blockers. Do not change files.\n\nTASK:\n" + task["prompt"] +
-                "\n\nCURRENT TASK CHANGES:\n" + stat + "\n\nDIFF (truncated; inspect repository for full):\n" + diff[:35000] +
-                "\n\nTEST RESULTS:\n" + json.dumps(record["tests"]))
-            (logs / f"{base}-b-prompt.txt").write_text(review_prompt, encoding="utf-8")
-            events.emit("Codex B", "review_started", "started", task_id=ident, attempt=attempt,
-                        evidence={"prompt": f"{base}-b-prompt.txt", "diff": f"{base}-diff.txt", "stream": f"{base}-b-events.jsonl", "verdict": f"{base}-b-verdict.json"})
-            verdict_path = logs / f"{base}-b-verdict.json"
-            code, output, timed = execute(codex_argv(readonly=True, last_message=verdict_path,
-                                                      schema=schema_path, model=model_b),
-                                          repo, timeout, prompt=review_prompt)
-            (logs / f"{base}-b-events.jsonl").write_text(output, encoding="utf-8")
-            events.emit("Codex B", "review_process_finished", "timed_out" if timed else ("success" if code == 0 else "failed"), task_id=ident, attempt=attempt,
-                        evidence={"stream": f"{base}-b-events.jsonl"}, metadata={"exit_code": code, "timed_out": timed})
-            if code != 0 or timed:
-                record["feedback"] = "Codex B process failure or timeout; see logs"
-                state["history"].append(record)
-                state["status"] = "stopped"
-                save_json(state_path, state)
-                events.emit("controller", "stopped", "failed", task_id=ident, attempt=attempt, metadata={"reason": "Codex B process failure"})
-                print("STOPPED: reviewer process failure; see logs")
-                return 1
-            try:
-                verdict = checked_review(verdict_path)
-            except PilotError as exc:
-                record["feedback"] = str(exc)
-                state["history"].append(record)
-                state["status"] = "stopped"
-                save_json(state_path, state)
-                events.emit("controller", "stopped", "failed", task_id=ident, attempt=attempt, evidence={"stream": f"{base}-b-events.jsonl"}, metadata={"reason": "invalid review verdict"})
-                print(f"STOPPED: {exc}")
-                return 1
-            record["review"] = verdict
-            events.emit("Codex B", "review_finished", verdict["decision"].lower(), task_id=ident, attempt=attempt,
-                        evidence={"verdict": f"{base}-b-verdict.json"})
-            if verdict["decision"] == "APPROVED" and not verdict["issues"]:
-                # Prevent changed or unstaged bytes from slipping in after review.
-                if (not git_clean_staged(repo) or
-                        hashlib.sha256(git_patch(repo, ["diff", "--cached", "--binary", "--no-ext-diff"]).encode("utf-8", errors="replace")).hexdigest() != diff_sha):
-                    record["feedback"] = "Project changed after review; inspect before checkpoint"
-                    state["history"].append(record)
-                    state["status"] = "stopped"
-                    save_json(state_path, state)
-                    events.emit("controller", "stopped", "failed", task_id=ident, attempt=attempt, metadata={"reason": "worktree changed after review"})
-                    print("STOPPED: worktree changed after Codex B review")
-                    return 1
-                record.update(base_head=head(repo), diff_sha256=diff_sha)
-                state["pending_checkpoint"] = {"task": ident, "base_head": head(repo),
-                                                "diff_sha256": diff_sha, "record": record}
-                state["status"] = "checkpointing"
-                save_json(state_path, state)
-                events.emit("Git", "checkpoint_started", "started", task_id=ident, attempt=attempt, evidence={"diff": f"{base}-diff.txt"})
-                try:
-                    commit = local_commit(repo, ident)
-                    verify_approved_commit(repo, state["pending_checkpoint"], commit)
-                except PilotError as exc:
-                    events.emit("Git", "stopped", "failed", task_id=ident, attempt=attempt,
-                                evidence={"state": "state.json"}, metadata={"reason": "checkpoint pending reconciliation", "error_type": type(exc).__name__})
-                    print(f"STOPPED: local checkpoint failed: {exc}")
-                    return 1
-                events.emit("Git", "checkpoint_committed", "success", task_id=ident, attempt=attempt, metadata={"commit": commit})
-                state["completed"].append(ident)
-                state["history"].append(record | {"commit": commit})
-                state["pending_checkpoint"] = None
-                state["status"] = "stopped" if auto_push else "running"
-                save_json(state_path, state)
-                events.emit("controller", "task_completed", "success", task_id=ident, attempt=attempt, metadata={"commit": commit})
-                print(f"[{ident}] APPROVED — saved local checkpoint {commit[:8]}", flush=True)
-                if not publish_approved(repo, state, state_path, events):
-                    return 1
-                break
-            feedback = "Codex B rejected:\n" + "\n".join(verdict["issues"])
-            record["feedback"] = feedback[-14000:]
-            state["history"].append(record)
+            state["pending_review"] = {"task": ident, "attempt": attempt,
+                                       "repo": str(repo), "plan_sha256": plan_sha,
+                                       "base_head": task_head, "diff_sha256": diff_sha,
+                                       "record": record, "review_invocations": 0}
+            state["status"] = "stopped"
             save_json(state_path, state)
-            events.emit("controller", "correction_requested", "retry", task_id=ident, attempt=attempt, evidence={"verdict": f"{base}-b-verdict.json"})
-            print(f"[{ident}] Rejected; returning Codex B feedback to Codex A", flush=True)
+            outcome = review_ready_task(repo, logs, state, state_path, events, task,
+                                        schema_path, execute, timeout, model_b)
+            if outcome == "stopped":
+                return 1
+            if outcome == "approved":
+                break
+            feedback = state["history"][-1]["feedback"]
         else:
             state["status"] = "stopped"
             save_json(state_path, state)

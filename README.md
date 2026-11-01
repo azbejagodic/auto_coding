@@ -114,6 +114,15 @@ cleans, deletes checkouts, pushes or merges. This slice adds service APIs withou
 changing the dashboard layout: the existing project picker and Open Run remain
 available, including legacy logs under `~/AutoCoding-Runs` or other external paths.
 
+After Codex A and the configured tests pass, the runner saves a review-ready
+checkpoint before starting Codex B. Reviewer process failures and invalid responses
+get at most three review invocations per run command; they do not consume Codex A
+correction attempts. A stopped run can resume review only when the plan, repository,
+Git HEAD, staged diff, test evidence and worktree still match the checkpoint.
+Unverified process cleanup or a run interrupted while a reviewer may still be
+active requires inspection. A REJECTED verdict with specific issues starts a new
+Codex A attempt and fresh tests.
+
 Run the headless regressions without Codex, a native window or network calls:
 
 ```powershell
