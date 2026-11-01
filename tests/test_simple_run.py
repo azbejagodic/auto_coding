@@ -477,7 +477,9 @@ class CheckpointAndRecoveryTests(unittest.TestCase):
         with patch.object(mod,'local_commit',commit_then_crash):
             self.assertEqual(run(first_only,self.repo,self.logs,create_repo=True,execute=fake),1)
         self.assertEqual(json.loads((self.logs/'state.json').read_text())['status'],'checkpointing')
+        metrics_before = json.loads((self.logs/'metrics.json').read_text())['run']
         self.assertEqual(run(first_only,self.repo,self.logs,resume=True,execute=fake),0)
+        self.assertEqual(json.loads((self.logs/'metrics.json').read_text())['run'], metrics_before)
         state=json.loads((self.logs/'state.json').read_text())
         self.assertEqual(state['completed'],['first'])
         self.assertEqual(len(seen),2)

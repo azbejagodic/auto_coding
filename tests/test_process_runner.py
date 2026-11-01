@@ -56,10 +56,12 @@ class ProcessRunnerTests(unittest.TestCase):
 
     def test_launch_failure_has_explicit_result(self):
         with tempfile.TemporaryDirectory() as directory:
-            code, output, timed = call(["missing-autocoding-executable-xyz"], Path(directory), 1)
+            result = call(["missing-autocoding-executable-xyz"], Path(directory), 1)
+            code, output, timed = result
         self.assertEqual(code, 127)
         self.assertIn("Process could not start", output)
         self.assertFalse(timed)
+        self.assertIs(result.process_started, False)
 
     def test_injected_workspace_output_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -92,6 +94,7 @@ class ProcessRunnerTests(unittest.TestCase):
             self.assertEqual(code, 124)
             self.assertTrue(timed)
             self.assertTrue(result.cleanup_confirmed)
+            self.assertIs(result.process_started, True)
             self.assertFalse(managed_lock(repo, ".job.lock").exists())
             self.assertTrue(pid_file.exists())
             self.assert_windows_pid_stopped(int(pid_file.read_text()))

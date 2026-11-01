@@ -6,6 +6,8 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+import io
+from contextlib import redirect_stderr
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import auto_coding.simple_run as runner
@@ -93,6 +95,9 @@ class ReviewRecoveryTests(unittest.TestCase):
         return [json.loads(line) for line in
                 (self.logs / "events.jsonl").read_text(encoding="utf-8").splitlines()]
 
+    def metrics(self):
+        return json.loads((self.logs / "metrics.json").read_text(encoding="utf-8"))["run"]
+
     def stopped_at_review(self):
         fake = FakeExecutor([1, 1, 1])
         self.assertEqual(self.run_fake(fake), 1)
@@ -112,6 +117,13 @@ class ReviewRecoveryTests(unittest.TestCase):
         self.assertIsNone(state["pending_review"])
         self.assertEqual(len(state["history"]), 1)
         self.assertEqual(state["history"][0]["tests"][0]["exit_code"], 0)
+        metrics = self.metrics()
+        for role in ("codex_a", "codex_b", "tests"):
+            self.assertEqual(metrics[role]["invocations"], 1)
+            self.assertEqual(metrics[role]["duration_observations"], 1)
+            self.assertIsNone(metrics[role]["usage"])
+        self.assertEqual(metrics["correction_attempts"], 0)
+        self.assertEqual(metrics["review_retries"], 0)
 
     def test_connection_failure_retries_only_b(self):
         fake = FakeExecutor([1, APPROVED])
@@ -119,6 +131,8 @@ class ReviewRecoveryTests(unittest.TestCase):
         self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (1, 1, 2))
         self.assertEqual([e["event"] for e in self.events()].count("review_retry"), 1)
         self.assertEqual(self.retry_delays, [5.0])
+        self.assertEqual(self.metrics()["review_retries"], 1)
+        self.assertEqual(self.metrics()["review_outcomes"], {"process_failure": 1, "approved": 1})
 
     def test_restart_during_delay_preserves_deadline_and_remaining_budget(self):
         first = FakeExecutor([1])
@@ -148,6 +162,7 @@ class ReviewRecoveryTests(unittest.TestCase):
             self.assertEqual(self.run_fake(resumed, resume=True), 1)
         self.assertEqual(resumed.b_calls, 0)
         self.assertEqual(self.state()["pending_review"]["review_invocations"], 3)
+        before = self.metrics()
         self.assertEqual(self.retry_delays, [5.0, 15.0])
         self.assertEqual(self.run_fake(resumed, resume=True, retry_review_once=True), 1)
         self.assertEqual(resumed.b_calls, 1)
@@ -157,6 +172,11 @@ class ReviewRecoveryTests(unittest.TestCase):
         self.assertEqual(resumed.b_calls, 1)
         self.assertEqual(self.state()["history"], [])
         self.assertEqual(self.state()["completed"], [])
+        self.assertEqual(before["codex_a"]["invocations"], 1)
+        self.assertEqual(before["codex_b"]["invocations"], 3)
+        self.assertEqual(self.metrics()["codex_a"], before["codex_a"])
+        self.assertEqual(self.metrics()["tests"], before["tests"])
+        self.assertEqual(self.metrics()["codex_b"]["invocations"], 4)
 
     def test_unused_explicit_authorization_survives_restart_without_stacking(self):
         self.stopped_at_review()
@@ -187,6 +207,7 @@ class ReviewRecoveryTests(unittest.TestCase):
         last = [event for event in self.events() if event["event"] == "review_started"][-1]
         self.assertEqual(last["metadata"]["review_invocation"], 8)
         self.assertEqual(self.retry_delays, [5.0, 15.0, 15.0])
+        self.assertEqual(self.metrics()["codex_b"]["invocations"], 4)
 
     def test_backward_clock_cannot_create_an_unbounded_wait(self):
         state = self.stopped_at_review()
@@ -213,6 +234,8 @@ class ReviewRecoveryTests(unittest.TestCase):
         self.assertEqual(fake.b_calls, 1)
         self.assertEqual(self.retry_delays, [])
         self.assertEqual(self.state()["pending_review"]["review_failure_kind"], "launch_failure")
+        self.assertEqual(self.metrics()["codex_b"]["invocations"], 0)
+        self.assertEqual(self.metrics()["codex_b"]["launch_failures"], 1)
         with self.assertRaisesRegex(PilotError, "only.*after.*exhausted"):
             self.run_fake(FakeExecutor(review_only=True), resume=True, retry_review_once=True)
         self.assertEqual(self.run_fake(FakeExecutor(review_only=True), resume=True), 0)
@@ -277,6 +300,8 @@ class ReviewRecoveryTests(unittest.TestCase):
         resumed = FakeExecutor(review_only=True)
         self.assertEqual(self.run_fake(resumed, resume=True), 0)
         self.assertEqual(resumed.b_calls, 1)
+        self.assertEqual(self.metrics()["codex_b"]["unconfirmed_invocations"], 1)
+        self.assertEqual(self.metrics()["codex_b"]["invocations"], 1)
 
     def test_invalid_response_cannot_approve(self):
         fake = FakeExecutor(["invalid", "invalid", "invalid"])
@@ -301,6 +326,9 @@ class ReviewRecoveryTests(unittest.TestCase):
         self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (2, 2, 2))
         self.assertEqual(self.retry_delays, [])
         self.assertIn("Fix the implementation", fake.a_prompts[1])
+        self.assertEqual(self.metrics()["correction_attempts"], 1)
+        self.assertEqual(self.metrics()["codex_a"]["invocations"], 2)
+        self.assertEqual(self.metrics()["tests"]["invocations"], 2)
         self.assertEqual([h["attempt"] for h in self.state()["history"]], [1, 2])
         self.assertEqual([e["outcome"] for e in self.events() if e["event"] == "review_finished"],
                          ["rejected", "approved"])
@@ -490,6 +518,53 @@ class ReviewRecoveryTests(unittest.TestCase):
             run(self.plan, self.repo, self.logs, execute=mutating_reviewer)
         self.assertEqual(self.state()["completed"], [])
         self.assertIsNotNone(self.state()["pending_review"])
+
+    def test_metrics_have_real_usage_and_durations_without_sensitive_text_or_accumulation(self):
+        secret = "private-prompt-and-output-secret"
+        self.plan.write_text(self.plan.read_text().replace("Implement one", secret), encoding="utf-8")
+        self.logs.mkdir()
+        (self.logs / "metrics.json").write_text('{"invocations":999999}', encoding="utf-8")
+        fake = FakeExecutor()
+        def measured(argv, cwd, timeout, *, prompt=None):
+            result = fake(argv, cwd, timeout, prompt=prompt)
+            if argv[0] == "fake-test":
+                return result
+            usage = {"input_tokens": 100, "cached_input_tokens": 40, "output_tokens": 10}
+            events = [{"type": "thread.started", "thread_id": secret}, {"type": "turn.started"},
+                      {"type": "item.completed", "item": {"text": secret}},
+                      {"type": "turn.completed", "usage": usage}]
+            return result[0], "\n".join(json.dumps(event) for event in events), result[2]
+        with patch.object(runner, "_execution_clock", side_effect=[0, 1, 1, 3, 3, 6]):
+            self.assertEqual(run(self.plan, self.repo, self.logs, execute=measured), 0)
+        metrics = self.metrics()
+        self.assertEqual([metrics[role]["duration_seconds"] for role in ("codex_a", "tests", "codex_b")],
+                         [1, 2, 3])
+        for role in ("codex_a", "codex_b"):
+            self.assertEqual(metrics[role]["usage"], {"input_tokens": 100, "cached_input_tokens": 40,
+                                                     "output_tokens": 10})
+            self.assertEqual(metrics[role]["usage_observations"], 1)
+        content = (self.logs / "metrics.json").read_text(encoding="utf-8")
+        self.assertNotIn(secret, content)
+        self.assertNotIn("999999", content)
+        runner.write_metrics(self.logs)
+        self.assertEqual(self.metrics(), metrics)
+        self.assertEqual(self.run_fake(FakeExecutor(review_only=True), resume=True), 0)
+        self.assertEqual(self.metrics(), metrics)
+
+    def test_metrics_write_failure_does_not_bypass_review_or_change_valid_execution(self):
+        fake = FakeExecutor(["invalid", "invalid", "invalid"])
+        errors = io.StringIO()
+        with patch.object(runner, "write_metrics", side_effect=OSError("sensitive diagnostic")), \
+                redirect_stderr(errors):
+            self.assertEqual(self.run_fake(fake), 1)
+        self.assertEqual(self.state()["completed"], [])
+        self.assertNotIn("sensitive diagnostic", errors.getvalue())
+        self.assertIn("metrics summary unavailable", errors.getvalue())
+        with patch.object(runner, "write_metrics", side_effect=OSError("unavailable")), \
+                redirect_stderr(errors):
+            self.assertEqual(self.run_fake(FakeExecutor(review_only=True), resume=True,
+                                           retry_review_once=True), 0)
+        self.assertEqual(self.state()["completed"], ["one"])
 
 
 class CorrectionContextTests(unittest.TestCase):

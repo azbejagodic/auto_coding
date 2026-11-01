@@ -23,6 +23,7 @@ from auto_coding.github_workspace import (managed_job, WorkspaceError, cancel_re
                                          mark_process_uncertain, GitHubWorkspaceManager,
                                          normalize_repository)
 from auto_coding.process_runner import bounded_run, OutputLimitExceeded
+from auto_coding.metrics import codex_usage, write_metrics
 
 
 MAX_PLAN = 512 * 1024
@@ -32,6 +33,7 @@ REVIEW_RETRY_DELAYS = (5.0, 15.0)
 # Kept separate from other process clocks so tests can control review waits.
 _review_clock = time.time
 _review_sleep = time.sleep
+_execution_clock = time.monotonic
 MAX_VERDICT_BYTES = 128 * 1024
 MAX_REVIEW_ISSUE_CHARS = 2000
 MAX_REVIEW_ISSUES_TOTAL = 9000
@@ -58,9 +60,10 @@ class PilotError(Exception):
 class _CallResult(tuple):
     """Keep the public three-value result and carry verified cleanup state."""
 
-    def __new__(cls, code, output, timed_out, cleanup_confirmed=None):
+    def __new__(cls, code, output, timed_out, cleanup_confirmed=None, process_started=None):
         result = super().__new__(cls, (code, output, timed_out))
         result.cleanup_confirmed = cleanup_confirmed
+        result.process_started = process_started
         return result
 
 
@@ -114,26 +117,42 @@ def call(argv: list[str], cwd: Path, timeout: int, *, prompt: str | None = None)
                                 encoding="utf-8", errors="surrogateescape" if argv[0] == "git" else "replace",
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 timeout=timeout, check=False, shell=False)
-        return result.returncode, result.stdout or "", False
+        return _CallResult(result.returncode, result.stdout or "", False, process_started=True)
     except subprocess.TimeoutExpired as exc:
         confirmed = getattr(exc, "cleanup_confirmed", False) is True
         if not confirmed:
             mark_process_uncertain()
-        return _CallResult(124, "PROCESS TIMED OUT", True, confirmed)
+        return _CallResult(124, "PROCESS TIMED OUT", True, confirmed, True)
     except OutputLimitExceeded as exc:
         confirmed = getattr(exc, "cleanup_confirmed", False) is True
         if not confirmed:
             mark_process_uncertain()
-        return _CallResult(125, "PROCESS OUTPUT EXCEEDED SAFE LIMIT", False, confirmed)
+        return _CallResult(125, "PROCESS OUTPUT EXCEEDED SAFE LIMIT", False, confirmed, True)
     except OSError as exc:
         confirmed = getattr(exc, "cleanup_confirmed", None)
         if confirmed is False:
             mark_process_uncertain()
-        return _CallResult(127, f"Process could not start: {type(exc).__name__}", False, confirmed)
+        return _CallResult(127, f"Process could not start: {type(exc).__name__}", False, confirmed,
+                           getattr(exc, "process_started", None))
     except BaseException as exc:
         if getattr(exc, "cleanup_confirmed", False) is not True:
             mark_process_uncertain()
         raise
+
+
+def execution_metadata(result, execution_id: int, started: float, *, codex=True) -> dict:
+    """Only numeric observations enter metrics; never prompts, argv or model text."""
+    duration = round(_execution_clock() - started, 6)
+    usage = None
+    if codex:
+        try:
+            usage = codex_usage(result[1])
+        except Exception as exc:
+            print(f"WARNING: token usage unavailable: {type(exc).__name__}", file=sys.stderr)
+    return {"execution_id": execution_id,
+            "duration_seconds": duration,
+            "process_started": getattr(result, "process_started", result[0] != 127),
+            "usage": usage}
 
 
 def safe_repo(repo: Path, create: bool) -> Path:
@@ -602,11 +621,12 @@ def review_ready_task(repo: Path, logs: Path, state: dict, state_path: Path,
         state["status"] = "running"
         save_json(state_path, state)
         (logs / prompt_name).write_text(review_prompt, encoding="utf-8")
-        events.emit("Codex B", "review_started", "started", task_id=ident, attempt=attempt,
+        execution = events.emit("Codex B", "review_started", "started", task_id=ident, attempt=attempt,
                     evidence={"prompt": prompt_name, "diff": f"{base}-diff.txt",
                               "stream": stream_name, "verdict": verdict_name},
                     metadata={"review_try": ordinal, "review_invocation": ordinal})
         try:
+            execution_started = _execution_clock()
             result = execute(codex_argv(readonly=True, last_message=verdict_path,
                                         schema=schema_path, model=model_b),
                              repo, timeout, prompt=review_prompt)
@@ -624,12 +644,14 @@ def review_ready_task(repo: Path, logs: Path, state: dict, state_path: Path,
             save_json(state_path, state)
             raise
         code, output, timed = result
+        measurement = execution_metadata(result, execution["seq"], execution_started)
         (logs / stream_name).write_text(output, encoding="utf-8")
         events.emit("Codex B", "review_process_finished",
                     "timed_out" if timed else ("success" if code == 0 else "failed"),
                     task_id=ident, attempt=attempt, evidence={"stream": stream_name},
                     metadata={"exit_code": code, "timed_out": timed,
-                              "review_try": ordinal, "review_invocation": ordinal})
+                              "review_try": ordinal, "review_invocation": ordinal}
+                              | measurement)
         if (getattr(result, "cleanup_confirmed", None) is not False and
                 (not timed or getattr(result, "cleanup_confirmed", None) is True)):
             # The reviewer has exited; a crash while parsing its verdict can
@@ -660,7 +682,8 @@ def review_ready_task(repo: Path, logs: Path, state: dict, state_path: Path,
                 verify_review_ready(repo, logs, state, task)
                 record["review"] = verdict
                 events.emit("Codex B", "review_finished", verdict["decision"].lower(),
-                            task_id=ident, attempt=attempt, evidence={"verdict": verdict_name})
+                            task_id=ident, attempt=attempt, evidence={"verdict": verdict_name},
+                            metadata={"execution_id": execution["seq"]})
                 if verdict["decision"] == "APPROVED" and not verdict["issues"]:
                     record.update(base_head=head(repo), diff_sha256=pending["diff_sha256"])
                     state["pending_checkpoint"] = {"task": ident, "base_head": pending["base_head"],
@@ -705,6 +728,8 @@ def review_ready_task(repo: Path, logs: Path, state: dict, state_path: Path,
         delay = schedule_review_retry(pending) if retryable else 0
         state["status"] = "stopped"
         save_json(state_path, state)
+        events.emit("Codex B", "review_failed", failure_kind, task_id=ident, attempt=attempt,
+                    metadata={"execution_id": execution["seq"], "review_invocation": ordinal})
         if not retryable or ordinal >= limit:
             return stop_review_retry(logs, state, state_path, events, reason)
         events.emit("controller", "review_retry", "retry", task_id=ident, attempt=attempt,
@@ -893,14 +918,19 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
             if feedback:
                 developer_msg += "\n\nPREVIOUS FAILURE OR REVIEW FEEDBACK:\n" + feedback
             (logs / f"{base}-a-prompt.txt").write_text(developer_msg, encoding="utf-8")
-            events.emit("Codex A", "process_started", "started", task_id=ident, attempt=attempt,
+            execution = events.emit("Codex A", "process_started", "started", task_id=ident, attempt=attempt,
                         evidence={"prompt": f"{base}-a-prompt.txt", "stream": f"{base}-a-events.jsonl", "answer": f"{base}-a-answer.txt"})
             answer_path = logs / f"{base}-a-answer.txt"
-            code, output, timed = execute(codex_argv(readonly=False, last_message=answer_path,
-                                                      schema=None, model=model_a), repo, timeout, prompt=developer_msg)
+            execution_started = _execution_clock()
+            result = execute(codex_argv(readonly=False, last_message=answer_path,
+                                      schema=None, model=model_a), repo, timeout, prompt=developer_msg)
+            code, output, timed = result
+            measurement = execution_metadata(result, execution["seq"], execution_started)
             (logs / f"{base}-a-events.jsonl").write_text(output, encoding="utf-8")
             events.emit("Codex A", "process_finished", "timed_out" if timed else ("success" if code == 0 else "failed"), task_id=ident, attempt=attempt,
-                        evidence={"stream": f"{base}-a-events.jsonl", "answer": f"{base}-a-answer.txt"}, metadata={"exit_code": code, "timed_out": timed})
+                        evidence={"stream": f"{base}-a-events.jsonl", "answer": f"{base}-a-answer.txt"},
+                        metadata={"exit_code": code, "timed_out": timed}
+                                 | measurement)
             record = {"task": ident, "attempt": attempt, "a_exit": code,
                       "a_timed_out": timed, "tests": [], "review": None}
             if code != 0 or timed:
@@ -935,17 +965,19 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                                 attempt=attempt, metadata={"reason": "checkpoint safety"})
                     return 1
             for index, cmd in enumerate(task["test_commands"], 1):
-                events.emit("tests", "test_started", "started", task_id=ident, attempt=attempt, metadata={"index": index})
+                execution = events.emit("tests", "test_started", "started", task_id=ident, attempt=attempt, metadata={"index": index})
                 print(f"[{ident}] Running test {index}/{len(task['test_commands'])}", flush=True)
-                test_started = time.monotonic()
-                code, output, timed = execute(cmd, repo, min(timeout, 300))
-                test_duration = round(time.monotonic() - test_started, 3)
+                test_started = _execution_clock()
+                result = execute(cmd, repo, min(timeout, 300))
+                code, output, timed = result
+                measurement = execution_metadata(result, execution["seq"], test_started, codex=False)
                 output_path = logs / f"{base}-test-{index}.txt"
                 output_path.write_text(output, encoding="utf-8")
                 record["tests"].append({"index": index, "exit_code": code, "timed_out": timed,
                                         "output_sha256": hashlib.sha256(output_path.read_bytes()).hexdigest()})
                 events.emit("tests", "test_finished", "timed_out" if timed else ("success" if code == 0 else "failed"), task_id=ident, attempt=attempt,
-                            evidence={"output": f"{base}-test-{index}.txt"}, metadata={"index": index, "exit_code": code, "timed_out": timed, "duration_seconds": test_duration})
+                            evidence={"output": f"{base}-test-{index}.txt"},
+                            metadata={"index": index, "exit_code": code, "timed_out": timed} | measurement)
                 if code != 0 or timed:
                     # Preserve the existing repair feedback while omitting argv;
                     # event metadata contains only safe index/status details.
@@ -1074,6 +1106,15 @@ def run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False, 
             # claim a durable stopped event that could not be written.
             print(f"FATAL: could not persist failure evidence: {type(exc).__name__}: {exc}", file=sys.stderr)
         raise
+    finally:
+        # A derived summary has no authority over execution or approval. Failure
+        # to export it must not mask the original process/cleanup exception.
+        try:
+            log_dir, project = logs.resolve(strict=False), repo.resolve(strict=False)
+            if log_dir != project and not log_dir.is_relative_to(project):
+                write_metrics(log_dir)
+        except Exception as exc:
+            print(f"WARNING: metrics summary unavailable: {type(exc).__name__}", file=sys.stderr)
 
 
 def git_clean_staged(repo: Path) -> bool:

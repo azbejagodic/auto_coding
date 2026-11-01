@@ -139,6 +139,26 @@ Older omissions are explicit in the prompt; complete verdicts remain in run hist
 Codex B is asked for a location, reproduction, expected result and fix check for
 each blocker. Contradictory or oversized verdicts are invalid responses, never approvals.
 
+Each run exit refreshes `metrics.json` in its external log directory from the
+existing event timeline. It contains per-run and per-task A/B and controller-test
+invocations, launch failures, observed execution time, process/review outcomes,
+actual B retry invocations, and distinct implementation/correction attempts.
+Execution time covers the executor call and cleanup, excluding retry waits and Git
+or log bookkeeping. Counts come from observed executions, not reserved review budget.
+Starts without an observed finish, and uncertain launch results, are reported as
+unconfirmed rather than invented invocations. Older timelines can lack duration
+and usage observations.
+
+Token metrics accept only a single complete [documented Codex JSON turn](https://learn.chatgpt.com/docs/non-interactive-mode)'s
+`input_tokens`, `cached_input_tokens`, and `output_tokens`. Missing, malformed,
+or ambiguous usage is `null`, never an estimated zero. Reported sums include only
+observed usage; `usage_observations`, `duration_observations`, and invocation counts
+show their coverage. These counters are not billing, cost, or quota measurements.
+Rebuilding replaces the derived summary instead of adding counters, so resume and
+review-only recovery do not count prior work again. `source_last_seq` identifies
+the source position. A failed export warns and can leave an older snapshot; metrics
+never participate in approval, cleanup, retry-budget, or Git safety decisions.
+
 Run the headless regressions without Codex, a native window or network calls:
 
 ```powershell

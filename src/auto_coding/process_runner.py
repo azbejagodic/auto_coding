@@ -79,9 +79,10 @@ def bounded_run(argv, *, cwd=None, input=None, text=True, encoding="utf-8",
         from auto_coding.windows_job import WindowsJob
         try:
             job = WindowsJob()
-        except BaseException:
+        except BaseException as exc:
             if stdin_file is not None:
                 stdin_file.close()
+            exc.process_started = False
             raise
     try:
         process = subprocess.Popen(
@@ -105,6 +106,7 @@ def bounded_run(argv, *, cwd=None, input=None, text=True, encoding="utf-8",
         else:
             from auto_coding.github_workspace import mark_process_uncertain
             mark_process_uncertain()
+        exc.process_started = False if isinstance(exc, FileNotFoundError) else None
         raise
 
     capture_lock = threading.Lock()
@@ -160,6 +162,7 @@ def bounded_run(argv, *, cwd=None, input=None, text=True, encoding="utf-8",
         if not confirmed:
             from auto_coding.github_workspace import mark_process_uncertain
             mark_process_uncertain()
+        exc.process_started = True
         raise
     finally:
         if stdin_file is not None:
