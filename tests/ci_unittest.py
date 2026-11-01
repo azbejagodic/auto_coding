@@ -2,6 +2,7 @@
 from pathlib import Path
 import os
 import sys
+import tempfile
 import unittest
 
 
@@ -26,6 +27,11 @@ def cases(suite):
 
 
 def main():
+    if sys.platform == "win32":
+        # Hosted runners can expose TEMP as an 8.3 alias (RUNNER~1). Tests
+        # compare stored paths with Path.resolve() results, so create their
+        # temporary directories under the canonical spelling from the start.
+        tempfile.tempdir = str(Path(tempfile.gettempdir()).resolve())
     suite = unittest.defaultTestLoader.discover(str(ROOT / "tests"), pattern="test_*.py")
     names = {test.id() for test in cases(suite)}
     process_tests = {name for name in names if name.startswith("test_process_runner.ProcessRunnerTests.")}

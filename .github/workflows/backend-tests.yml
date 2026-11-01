@@ -37,4 +37,5 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }}/src
           PYTHONDONTWRITEBYTECODE: '1'
+          AUTOCODING_CONFIG_DIR: ${{ runner.temp }}/autocoding-ci-config
         run: python tests/ci_unittest.py
