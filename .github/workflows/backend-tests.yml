@@ -1,0 +1,40 @@
+name: Backend unit tests
+
+on:
+  push:
+    branches:
+      - main
+      - improve/main-reliability
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unittest:
+    name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ['3.12', '3.13', '3.14']
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Verify test tools
+        run: |
+          python --version
+          git --version
+          node --version
+      - name: Run complete unittest suite and check skips
+        env:
+          PYTHONPATH: ${{ github.workspace }}/src
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python tests/ci_unittest.py

@@ -154,7 +154,7 @@ class ProcessRunnerTests(unittest.TestCase):
             self.assertEqual(job(None, repo, None)[0], 125)
             self.assertTrue((managed_lock(repo, ".job.lock") / "uncertain").exists())
 
-    def test_confirmed_output_limit_releases_gate(self):
+    def test_output_limit_respects_platform_cleanup_confirmation(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "workspaces" / ("c" * 64)
             repo.mkdir(parents=True)
@@ -166,10 +166,14 @@ class ProcessRunnerTests(unittest.TestCase):
             with patch.object(process_runner, "MAX_CAPTURE_BYTES", 4096):
                 result = job(None, repo, None)
             self.assertEqual(result[0], 125)
-            self.assertTrue(result.cleanup_confirmed)
-            self.assertFalse(managed_lock(repo, ".job.lock").exists())
+            if sys.platform == "win32":
+                self.assertTrue(result.cleanup_confirmed)
+                self.assertFalse(managed_lock(repo, ".job.lock").exists())
+            else:
+                self.assertFalse(result.cleanup_confirmed)
+                self.assertTrue((managed_lock(repo, ".job.lock") / "uncertain").exists())
 
-    def test_workspace_command_verified_timeout_releases_operation_lock(self):
+    def test_workspace_timeout_respects_platform_cleanup_confirmation(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "workspaces" / ("d" * 64)
             repo.mkdir(parents=True)
@@ -185,7 +189,10 @@ class ProcessRunnerTests(unittest.TestCase):
                 with self.assertRaises(WorkspaceError) as caught:
                     manager._command(["git", "status"], repo)
             self.assertEqual(caught.exception.code, "network")
-            self.assertFalse(lock.exists())
+            if sys.platform == "win32":
+                self.assertFalse(lock.exists())
+            else:
+                self.assertTrue((lock / "uncertain").exists())
 
     @unittest.skipUnless(sys.platform == "win32", "Windows job assignment check")
     def test_failed_windows_job_assignment_keeps_gate(self):
