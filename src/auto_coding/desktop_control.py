@@ -23,6 +23,7 @@ from auto_coding.process_runner import bounded_run
 from auto_coding.repository_activity import repository_busy
 from auto_coding.launch_preflight import launch_preflight, validate_repository_root
 from auto_coding import run_lifecycle
+from auto_coding.run_launcher import launch_runner
 
 
 class DesktopController:
@@ -286,64 +287,14 @@ class DesktopController:
                 return self._fail(str(exc))
 
     def _launch(self, attempts: int, resume: bool, auto_push: bool = False) -> dict:
-        src = str(Path(__file__).resolve().parents[1])
-        env = os.environ.copy()
-        # A reservation belongs only to this launch, never to a parent runner.
-        env.pop("AUTOCODING_JOB_RESERVATION", None)
-        env["PYTHONPATH"] = src + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
-        argv = [sys.executable, "-B", "-m", "auto_coding.simple_run", "--repo", str(self.repo),
-                "--logs", str(self.logs), "--attempts", str(attempts)]
-        if resume: argv.append("--resume")
         config = None
         if resume:
             config = read_run(self.logs).get("state", {}).get("auto_push")
         elif auto_push:
             config = {"repository": self.repository, "branch": self.preflight()["branch"]}
-        if config:
-            argv.extend(["--auto-push-repository", config["repository"], "--auto-push-branch", config["branch"]])
-        argv.append(str(self.plan))
-        reservation = None
-        spawned = False
-        try:
-            reservation = reserve_job(self.repo)
-            if reservation is not None:
-                env["AUTOCODING_JOB_RESERVATION"] = reservation
-            # Persist intent before creating a child. If PID persistence then fails,
-            # reopen can still refuse an unsafe duplicate resume.
-            self._metadata(self.logs, status="launching")
-            options = {}
-            if os.name == "nt":
-                options["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-            # Do not inherit the dashboard console or pipes. Diagnostic output
-            # remains available even if initialization fails before state.json.
-            output_path = self.logs / "runner-output.txt"
-            if not output_path.resolve().is_relative_to(self.logs.resolve()):
-                raise OSError("Runner output path escapes the selected logs directory.")
-            with output_path.open("ab") as output:
-                self.process = Popen(argv, cwd=src, env=env, shell=False,
-                                     stdin=subprocess.DEVNULL, stdout=output,
-                                     stderr=subprocess.STDOUT, **options)
-                spawned = True
-            self.exit_code = None
-            self.error = None
-            try:
-                self._metadata(self.logs, pid=getattr(self.process, "pid", None), status="running")
-                self._launch_uncertain = False
-            except OSError as exc:
-                self._launch_uncertain = True
-                self.error = f"Runner is active (PID {getattr(self.process, 'pid', 'unknown')}), but its PID could not be saved: {exc}. Keep this window open and do not resume this run."
-            return {"ok": True, "argv": argv, "error": self.error}
-        except OSError as exc:
-            if not spawned:
-                cancel_reservation(self.repo, reservation)
-            if self.process is None and self.logs is not None:
-                try:
-                    self._metadata(self.logs, status="stopped")
-                except OSError:
-                    # Leaving launch intent is conservative: a reopened UI will
-                    # require inspection rather than risk a duplicate resume.
-                    self._launch_uncertain = True
-            return self._fail(f"Could not start the local runner: {type(exc).__name__}: {exc}")
+        return launch_runner(self, repo=self.repo, plan=self.plan, logs=self.logs, attempts=attempts,
+                             resume=resume, publication=config, popen=Popen, persist_metadata=self._metadata,
+                             reserve=reserve_job, cancel=cancel_reservation, fail=self._fail)
 
     def _read_metadata(self):
         value, self._metadata_error = run_lifecycle.read_launch_metadata(self.logs)
