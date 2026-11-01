@@ -5,8 +5,10 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+import auto_coding.simple_run as runner
 from auto_coding.simple_run import (PilotError, run, checked_review, correction_context,
                                    MAX_CORRECTION_CONTEXT, MAX_REVIEW_ISSUE_CHARS,
                                    MAX_REVIEW_ISSUES_TOTAL, MAX_VERDICT_BYTES)
@@ -67,9 +69,22 @@ class ReviewRecoveryTests(unittest.TestCase):
         self.plan.write_text(json.dumps({"tasks": [{"id": "one", "prompt": "Implement one",
                                                     "test_commands": [["fake-test"]]}]}),
                              encoding="utf-8")
+        self.retry_now = 1000.0
+        self.retry_delays = []
+        clock = patch.object(runner, "_review_clock", side_effect=lambda: self.retry_now)
+        sleep = patch.object(runner, "_review_sleep", side_effect=self.advance_retry_clock)
+        clock.start()
+        self.retry_sleep = sleep.start()
+        self.addCleanup(clock.stop)
+        self.addCleanup(sleep.stop)
 
-    def run_fake(self, fake, *, resume=False):
-        return run(self.plan, self.repo, self.logs, resume=resume, execute=fake)
+    def advance_retry_clock(self, seconds):
+        self.retry_delays.append(seconds)
+        self.retry_now += seconds
+
+    def run_fake(self, fake, *, resume=False, retry_review_once=False):
+        return run(self.plan, self.repo, self.logs, resume=resume, execute=fake,
+                   retry_review_once=retry_review_once)
 
     def state(self):
         return json.loads((self.logs / "state.json").read_text(encoding="utf-8"))
@@ -103,15 +118,141 @@ class ReviewRecoveryTests(unittest.TestCase):
         self.assertEqual(self.run_fake(fake), 0)
         self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (1, 1, 2))
         self.assertEqual([e["event"] for e in self.events()].count("review_retry"), 1)
+        self.assertEqual(self.retry_delays, [5.0])
 
-    def test_connection_failure_restart_resumes_only_b(self):
+    def test_restart_during_delay_preserves_deadline_and_remaining_budget(self):
+        first = FakeExecutor([1])
+        self.retry_sleep.side_effect = RuntimeError("application restarted during wait")
+        with self.assertRaisesRegex(RuntimeError, "restarted"):
+            self.run_fake(first)
+        saved = self.state()["pending_review"]
+        self.assertEqual(saved["review_invocations"], 1)
+        self.assertEqual(saved["review_retry_after"], 1005.0)
+        self.assertEqual(self.state()["status"], "stopped")
+        self.retry_now += 2
+        self.retry_sleep.side_effect = self.advance_retry_clock
+        resumed = FakeExecutor([1, APPROVED], review_only=True)
+        self.assertEqual(self.run_fake(resumed, resume=True), 0)
+        self.assertEqual((first.a_calls, first.test_calls, first.b_calls), (1, 1, 1))
+        self.assertEqual((resumed.a_calls, resumed.test_calls, resumed.b_calls), (0, 0, 2))
+        self.assertEqual(self.retry_delays, [3.0, 15.0])
+        self.assertEqual(first.b_prompts[0], resumed.b_prompts[0])
+        invocations = [event["metadata"]["review_invocation"] for event in self.events()
+                       if event["event"] == "review_started"]
+        self.assertEqual(invocations, [1, 2, 3])
+
+    def test_exhaustion_survives_restarts_and_explicit_grant_is_only_one_call(self):
+        self.stopped_at_review()
+        resumed = FakeExecutor([1, 1, 1], review_only=True)
+        for _ in range(2):
+            self.assertEqual(self.run_fake(resumed, resume=True), 1)
+        self.assertEqual(resumed.b_calls, 0)
+        self.assertEqual(self.state()["pending_review"]["review_invocations"], 3)
+        self.assertEqual(self.retry_delays, [5.0, 15.0])
+        self.assertEqual(self.run_fake(resumed, resume=True, retry_review_once=True), 1)
+        self.assertEqual(resumed.b_calls, 1)
+        self.assertEqual(self.state()["pending_review"]["review_invocations"], 4)
+        self.assertEqual(self.state()["pending_review"]["review_invocation_limit"], 4)
+        self.assertEqual(self.run_fake(resumed, resume=True), 1)
+        self.assertEqual(resumed.b_calls, 1)
+        self.assertEqual(self.state()["history"], [])
+        self.assertEqual(self.state()["completed"], [])
+
+    def test_unused_explicit_authorization_survives_restart_without_stacking(self):
+        self.stopped_at_review()
+        resumed = FakeExecutor(review_only=True)
+        self.retry_sleep.side_effect = RuntimeError("restart after authorization")
+        with self.assertRaisesRegex(RuntimeError, "after authorization"):
+            self.run_fake(resumed, resume=True, retry_review_once=True)
+        self.assertEqual(resumed.b_calls, 0)
+        self.assertEqual(self.state()["pending_review"]["review_invocations"], 3)
+        self.assertEqual(self.state()["pending_review"]["review_invocation_limit"], 4)
+        with self.assertRaisesRegex(PilotError, "only.*after.*exhausted"):
+            self.run_fake(resumed, resume=True, retry_review_once=True)
+        self.retry_sleep.side_effect = self.advance_retry_clock
+        self.assertEqual(self.run_fake(resumed, resume=True), 0)
+        self.assertEqual(resumed.b_calls, 1)
+
+    def test_legacy_invocations_do_not_gain_a_fresh_automatic_budget(self):
+        state = self.stopped_at_review()
+        pending = state["pending_review"]
+        pending["review_invocations"] = 7
+        for field in ("review_invocation_limit", "review_retry_after", "review_failure_kind"):
+            pending.pop(field, None)
+        (self.logs / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        resumed = FakeExecutor(review_only=True)
+        self.assertEqual(self.run_fake(resumed, resume=True), 1)
+        self.assertEqual(resumed.b_calls, 0)
+        self.assertEqual(self.run_fake(resumed, resume=True, retry_review_once=True), 0)
+        last = [event for event in self.events() if event["event"] == "review_started"][-1]
+        self.assertEqual(last["metadata"]["review_invocation"], 8)
+        self.assertEqual(self.retry_delays, [5.0, 15.0, 15.0])
+
+    def test_backward_clock_cannot_create_an_unbounded_wait(self):
+        state = self.stopped_at_review()
+        state["pending_review"]["review_retry_after"] = self.retry_now + 1000000000
+        (self.logs / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        self.assertEqual(self.run_fake(FakeExecutor(review_only=True), resume=True,
+                                       retry_review_once=True), 0)
+        self.assertEqual(self.retry_delays[-1], 15.0)
+
+    def test_changed_worktree_during_delay_stops_before_another_call(self):
+        fake = FakeExecutor([1, APPROVED])
+        def mutate_while_waiting(seconds):
+            (self.repo / "app.txt").write_text("unexpected edit", encoding="utf-8")
+            self.advance_retry_clock(seconds)
+        self.retry_sleep.side_effect = mutate_while_waiting
+        with self.assertRaisesRegex(PilotError, "unstaged or untracked"):
+            self.run_fake(fake)
+        self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (1, 1, 1))
+        self.assertIsNotNone(self.state()["pending_review"])
+
+    def test_launch_failure_stops_without_automatic_retry_and_can_resume_after_fix(self):
+        fake = FakeExecutor([127])
+        self.assertEqual(self.run_fake(fake), 1)
+        self.assertEqual(fake.b_calls, 1)
+        self.assertEqual(self.retry_delays, [])
+        self.assertEqual(self.state()["pending_review"]["review_failure_kind"], "launch_failure")
+        with self.assertRaisesRegex(PilotError, "only.*after.*exhausted"):
+            self.run_fake(FakeExecutor(review_only=True), resume=True, retry_review_once=True)
+        self.assertEqual(self.run_fake(FakeExecutor(review_only=True), resume=True), 0)
+        self.assertEqual(self.retry_delays, [])
+
+    def test_output_limit_stops_without_repeating_the_request(self):
+        fake = FakeExecutor([runner._CallResult(125, "output limit", False, True)])
+        self.assertEqual(self.run_fake(fake), 1)
+        self.assertEqual(fake.b_calls, 1)
+        self.assertEqual(self.retry_delays, [])
+        self.assertEqual(self.state()["pending_review"]["review_failure_kind"], "output_limit")
+
+    def test_explicit_retry_requires_resume_and_a_review_checkpoint(self):
+        with self.assertRaisesRegex(PilotError, "requires --resume"):
+            self.run_fake(FakeExecutor(), retry_review_once=True)
+        # The rejected preflight created no task state or implementation.
+        self.assertFalse((self.repo / "app.txt").exists())
+        self.assertEqual(self.run_fake(FakeExecutor()), 0)
+        with self.assertRaisesRegex(PilotError, "requires an exhausted review-ready"):
+            self.run_fake(FakeExecutor(review_only=True), resume=True, retry_review_once=True)
+
+    def test_invalid_saved_budget_cannot_authorize_extra_calls(self):
+        state = self.stopped_at_review()
+        state["pending_review"]["review_invocation_limit"] = 100
+        (self.logs / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        fake = FakeExecutor(review_only=True)
+        with self.assertRaisesRegex(PilotError, "does not match"):
+            self.run_fake(fake, resume=True)
+        self.assertEqual(fake.b_calls, 0)
+
+    def test_exhausted_review_requires_explicit_retry_then_resumes_only_b(self):
         original = self.stopped_at_review()
         pending = original["pending_review"]
         self.assertEqual(pending["attempt"], 1)
         self.assertIsNone(pending["base_head"])
         self.assertEqual(pending["record"]["tests"][0]["exit_code"], 0)
         resumed = FakeExecutor(review_only=True)
-        self.assertEqual(self.run_fake(resumed, resume=True), 0)
+        self.assertEqual(self.run_fake(resumed, resume=True), 1)
+        self.assertEqual(resumed.b_calls, 0)
+        self.assertEqual(self.run_fake(resumed, resume=True, retry_review_once=True), 0)
         self.assertEqual((resumed.a_calls, resumed.test_calls, resumed.b_calls), (0, 0, 1))
         self.assertEqual(self.state()["history"][0]["attempt"], 1)
         streams = [e["evidence"]["stream"] for e in self.events()
@@ -141,6 +282,8 @@ class ReviewRecoveryTests(unittest.TestCase):
         fake = FakeExecutor(["invalid", "invalid", "invalid"])
         self.assertEqual(self.run_fake(fake), 1)
         self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (1, 1, 3))
+        self.assertEqual(self.retry_delays, [5.0, 15.0])
+        self.assertEqual(self.state()["pending_review"]["review_failure_kind"], "invalid_verdict")
         self.assertEqual(self.state()["completed"], [])
         self.assertIsNotNone(self.state()["pending_review"])
         self.assertFalse(any(e["event"] == "checkpoint_committed" for e in self.events()))
@@ -156,6 +299,7 @@ class ReviewRecoveryTests(unittest.TestCase):
         fake = FakeExecutor([REJECTED, APPROVED])
         self.assertEqual(self.run_fake(fake), 0)
         self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (2, 2, 2))
+        self.assertEqual(self.retry_delays, [])
         self.assertIn("Fix the implementation", fake.a_prompts[1])
         self.assertEqual([h["attempt"] for h in self.state()["history"]], [1, 2])
         self.assertEqual([e["outcome"] for e in self.events() if e["event"] == "review_finished"],
@@ -291,8 +435,11 @@ class ReviewRecoveryTests(unittest.TestCase):
         self.assertEqual(self.run_fake(fake), 1)
         self.assertEqual(fake.b_calls, 1)
         self.assertTrue(self.state()["pending_review"]["process_uncertain"])
+        self.assertEqual(self.retry_delays, [])
         with self.assertRaisesRegex(PilotError, "cleanup is unverified"):
             self.run_fake(FakeExecutor(review_only=True), resume=True)
+        with self.assertRaisesRegex(PilotError, "cleanup is unverified"):
+            self.run_fake(FakeExecutor(review_only=True), resume=True, retry_review_once=True)
 
     def test_confirmed_reviewer_timeout_retries_only_b(self):
         class ConfirmedTimeout(tuple):
@@ -303,6 +450,9 @@ class ReviewRecoveryTests(unittest.TestCase):
         fake = FakeExecutor([ConfirmedTimeout(), APPROVED])
         self.assertEqual(self.run_fake(fake), 0)
         self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (1, 1, 2))
+        self.assertEqual(self.retry_delays, [5.0])
+        retry = next(event for event in self.events() if event["event"] == "review_retry")
+        self.assertEqual(retry["metadata"]["failure_kind"], "timeout")
 
     def test_test_modified_implementation_never_becomes_review_ready(self):
         fake = FakeExecutor()
@@ -393,6 +543,22 @@ class CorrectionContextTests(unittest.TestCase):
             self.assertEqual(checked_review(verdict_path), REJECTED)
             verdict_path.write_text(json.dumps(APPROVED), encoding="utf-8")
             self.assertEqual(checked_review(verdict_path), APPROVED)
+
+
+class ReviewRetryCliTests(unittest.TestCase):
+    def test_explicit_retry_flag_reaches_runner_only_with_resume(self):
+        argv = ["tasks.json", "--repo", "project", "--logs", "logs", "--retry-review-once"]
+        with patch.object(runner, "run", return_value=0) as execute, \
+                patch.object(runner.shutil, "which", return_value="codex"), \
+                patch.object(runner, "cancel_reservation") as cancel:
+            with self.assertRaises(SystemExit) as invalid:
+                runner.main(argv)
+            self.assertEqual(invalid.exception.code, 2)
+            execute.assert_not_called()
+            cancel.assert_called_once()
+            self.assertEqual(runner.main(argv + ["--resume"]), 0)
+            self.assertTrue(execute.call_args.kwargs["retry_review_once"])
+            self.assertTrue(execute.call_args.kwargs["resume"])
 
 
 if __name__ == "__main__":

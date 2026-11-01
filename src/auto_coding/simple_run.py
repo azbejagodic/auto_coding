@@ -8,6 +8,7 @@ import argparse
 import hashlib
 import datetime
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -27,6 +28,10 @@ from auto_coding.process_runner import bounded_run, OutputLimitExceeded
 MAX_PLAN = 512 * 1024
 MAX_OUTPUT = 16 * 1024 * 1024
 MAX_REVIEW_PROCESS_ATTEMPTS = 3
+REVIEW_RETRY_DELAYS = (5.0, 15.0)
+# Kept separate from other process clocks so tests can control review waits.
+_review_clock = time.time
+_review_sleep = time.sleep
 MAX_VERDICT_BYTES = 128 * 1024
 MAX_REVIEW_ISSUE_CHARS = 2000
 MAX_REVIEW_ISSUES_TOTAL = 9000
@@ -483,15 +488,21 @@ def verify_review_ready(repo: Path, logs: Path, state: dict, task: dict) -> tupl
     pending = state.get("pending_review")
     if not isinstance(pending, dict):
         raise PilotError("Missing review-ready checkpoint")
-    if pending.get("process_uncertain"):
+    if pending.get("process_uncertain") or pending.get("review_failure_kind") == "cleanup_unverified":
         raise PilotError("Reviewer process cleanup is unverified; inspect workspace lock")
     record = pending.get("record")
     tests = record.get("tests") if isinstance(record, dict) else None
     if (pending.get("task") != task["id"] or pending.get("repo") != str(repo)
             or pending.get("plan_sha256") != state["plan_sha256"]
             or not isinstance(pending.get("attempt"), int) or pending["attempt"] < 1
-            or not isinstance(pending.get("review_invocations"), int)
+            or type(pending.get("review_invocations")) is not int
             or pending["review_invocations"] < 0
+            or type(pending.get("review_invocation_limit", MAX_REVIEW_PROCESS_ATTEMPTS)) is not int
+            or not MAX_REVIEW_PROCESS_ATTEMPTS <= pending.get("review_invocation_limit", MAX_REVIEW_PROCESS_ATTEMPTS)
+                   <= max(MAX_REVIEW_PROCESS_ATTEMPTS, pending["review_invocations"] + 1)
+            or ("review_retry_after" in pending and
+                (type(pending["review_retry_after"]) not in (int, float)
+                 or not math.isfinite(pending["review_retry_after"])))
             or not isinstance(record, dict) or record.get("task") != task["id"]
             or record.get("attempt") != pending["attempt"] or record.get("a_exit") != 0
             or record.get("a_timed_out") is not False or record.get("review") is not None
@@ -518,15 +529,63 @@ def verify_review_ready(repo: Path, logs: Path, state: dict, task: dict) -> tupl
     return record, review_prompt_for(task, stat, diff, tests)
 
 
+def schedule_review_retry(pending: dict) -> float:
+    delay = REVIEW_RETRY_DELAYS[min(pending["review_invocations"] - 1, len(REVIEW_RETRY_DELAYS) - 1)]
+    pending["review_retry_after"] = _review_clock() + delay
+    return delay
+
+
+def stop_review_retry(logs, state, state_path, events, reason):
+    pending = state["pending_review"]
+    used = pending["review_invocations"]
+    limit = pending.get("review_invocation_limit", MAX_REVIEW_PROCESS_ATTEMPTS)
+    state["status"] = "stopped"
+    save_json(state_path, state)
+    events.emit("controller", "stopped", "failed", task_id=pending["task"], attempt=pending["attempt"],
+                metadata={"reason": reason, "failure_kind": pending.get("review_failure_kind", "unknown"),
+                          "review_invocations": used, "review_invocation_limit": limit,
+                          "review_retry_limit": used >= limit})
+    print(f"STOPPED: {reason}; reviewer calls reserved: {used}/{limit}. "
+          f"Review-ready checkpoint preserved in {logs}. "
+          "After checking the failure, use --resume --retry-review-once for one extra call "
+          "if the budget is exhausted. Unverified cleanup still requires inspection.")
+    return "stopped"
+
+
 def review_ready_task(repo: Path, logs: Path, state: dict, state_path: Path,
                       events: EventLog, task: dict, schema_path: Path,
-                      execute: Callable, timeout: int, model_b: str | None) -> str:
+                      execute: Callable, timeout: int, model_b: str | None, *,
+                      retry_review_once=False) -> str:
     """Retry reviewer infrastructure independently of Codex A correction attempts."""
     pending = state["pending_review"]
     ident, attempt = pending["task"], pending["attempt"]
     base = f"{ident}-{attempt:02d}"
-    for review_try in range(1, MAX_REVIEW_PROCESS_ATTEMPTS + 1):
+    if retry_review_once:
+        verify_review_ready(repo, logs, state, task)
+        if pending["review_invocations"] < pending.get("review_invocation_limit", MAX_REVIEW_PROCESS_ATTEMPTS):
+            raise PilotError("One extra review call can only be authorized after the saved budget is exhausted")
+        pending["review_invocation_limit"] = pending["review_invocations"] + 1
+        save_json(state_path, state)
+        events.emit("controller", "review_retry_authorized", "observed", task_id=ident, attempt=attempt,
+                    metadata={"review_invocation_limit": pending["review_invocation_limit"]})
+    while True:
         record, review_prompt = verify_review_ready(repo, logs, state, task)
+        used = pending["review_invocations"]
+        limit = pending.get("review_invocation_limit", MAX_REVIEW_PROCESS_ATTEMPTS)
+        if used >= limit:
+            return stop_review_retry(logs, state, state_path, events, "Codex B review retry budget exhausted")
+        if used and pending.get("review_failure_kind") not in {"launch_failure", "output_limit"}:
+            if "review_retry_after" not in pending:
+                # Legacy checkpoints and interruptions after process exit have
+                # no deadline. Conservatively schedule one before another call.
+                schedule_review_retry(pending)
+                save_json(state_path, state)
+            wait = min(max(0.0, pending["review_retry_after"] - _review_clock()), max(REVIEW_RETRY_DELAYS))
+            if wait:
+                events.emit("controller", "review_retry_wait", "started", task_id=ident, attempt=attempt,
+                            metadata={"delay_seconds": wait, "review_invocations": used})
+                _review_sleep(wait)
+                record, review_prompt = verify_review_ready(repo, logs, state, task)
         print(f"[{ident}] Codex B — independent review", flush=True)
         ordinal = pending["review_invocations"] + 1
         suffix = "" if ordinal == 1 else f"-retry-{ordinal}"
@@ -539,13 +598,14 @@ def review_ready_task(repo: Path, logs: Path, state: dict, state_path: Path,
         if verdict_path.exists():
             raise PilotError("Review verdict path already exists; inspect before retry")
         pending["review_invocations"] = ordinal
+        pending.pop("review_retry_after", None)
         state["status"] = "running"
         save_json(state_path, state)
         (logs / prompt_name).write_text(review_prompt, encoding="utf-8")
         events.emit("Codex B", "review_started", "started", task_id=ident, attempt=attempt,
                     evidence={"prompt": prompt_name, "diff": f"{base}-diff.txt",
                               "stream": stream_name, "verdict": verdict_name},
-                    metadata={"review_try": review_try, "review_invocation": ordinal})
+                    metadata={"review_try": ordinal, "review_invocation": ordinal})
         try:
             result = execute(codex_argv(readonly=True, last_message=verdict_path,
                                         schema=schema_path, model=model_b),
@@ -553,7 +613,15 @@ def review_ready_task(repo: Path, logs: Path, state: dict, state_path: Path,
         except BaseException as exc:
             if getattr(exc, "cleanup_confirmed", None) is not True:
                 pending["process_uncertain"] = True
-                save_json(state_path, state)
+                pending["review_failure_kind"] = "cleanup_unverified"
+            else:
+                pending["review_failure_kind"] = ("timeout" if isinstance(exc, subprocess.TimeoutExpired)
+                                                  else "output_limit" if isinstance(exc, OutputLimitExceeded)
+                                                  else "interrupted")
+                if pending["review_failure_kind"] != "output_limit":
+                    schedule_review_retry(pending)
+            state["status"] = "stopped"
+            save_json(state_path, state)
             raise
         code, output, timed = result
         (logs / stream_name).write_text(output, encoding="utf-8")
@@ -561,24 +629,31 @@ def review_ready_task(repo: Path, logs: Path, state: dict, state_path: Path,
                     "timed_out" if timed else ("success" if code == 0 else "failed"),
                     task_id=ident, attempt=attempt, evidence={"stream": stream_name},
                     metadata={"exit_code": code, "timed_out": timed,
-                              "review_try": review_try, "review_invocation": ordinal})
+                              "review_try": ordinal, "review_invocation": ordinal})
         if (getattr(result, "cleanup_confirmed", None) is not False and
                 (not timed or getattr(result, "cleanup_confirmed", None) is True)):
             # The reviewer has exited; a crash while parsing its verdict can
             # safely resume by making a fresh read-only review request.
             state["status"] = "stopped"
             save_json(state_path, state)
-        if getattr(result, "cleanup_confirmed", None) is False:
+        if (getattr(result, "cleanup_confirmed", None) is False or
+                (timed and getattr(result, "cleanup_confirmed", None) is not True)):
             reason = "Codex B process cleanup unverified"
-        elif code != 0 or timed:
-            reason = ("Codex B process cleanup unverified" if
-                      timed and getattr(result, "cleanup_confirmed", None) is not True
-                      else "Codex B process failure")
+            failure_kind = "cleanup_unverified"
+            pending["process_uncertain"] = True
+        elif timed:
+            reason, failure_kind = "Codex B process timeout", "timeout"
+        elif code == 125:
+            reason, failure_kind = "Codex B output exceeded safe limit", "output_limit"
+        elif code == 127:
+            reason, failure_kind = "Codex B could not launch", "launch_failure"
+        elif code != 0:
+            reason, failure_kind = "Codex B process failure", "process_failure"
         else:
             try:
                 verdict = checked_review(verdict_path)
             except PilotError:
-                reason = "invalid review verdict"
+                reason, failure_kind = "invalid review verdict", "invalid_verdict"
             else:
                 # A read-only reviewer is still an external process; inspect the
                 # worktree after it exits before accepting either verdict.
@@ -625,25 +700,24 @@ def review_ready_task(repo: Path, logs: Path, state: dict, state_path: Path,
                             attempt=attempt, evidence={"verdict": verdict_name})
                 print(f"[{ident}] Rejected; returning Codex B feedback to Codex A", flush=True)
                 return "rejected"
-        if reason == "Codex B process cleanup unverified" or review_try == MAX_REVIEW_PROCESS_ATTEMPTS:
-            if reason == "Codex B process cleanup unverified":
-                pending["process_uncertain"] = True
-            state["status"] = "stopped"
-            save_json(state_path, state)
-            events.emit("controller", "stopped", "failed", task_id=ident, attempt=attempt,
-                        metadata={"reason": reason,
-                                  "review_retry_limit": review_try == MAX_REVIEW_PROCESS_ATTEMPTS})
-            print(f"STOPPED: {reason}; review-ready checkpoint preserved in {logs}")
-            return "stopped"
+        pending["review_failure_kind"] = failure_kind
+        retryable = failure_kind in {"process_failure", "timeout", "invalid_verdict"}
+        delay = schedule_review_retry(pending) if retryable else 0
+        state["status"] = "stopped"
+        save_json(state_path, state)
+        if not retryable or ordinal >= limit:
+            return stop_review_retry(logs, state, state_path, events, reason)
         events.emit("controller", "review_retry", "retry", task_id=ident, attempt=attempt,
-                    metadata={"reason": reason, "review_try": review_try})
-    raise AssertionError("Unreachable review retry state")
+                    metadata={"reason": reason, "failure_kind": failure_kind,
+                              "review_try": ordinal, "delay_seconds": delay})
 
 
 def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False, attempts=3,
-        auto_push=None,
+        auto_push=None, retry_review_once=False,
         model_a=None, model_b=None, timeout=1800,
         execute: Callable = call) -> int:
+    if retry_review_once and not resume:
+        raise PilotError("One extra review call requires --resume and an exhausted review-ready checkpoint")
     tasks, plan_sha = load_tasks(plan)
     repo = safe_repo(repo, create_repo)
     if auto_push:
@@ -666,6 +740,8 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
             raise PilotError("Resume plan or repository mismatch")
         if state.get("auto_push") != auto_push:
             raise PilotError("Auto-push settings are fixed for this run; use its original repository and branch options")
+        if retry_review_once and not state.get("pending_review"):
+            raise PilotError("One extra review call requires an exhausted review-ready checkpoint")
         if state.get("status") == "completed" and not auto_push:
             if state.get("pending_review") or state.get("pending_checkpoint"):
                 raise PilotError("Completed state still has an unfinished checkpoint")
@@ -794,7 +870,8 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
             if state["pending_review"].get("task") != ident:
                 raise PilotError("Review-ready task is out of sequence")
             outcome = review_ready_task(repo, logs, state, state_path, events, task,
-                                        schema_path, execute, timeout, model_b)
+                                        schema_path, execute, timeout, model_b,
+                                        retry_review_once=retry_review_once)
             if outcome == "stopped":
                 return 1
             if outcome == "approved":
@@ -916,7 +993,8 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
             state["pending_review"] = {"task": ident, "attempt": attempt,
                                        "repo": str(repo), "plan_sha256": plan_sha,
                                        "base_head": task_head, "diff_sha256": diff_sha,
-                                       "record": record, "review_invocations": 0}
+                                       "record": record, "review_invocations": 0,
+                                       "review_invocation_limit": MAX_REVIEW_PROCESS_ATTEMPTS}
             state["status"] = "stopped"
             save_json(state_path, state)
             outcome = review_ready_task(repo, logs, state, state_path, events, task,
@@ -941,12 +1019,14 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
 
 @managed_job
 def run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False, attempts=3,
-        model_a=None, model_b=None, timeout=1800, execute: Callable = call, auto_push=None) -> int:
+        model_a=None, model_b=None, timeout=1800, execute: Callable = call, auto_push=None,
+        retry_review_once=False) -> int:
     """Run while ensuring controlled exceptions after log creation are recorded."""
     try:
         return _run(plan, repo, logs, create_repo=create_repo, resume=resume,
                     attempts=attempts, model_a=model_a, model_b=model_b,
-                    timeout=timeout, execute=execute, auto_push=auto_push)
+                    timeout=timeout, execute=execute, auto_push=auto_push,
+                    retry_review_once=retry_review_once)
     except Exception as exc:
         log_dir = logs.resolve(strict=False)
         state_path = log_dir / "state.json"
@@ -1009,6 +1089,8 @@ def main(argv=None):
     parser.add_argument("--logs", required=True, type=Path, help="Output logs, outside repository")
     parser.add_argument("--create-repo", action="store_true", help="Initialize an empty disposable repository")
     parser.add_argument("--resume", action="store_true", help="Resume a stopped run with same task file")
+    parser.add_argument("--retry-review-once", action="store_true",
+                        help="With --resume, authorize one additional Codex B call after its saved budget is exhausted")
     parser.add_argument("--attempts", type=int, default=3)
     parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument("--model-a")
@@ -1016,6 +1098,9 @@ def main(argv=None):
     parser.add_argument("--auto-push-repository", help="Explicitly enable auto-push to this GitHub OWNER/REPO")
     parser.add_argument("--auto-push-branch", help="Fixed origin feature branch for approved checkpoints")
     args = parser.parse_args(argv)
+    if args.retry_review_once and not args.resume:
+        cancel_reservation(args.repo, os.environ.get("AUTOCODING_JOB_RESERVATION"))
+        parser.error("--retry-review-once requires --resume")
     if bool(args.auto_push_repository) != bool(args.auto_push_branch):
         parser.error("Auto-push requires both repository and feature branch")
     if not 1 <= args.attempts <= 10 or not 30 <= args.timeout <= 86400:
@@ -1027,6 +1112,7 @@ def main(argv=None):
     try:
         return run(args.plan, args.repo, args.logs, create_repo=args.create_repo,
                    resume=args.resume, attempts=args.attempts, timeout=args.timeout,
+                    retry_review_once=args.retry_review_once,
                    model_a=args.model_a, model_b=args.model_b,
                    auto_push=({"repository": normalize_repository(args.auto_push_repository)[0],
                                "branch": args.auto_push_branch} if args.auto_push_repository else None))

@@ -115,13 +115,23 @@ changing the dashboard layout: the existing project picker and Open Run remain
 available, including legacy logs under `~/AutoCoding-Runs` or other external paths.
 
 After Codex A and the configured tests pass, the runner saves a review-ready
-checkpoint before starting Codex B. Reviewer process failures and invalid responses
-get at most three review invocations per run command; they do not consume Codex A
-correction attempts. A stopped run can resume review only when the plan, repository,
+checkpoint before starting Codex B. Reviewer process failures, confirmed timeouts
+and invalid responses share a saved budget of three review invocations per
+checkpoint, including across restarts. Eligible retries wait 5 then 15 seconds;
+the saved deadline also applies on resume. Launch failures and output limits stop
+without automatic repetition. These failures do not consume Codex A correction
+attempts. A stopped run can resume review only when the plan, repository,
 Git HEAD, staged diff, test evidence and worktree still match the checkpoint.
 Unverified process cleanup or a run interrupted while a reviewer may still be
 active requires inspection. A REJECTED verdict with specific issues starts a new
 Codex A attempt and fresh tests.
+
+After the saved review budget is exhausted, ordinary resume makes no Codex call.
+Inspect the failure and use the original command with both
+`--resume --retry-review-once` to authorize exactly one additional B invocation.
+The cumulative invocation count and evidence are preserved; a failed extra call
+stops again. This option revalidates the checkpoint and cannot bypass uncertain
+process cleanup. Legacy checkpoints use their existing invocation count.
 
 Correction prompts preserve the latest blockers and include a deduplicated
 checklist of earlier review issues within a 14,000-character feedback budget.
