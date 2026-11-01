@@ -21,6 +21,7 @@ from auto_coding.github_workspace import (GitHubWorkspaceManager, storage_root, 
     managed_lock, reserve_job, cancel_reservation)
 from auto_coding.process_runner import bounded_run
 from auto_coding.repository_activity import repository_busy
+from auto_coding.launch_preflight import launch_preflight, validate_repository_root
 
 
 class DesktopController:
@@ -104,12 +105,7 @@ class DesktopController:
 
     def select_repo(self, path: str | Path) -> dict:
         try:
-            repo = Path(path).expanduser().resolve(strict=True)
-            if not repo.is_dir(): raise ValueError("Target must be a directory.")
-            top = bounded_run(["git", "rev-parse", "--show-toplevel"], cwd=repo, capture_output=True,
-                              text=True, encoding="utf-8", errors="surrogateescape", shell=False, timeout=10)
-            if top.returncode or Path(top.stdout.strip()).resolve() != repo:
-                raise ValueError("Select the Git repository root, not a subdirectory.")
+            repo = validate_repository_root(path, run_command=bounded_run)
             self.repo = repo
             self.repository = None
             self.error = None
@@ -147,35 +143,11 @@ class DesktopController:
 
     def preflight(self) -> dict:
         """Read-only Git checks for display and launch confirmation."""
-        result = {"branch": None, "clean": None, "errors": [], "resume_error": None, "start_error": None}
         metadata = self._read_metadata()
+        result = launch_preflight(self.repo, self.runs_dir, run_command=bounded_run,
+                                  other_active_run=self._other_active_run)
         if metadata and (metadata.get("repo") != str(self.repo) or metadata.get("plan") != str(self.plan)):
             result["resume_error"] = "Resume requires the original exact repository and plan paths saved in desktop-run.json."
-        if self.repo is None:
-            result["errors"].append("Select a Git repository root.")
-            return result
-        job_lock = managed_lock(self.repo, ".job.lock")
-        if job_lock and job_lock.exists():
-            result["errors"].append("An Auto-Coding runner is active or uncertain for this checkout.")
-        if self.runs_dir == self.repo or self.runs_dir.is_relative_to(self.repo):
-            result["start_error"] = "Run storage must be outside the project. Select a different project or configure external run storage."
-        if self._other_active_run():
-            result["errors"].append("An earlier desktop run may still be active. Open its logs and wait for it to stop.")
-        try:
-            branch = bounded_run(["git", "branch", "--show-current"], cwd=self.repo,
-                                 capture_output=True, text=True, encoding="utf-8", errors="surrogateescape", shell=False, timeout=10)
-            result["branch"] = branch.stdout.strip() if not branch.returncode else None
-            if not result["branch"]:
-                result["errors"].append("Select a feature branch; detached HEAD or unavailable Git branch.")
-            elif result["branch"].lower() in {"main", "master"}:
-                result["errors"].append("Runs are blocked on main/master. Switch to a feature branch first.")
-            status = bounded_run(["git", "status", "--porcelain", "--untracked-files=all"],
-                                 cwd=self.repo, capture_output=True, text=True, encoding="utf-8", errors="surrogateescape", shell=False, timeout=10)
-            result["clean"] = not status.stdout.strip() if not status.returncode else None
-            if status.returncode:
-                result["errors"].append("Could not check Git working tree.")
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            result["errors"].append(f"Git preflight failed: {exc}")
         return result
 
     def _validate(self):
