@@ -214,7 +214,7 @@ class SimpleRunnerTests(unittest.TestCase):
 
     def test_existing_run_refuses_dirty_repo(self):
         self.repo.mkdir()
-        subprocess.run(['git', 'init'], cwd=self.repo, stdout=subprocess.PIPE, check=True)
+        subprocess.run(['git', 'init', '-b', 'feature/test'], cwd=self.repo, stdout=subprocess.PIPE, check=True)
         (self.repo / 'surprise.txt').write_text('existing change')
         with self.assertRaises(PilotError):
             run(self.plan, self.repo, self.logs, execute=lambda *a, **k: (1, '', False))
@@ -224,7 +224,7 @@ class SimpleRunnerTests(unittest.TestCase):
 
     def test_logs_inside_target_repo_are_rejected_before_creation(self):
         self.repo.mkdir()
-        subprocess.run(['git', 'init'], cwd=self.repo, stdout=subprocess.PIPE, check=True)
+        subprocess.run(['git', 'init', '-b', 'feature/test'], cwd=self.repo, stdout=subprocess.PIPE, check=True)
         nested_logs = self.repo / 'logs'
         with self.assertRaises(PilotError):
             run(self.plan, self.repo, nested_logs, execute=lambda *a, **k: (1, '', False))
@@ -513,7 +513,7 @@ class CheckpointAndRecoveryTests(unittest.TestCase):
         """Do not use .strip() on patches: it can erase a last-line space."""
         import auto_coding.simple_run as mod
         self.repo.mkdir()
-        subprocess.run(['git', 'init'], cwd=self.repo, stdout=subprocess.PIPE, check=True)
+        subprocess.run(['git', 'init', '-b', 'feature/test'], cwd=self.repo, stdout=subprocess.PIPE, check=True)
         (self.repo / 'one.txt').write_text('some text\n')
         subprocess.run(['git', 'add', '-A'], cwd=self.repo, check=True)
         first = mod.git_patch(self.repo, ['diff', '--cached', '--binary', '--no-ext-diff'])
@@ -551,7 +551,7 @@ class CheckpointAndRecoveryTests(unittest.TestCase):
         """A task checkpoint must extend the exact reviewed base HEAD."""
         import auto_coding.simple_run as mod
         self.repo.mkdir()
-        subprocess.run(['git', 'init'], cwd=self.repo, stdout=subprocess.PIPE, check=True)
+        subprocess.run(['git', 'init', '-b', 'feature/test'], cwd=self.repo, stdout=subprocess.PIPE, check=True)
         (self.repo / 'base.txt').write_text('base')
         subprocess.run(['git', 'add', '-A'], cwd=self.repo, check=True)
         subprocess.run(['git', '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',

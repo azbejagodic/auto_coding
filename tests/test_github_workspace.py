@@ -250,6 +250,19 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(self.git(self.remote, "rev-parse", "main"), self.git(self.seed, "rev-parse", "main"))
         self.assert_error("approval", lambda: self.manager.push_eligibility("owner/repo", approved))
 
+    def test_recorded_approval_branch_cannot_publish_another_branch_at_the_same_sha(self):
+        repo = self.connect()
+        self.manager.create_branch("owner/repo", "feature/approved")
+        approved = self.checkpoint(repo)
+        record = next(iter(approved.values()))
+        record["branch"] = "feature/approved"
+        self.git(repo, "switch", "-c", "feature/other")
+        before = self.git(repo, "rev-parse", "HEAD")
+        self.assert_error("approval", lambda: self.manager.push_eligibility("owner/repo", approved))
+        self.assert_error("approval", lambda: self.manager.push_approved("owner/repo", approved))
+        self.assertEqual(self.git(repo, "rev-parse", "HEAD"), before)
+        self.assertFalse(any("push" in argv for argv in self.calls))
+
     def test_push_blocks_dirty_active_main_origin_unapproved_and_changed_bytes(self):
         repo = self.connect()
         self.assert_error("invalid_branch", lambda: self.manager.push_eligibility("owner/repo", {}))
@@ -706,6 +719,7 @@ class WorkspaceTests(unittest.TestCase):
     def test_direct_checkpoint_git_timeout_retains_job_gate(self):
         from auto_coding.simple_run import local_commit, PilotError
         repo = self.connect()
+        self.manager.checkout_branch("owner/repo", "feature/existing")
         original = subprocess.run
         def command(argv, **kwargs):
             if "commit" in argv:

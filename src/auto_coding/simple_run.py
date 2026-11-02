@@ -26,6 +26,7 @@ from auto_coding.process_runner import bounded_run, OutputLimitExceeded
 from auto_coding.metrics import codex_usage, write_metrics
 from auto_coding.test_process_safety import TestProcessGate, assert_test_process_safe
 from auto_coding.repository_ownership import assert_process_safe
+from auto_coding.launch_preflight import validate_feature_branch
 
 
 MAX_PLAN = 512 * 1024
@@ -199,7 +200,7 @@ def safe_repo(repo: Path, create: bool) -> Path:
     git = call(["git", "rev-parse", "--show-toplevel"], repo, 15)
     if git[0] != 0:
         if create and not any(repo.iterdir()):
-            created = call(["git", "init"], repo, 30)
+            created = call(["git", "init", "-b", "feature/auto-coding"], repo, 30)
             if created[0] != 0:
                 raise PilotError("Could not initialize disposable Git repository")
         else:
@@ -241,6 +242,17 @@ def git_patch(repo: Path, args: list[str]) -> str:
     if rc or timed:
         raise PilotError(f"Git patch command failed: {args[:3]}")
     return output
+
+
+def require_run_branch(repo, expected=None):
+    branch = git(repo, ["branch", "--show-current"])
+    try:
+        validate_feature_branch(branch)
+    except ValueError as exc:
+        raise PilotError(str(exc)) from exc
+    if expected is not None and branch != expected:
+        raise PilotError("Git branch changed from the run's selected feature branch; inspect before continuing")
+    return branch
 
 
 def head(repo: Path) -> str | None:
@@ -347,6 +359,7 @@ def checked_review(verdict_path: Path) -> dict:
 def local_commit(repo: Path, ident: str) -> str:
     assert_test_process_safe(repo)
     assert_process_safe(repo)
+    require_run_branch(repo)
     # Local checkpoints only. Never push. The user can set their Git identity;
     # if it is absent, an explicitly non-public local-only identity is used.
     name = git(repo, ["config", "--get", "user.name"]) if call(["git", "config", "--get", "user.name"], repo, 15)[0] == 0 else "Auto-Coding (local)"
@@ -359,32 +372,135 @@ def local_commit(repo: Path, ident: str) -> str:
     return result
 
 
-def verify_approved_commit(repo: Path, pending: dict, current: str | None) -> None:
+def verify_approved_commit(repo: Path, pending: dict, current: str | None, *, require_clean=True) -> None:
     """Accept only the exact approved patch on the exact recorded parent.
 
     A matching commit subject is not proof of approval. Check both normal
     commits and crash recovery before reporting a checkpoint as committed.
     """
-    if not current or not git_clean(repo):
+    if (not isinstance(current, str) or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", current)
+            or (require_clean and (current != head(repo) or not git_clean(repo)))):
         raise PilotError("Checkpoint state ambiguous: inspect repository and logs")
-    message = git(repo, ["log", "-1", "--format=%s"])
-    lineage = git(repo, ["rev-list", "--parents", "-n", "1", "HEAD"]).split()
+    message = git(repo, ["log", "-1", "--format=%s", current])
+    lineage = git(repo, ["rev-list", "--parents", "-n", "1", current]).split()
     base = pending.get("base_head")
     expected_lineage = [current, base] if base else [current]
-    committed_diff = git_patch(repo, ["show", "--format=", "--binary", "--no-ext-diff", "HEAD"])
+    committed_diff = git_patch(repo, ["show", "--format=", "--binary", "--no-ext-diff", current])
     committed_sha256 = hashlib.sha256(committed_diff.encode("utf-8", errors="surrogateescape")).hexdigest()
     if (message != f"auto-coding: {pending['task']}" or lineage != expected_lineage
             or committed_sha256 != pending.get("diff_sha256")):
         raise PilotError("Recovered checkpoint does not match the approved parent and diff; inspect manually")
 
 
+def committed_records(state):
+    history = state.get("history")
+    if not isinstance(history, list) or any(not isinstance(record, dict) for record in history):
+        raise PilotError("Saved run history is ambiguous; inspect before resume")
+    return [record for record in history if record.get("commit")]
+
+
+def stop_uncertain_saved_process(state, reason):
+    state["uncertain_process"] = {"actor": "saved execution", "cleanup_confirmed": False, "reason": reason}
+    mark_process_uncertain()
+    raise PilotError(reason)
+
+
+def expected_run_head(state, manifest):
+    completed = state["completed"]
+    if not completed:
+        return manifest["initial_git_head"]
+    records = committed_records(state)
+    if not records or records[-1].get("task") != completed[-1]:
+        raise PilotError("Completed tasks lack an approved Git checkpoint; inspect before resume")
+    return records[-1]["commit"]
+
+
+def verify_resume_git(repo, state, manifest, tasks):
+    """Validate existing approvals without changing the checkout or inventing progress."""
+    branch = require_run_branch(repo, state.get("branch"))
+    if manifest.get("branch") not in (None, branch):
+        raise PilotError("Run manifest Git branch differs from the selected feature branch")
+    completed = state["completed"]
+    if not isinstance(completed, list) or completed != [task["id"] for task in tasks[:len(completed)]]:
+        raise PilotError("Completed tasks are not an ordered prefix of this plan")
+    records = committed_records(state)
+    if any(record.get("a_cleanup_confirmed") is False for record in state["history"]):
+        stop_uncertain_saved_process(state, "Saved Codex A cleanup is unverified; inspect before resume")
+    ownership = state.get("process_ownership")
+    if ownership is not None and (type(ownership) is not int or ownership != 1):
+        raise PilotError("Unsupported saved process-ownership state; inspect before resume")
+    if state.get("process_ownership") is None:
+        # Older unmanaged runners did not reliably save A cleanup or a B
+        # failure observed before evidence I/O. Do not invent missing proof.
+        for record in state["history"]:
+            if type(record.get("a_exit")) is not int or type(record.get("a_timed_out")) is not bool:
+                stop_uncertain_saved_process(state, "Legacy execution metadata is ambiguous; inspect before resume")
+            if ((record.get("a_timed_out") or record.get("a_exit") in (125, 127))
+                    and record.get("a_cleanup_confirmed") is not True
+                    and record.get("a_process_started") is not False):
+                stop_uncertain_saved_process(state, "Legacy Codex A cleanup lacks verified evidence; inspect before resume")
+        review = state.get("pending_review")
+        if review and review.get("review_invocations", 0):
+            # A saved failure kind can belong to an earlier invocation; it is
+            # not proof of the most recently reserved legacy process's cleanup.
+            stop_uncertain_saved_process(state, "Legacy Codex B cleanup lacks verified evidence; inspect before resume")
+    if [record.get("task") for record in records] != completed:
+        raise PilotError("Completed tasks lack matching approved Git checkpoints")
+    expected = manifest["initial_git_head"]
+    if "initial_git_head" in state and state["initial_git_head"] != expected:
+        raise PilotError("Saved initial Git HEAD differs from the run manifest")
+    for record in records:
+        review = record.get("review")
+        if (not isinstance(review, dict) or review.get("decision") != "APPROVED"
+                or review.get("issues") != [] or record.get("base_head") != expected
+                or record.get("branch") not in (None, branch)):
+            raise PilotError("Completed Git checkpoint does not match its approval and base")
+        verify_approved_commit(repo, record, record["commit"], require_clean=False)
+        expected = record["commit"]
+    pending = state.get("pending_checkpoint") or state.get("pending_review")
+    if pending:
+        if len(completed) >= len(tasks) or pending.get("task") != tasks[len(completed)]["id"]:
+            raise PilotError("Pending checkpoint is out of sequence in the prepared plan")
+        if pending.get("base_head") != expected or pending.get("branch") not in (None, branch):
+            raise PilotError("Pending checkpoint does not match the approved Git base and branch")
+        if isinstance(pending.get("record"), dict) and pending["record"].get("a_cleanup_confirmed") is False:
+            stop_uncertain_saved_process(state, "Pending Codex A cleanup is unverified; inspect before resume")
+        # Approved commit recovery validates both permissible HEAD outcomes itself.
+        if state.get("pending_checkpoint"):
+            record = pending.get("record")
+            review = record.get("review") if isinstance(record, dict) else None
+            if (not isinstance(review, dict) or review.get("decision") != "APPROVED" or review.get("issues") != []
+                    or record.get("task") != pending.get("task") or record.get("base_head") != expected
+                    or record.get("diff_sha256") != pending.get("diff_sha256")
+                    or record.get("branch") not in (None, branch)):
+                raise PilotError("Pending checkpoint lacks matching independent approval")
+            return branch
+    if head(repo) != expected:
+        raise PilotError("Git HEAD changed from the last approved checkpoint or initial run HEAD")
+    return branch
+
+
+def legacy_initial_head(repo, state):
+    if "initial_git_head" in state:
+        return state["initial_git_head"]
+    records = committed_records(state)
+    evidence = records[0] if records else state.get("pending_checkpoint") or state.get("pending_review")
+    if evidence is not None and "base_head" in evidence:
+        return evidence["base_head"]  # Verified before a replacement manifest is written.
+    if not state["completed"] and head(repo) is None:
+        return None
+    raise PilotError("Legacy run lacks evidence of its initial Git HEAD; inspect before resume")
+
+
 def recover_checkpoint(repo: Path, state: dict, state_path: Path, events: EventLog | None = None) -> None:
     """Reconcile the tiny window between successful commit and state save."""
     assert_test_process_safe(repo)
     assert_process_safe(repo)
+    require_run_branch(repo, state.get("branch"))
     pending = state.get("pending_checkpoint")
     if not pending:
         return
+    require_run_branch(repo, pending.get("branch", state.get("branch")))
     current = head(repo)
     task = pending["task"]
     if current != pending.get("base_head"):
@@ -412,6 +528,7 @@ def recover_checkpoint(repo: Path, state: dict, state_path: Path, events: EventL
         events.emit("Git", "checkpoint_started", "started", task_id=task,
                     attempt=pending["record"].get("attempt"), metadata={"recovered": True})
     try:
+        require_run_branch(repo, state.get("branch"))
         committed = local_commit(repo, task)
     except PilotError:
         if events:
@@ -419,6 +536,7 @@ def recover_checkpoint(repo: Path, state: dict, state_path: Path, events: EventL
                         attempt=pending["record"].get("attempt"), metadata={"reason": "checkpoint recovery failed"})
         raise
     verify_approved_commit(repo, pending, committed)
+    require_run_branch(repo, state.get("branch"))
     if events:
         events.emit("Git", "checkpoint_committed", "success", task_id=task,
                     attempt=pending["record"].get("attempt"), metadata={"commit": committed, "recovered": True})
@@ -433,6 +551,7 @@ def publish_approved(repo, state, state_path, events):
     """Reconcile with the remote even when a previous saved result says published."""
     assert_test_process_safe(repo)
     assert_process_safe(repo)
+    require_run_branch(repo, state.get("branch"))
     config = state.get("auto_push")
     records = [r for r in state["history"] if r.get("commit")]
     if not config or not records:
@@ -545,11 +664,14 @@ def verify_review_ready(repo: Path, logs: Path, state: dict, task: dict) -> tupl
     """Rebuild a review request only for the exact tested, staged implementation."""
     assert_test_process_safe(repo)
     assert_process_safe(repo)
+    require_run_branch(repo, state.get("branch"))
     pending = state.get("pending_review")
     if not isinstance(pending, dict):
         raise PilotError("Missing review-ready checkpoint")
     if pending.get("process_uncertain") or pending.get("review_failure_kind") == "cleanup_unverified":
         raise PilotError("Reviewer process cleanup is unverified; inspect workspace lock")
+    if pending.get("branch") not in (None, state.get("branch")):
+        raise PilotError("Review-ready Git branch differs from the saved run")
     record = pending.get("record")
     tests = record.get("tests") if isinstance(record, dict) else None
     if (pending.get("task") != task["id"] or pending.get("repo") != str(repo)
@@ -566,6 +688,7 @@ def verify_review_ready(repo: Path, logs: Path, state: dict, task: dict) -> tupl
             or not isinstance(record, dict) or record.get("task") != task["id"]
             or record.get("attempt") != pending["attempt"] or record.get("a_exit") != 0
             or record.get("a_timed_out") is not False or record.get("review") is not None
+            or record.get("a_cleanup_confirmed") is False
             or not isinstance(tests, list) or len(tests) != len(task["test_commands"])):
         raise PilotError("Review-ready checkpoint does not match the task or verified tests")
     for index, result in enumerate(tests, 1):
@@ -733,17 +856,20 @@ def review_ready_task(repo: Path, logs: Path, state: dict, state_path: Path,
                             task_id=ident, attempt=attempt, evidence={"verdict": verdict_name},
                             metadata={"execution_id": execution["seq"]})
                 if verdict["decision"] == "APPROVED" and not verdict["issues"]:
-                    record.update(base_head=head(repo), diff_sha256=pending["diff_sha256"])
+                    record.update(base_head=head(repo), diff_sha256=pending["diff_sha256"], branch=state["branch"])
                     state["pending_checkpoint"] = {"task": ident, "base_head": pending["base_head"],
-                                                    "diff_sha256": pending["diff_sha256"], "record": record}
+                                                    "diff_sha256": pending["diff_sha256"], "record": record,
+                                                    "branch": state["branch"]}
                     state["pending_review"] = None
                     state["status"] = "checkpointing"
                     save_json(state_path, state)
                     events.emit("Git", "checkpoint_started", "started", task_id=ident,
                                 attempt=attempt, evidence={"diff": f"{base}-diff.txt"})
                     try:
+                        require_run_branch(repo, state["branch"])
                         commit = local_commit(repo, ident)
                         verify_approved_commit(repo, state["pending_checkpoint"], commit)
+                        require_run_branch(repo, state["branch"])
                     except PilotError as exc:
                         events.emit("Git", "stopped", "failed", task_id=ident, attempt=attempt,
                                     evidence={"state": "state.json"},
@@ -795,11 +921,12 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
     repo = safe_repo(repo, create_repo)
     assert_test_process_safe(repo)
     assert_process_safe(repo)
+    selected_branch = require_run_branch(repo)
     if auto_push:
         identity = normalize_repository(auto_push["repository"])[0]
         branch = auto_push["branch"]
         if (identity != auto_push["repository"] or branch.lower() in {"main", "master"}
-                or git(repo, ["branch", "--show-current"]) != branch):
+                or selected_branch != branch):
             raise PilotError("Auto-push requires the selected origin feature branch; main/master are protected")
         git(repo, ["check-ref-format", "refs/heads/" + branch])
     logs = logs.resolve(strict=False)
@@ -811,6 +938,14 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
         if not resume:
             raise PilotError("Existing run logs; use --resume (never overwrite a run)")
         state = json.loads(state_path.read_text(encoding="utf-8"))
+        if not isinstance(state, dict):
+            raise PilotError("Saved run state must be an object; inspect before resume")
+        if not isinstance(state.get("completed"), list):
+            raise PilotError("Saved completed tasks are ambiguous; inspect before resume")
+        committed_records(state)
+        if any(state.get(key) is not None and not isinstance(state[key], dict)
+               for key in ("pending_review", "pending_checkpoint")):
+            raise PilotError("Saved pending checkpoint is ambiguous; inspect before resume")
         if "uncertain_test" in state:
             raise PilotError("Test-process cleanup remains unverified in saved state; inspect before resuming.")
         if "uncertain_process" in state:
@@ -821,16 +956,15 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
             raise PilotError("Auto-push settings are fixed for this run; use its original repository and branch options")
         if retry_review_once and not state.get("pending_review"):
             raise PilotError("One extra review call requires an exhausted review-ready checkpoint")
-        if state.get("status") == "completed" and not auto_push:
-            if state.get("pending_review") or state.get("pending_checkpoint"):
-                raise PilotError("Completed state still has an unfinished checkpoint")
-            print("Already completed; no Codex invocation needed")
-            return 0
+        if state.get("status") == "completed" and (state.get("pending_review") or state.get("pending_checkpoint")):
+            raise PilotError("Completed state still has an unfinished checkpoint")
         if state.get("status") not in {"stopped", "checkpointing", "completed"}:
             raise PilotError("Previous run may still be active or interrupted; inspect before resuming")
         manifest_path = logs / "run-manifest.json"
         if manifest_path.exists():
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(manifest, dict):
+                raise PilotError("Run manifest must be an object")
             if (manifest.get("plan_sha256") != plan_sha or manifest.get("target_repo") != str(repo)
                     or manifest.get("task_ids") != [t["id"] for t in tasks]):
                 raise PilotError("Run manifest does not match resume plan or repository")
@@ -852,18 +986,25 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                     except (ValueError, TypeError):
                         pass
             manifest = {"run_id": run_id, "plan_sha256": plan_sha,
-                        "task_ids": [t["id"] for t in tasks], "initial_git_head": head(repo),
+                        "task_ids": [t["id"] for t in tasks], "initial_git_head": legacy_initial_head(repo, state),
                         "start_time_utc": state.get("created_utc"), "target_repo": str(repo)}
         events = EventLog(logs / "events.jsonl", run_id)
-        if not manifest_path.exists():
-            # Write only after the existing timeline has been validated.
-            state["run_id"] = run_id
-            save_json(manifest_path, manifest)
-            save_json(state_path, state)
         events.emit("controller", "resume_started", "started")
         try:
             if state.get("pending_review") and state.get("pending_checkpoint"):
                 raise PilotError("Conflicting review and approved checkpoints")
+            if state.get("status") == "completed" and state["completed"] != [task["id"] for task in tasks]:
+                raise PilotError("Completed state does not contain every prepared task")
+            selected_branch = verify_resume_git(repo, state, manifest, tasks)
+            legacy_branch = state.get("branch") is None or manifest.get("branch") is None
+            state["branch"] = manifest["branch"] = selected_branch
+            state["initial_git_head"] = manifest["initial_git_head"]
+            state["process_ownership"] = 1
+            if not manifest_path.exists() or legacy_branch:
+                # The timeline and recorded Git history were validated first.
+                state["run_id"] = run_id
+                save_json(manifest_path, manifest)
+                save_json(state_path, state)
             recover_checkpoint(repo, state, state_path, events)
             if state.get("pending_review"):
                 pending_task = next((t for t in tasks if t["id"] == state["pending_review"].get("task")), None)
@@ -883,7 +1024,14 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                 events.emit("controller", "stopped", "failed", evidence={"state": "state.json"},
                             metadata={"reason": "resume reconciliation failed", "error_type": type(exc).__name__})
             raise
+        if legacy_branch:
+            events.emit("controller", "legacy_branch_bound", "observed",
+                        metadata={"branch": selected_branch, "reason": "existing Git evidence verified before binding"})
         events.emit("controller", "resume_reconciled", "success", metadata={"completed_tasks": list(state["completed"])})
+        if state.get("status") == "completed" and not auto_push:
+            require_run_branch(repo, state["branch"])
+            print("Already completed; approved Git checkpoints verified; no Codex invocation needed")
+            return 0
     else:
         if resume:
             raise PilotError("No existing state to resume")
@@ -896,11 +1044,16 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
         # its plan/repository instead of making the next attempt unrecoverable.
         if manifest_path.exists():
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(manifest, dict):
+                raise PilotError("Run manifest must be an object")
             if (manifest.get("plan_sha256") != plan_sha or manifest.get("target_repo") != str(repo)
                     or manifest.get("task_ids") != [t["id"] for t in tasks]):
                 raise PilotError("Existing run manifest does not match this plan or repository")
             run_id = manifest["run_id"]
             created = manifest.get("start_time_utc") or created
+            if (manifest.get("branch") not in (None, selected_branch)
+                    or manifest.get("initial_git_head") != head(repo)):
+                raise PilotError("Initialization Git HEAD or branch changed from the saved manifest")
         elif timeline_path.exists():
             # EventLog validates every complete record and preserves any torn tail.
             data = timeline_path.read_bytes()
@@ -920,13 +1073,15 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
             events.emit("controller", "stopped", "failed",
                         metadata={"reason": "dirty worktree preflight"})
             raise PilotError("New run requires a clean working tree; use a disposable project")
+        initial_head = head(repo)
         state = {"repo": str(repo), "plan_sha256": plan_sha, "status": "initializing",
                  "completed": [], "current_task": None, "history": [], "pending_checkpoint": None,
                  "pending_review": None,
-                 "created_utc": created, "run_id": run_id, "auto_push": auto_push}
+                 "created_utc": created, "run_id": run_id, "auto_push": auto_push, "branch": selected_branch,
+                 "initial_git_head": initial_head, "process_ownership": 1}
         manifest = {"run_id": run_id, "plan_sha256": plan_sha,
-                    "task_ids": [t["id"] for t in tasks], "initial_git_head": head(repo),
-                    "start_time_utc": created, "target_repo": str(repo)}
+                    "task_ids": [t["id"] for t in tasks], "initial_git_head": initial_head,
+                    "start_time_utc": created, "target_repo": str(repo), "branch": selected_branch}
         if not manifest_path.exists():
             save_json(manifest_path, manifest)
         events = EventLog(timeline_path, run_id)
@@ -960,12 +1115,15 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
         for attempt in range(start, attempts + 1):
             assert_test_process_safe(repo)
             assert_process_safe(repo)
+            require_run_branch(repo, state["branch"])
+            task_head = expected_run_head(state, manifest)
+            if head(repo) != task_head:
+                raise PilotError("Git HEAD changed from the approved task base")
             events.emit("controller", "task_started", "started", task_id=ident, attempt=attempt)
             print(f"[{ident}] Codex A — attempt {attempt}", flush=True)
             state["status"] = "running"
             save_json(state_path, state)
             base = f"{ident}-{attempt:02d}"
-            task_head = head(repo)
             developer_msg = ("Implement this task in the current Git repository. You may create the normal "
                  "source files you need INSIDE this repository. Do not change Git history, push, "
                  "read secrets, or modify files outside it. Run appropriate tests and fix code issues "
@@ -999,7 +1157,8 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                         metadata={"exit_code": code, "timed_out": timed}
                                  | measurement)
             record = {"task": ident, "attempt": attempt, "a_exit": code,
-                      "a_timed_out": timed, "tests": [], "review": None}
+                      "a_timed_out": timed, "a_cleanup_confirmed": getattr(result, "cleanup_confirmed", None),
+                      "a_process_started": getattr(result, "process_started", None), "tests": [], "review": None}
             if uncertain:
                 events.emit("controller", "stopped", "failed", task_id=ident, attempt=attempt,
                             metadata={"reason": "Codex A process cleanup unverified", "execution_id": execution["seq"]})
@@ -1012,8 +1171,8 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                 events.emit("controller", "stopped", "failed", task_id=ident, attempt=attempt, evidence={"state": "state.json"}, metadata={"reason": "Codex A process failure"})
                 print(f"STOPPED: Codex A process failed; logs: {logs}")
                 return 1
-            if head(repo) != task_head:
-                record["feedback"] = "Git HEAD changed during Codex A implementation"
+            if head(repo) != task_head or git(repo, ["branch", "--show-current"]) != state["branch"]:
+                record["feedback"] = "Git HEAD or branch changed during Codex A implementation"
                 state["history"].append(record)
                 state["status"] = "stopped"
                 save_json(state_path, state)
@@ -1026,6 +1185,7 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
             tested_diff_sha = None
             if not failed:
                 try:
+                    require_run_branch(repo, state["branch"])
                     _, _, tested_diff_sha = staging_summary(repo)
                 except PilotError as exc:
                     record["feedback"] = str(exc)
@@ -1036,6 +1196,9 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                                 attempt=attempt, metadata={"reason": "checkpoint safety"})
                     return 1
             for index, cmd in enumerate(task["test_commands"], 1):
+                require_run_branch(repo, state["branch"])
+                if head(repo) != task_head:
+                    raise PilotError("Git HEAD changed before controller verification")
                 execution = events.emit("tests", "test_started", "started", task_id=ident, attempt=attempt, metadata={"index": index})
                 print(f"[{ident}] Running test {index}/{len(task['test_commands'])}", flush=True)
                 context = {"repo": str(repo), "logs": str(logs), "run_id": state["run_id"],
@@ -1113,6 +1276,7 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                             evidence={"test_output": [f"{base}-test-{i}.txt" for i in range(1, len(record["tests"])+1)]})
                 continue
             try:
+                require_run_branch(repo, state["branch"])
                 stat, diff, diff_sha = staging_summary(repo)
                 if (head(repo) != task_head or tested_diff_sha != diff_sha
                         or not git_clean_staged(repo)):
@@ -1128,6 +1292,7 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
             (logs / f"{base}-diff.txt").write_text(diff, encoding="utf-8")
             state["pending_review"] = {"task": ident, "attempt": attempt,
                                        "repo": str(repo), "plan_sha256": plan_sha,
+                                        "branch": state["branch"],
                                        "base_head": task_head, "diff_sha256": diff_sha,
                                        "record": record, "review_invocations": 0,
                                        "review_invocation_limit": MAX_REVIEW_PROCESS_ATTEMPTS}
@@ -1145,6 +1310,9 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
             events.emit("controller", "stopped", "failed", task_id=ident, metadata={"reason": "correction attempt limit"})
             print(f"STOPPED: correction attempt limit for {ident}. Logs: {logs}")
             return 1
+    require_run_branch(repo, state["branch"])
+    if head(repo) != expected_run_head(state, manifest):
+        raise PilotError("Git HEAD changed before run completion")
     state["status"] = "completed"
     state["current_task"] = None
     save_json(state_path, state)

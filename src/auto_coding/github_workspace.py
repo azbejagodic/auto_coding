@@ -456,6 +456,8 @@ class GitHubWorkspaceManager:
             if (not isinstance(review, dict) or review.get("decision") != "APPROVED" or review.get("issues") != []
                     or not record.get("diff_sha256")):
                 raise WorkspaceError("approval", "Every unpublished commit needs a recorded approved checkpoint. Older or manual commits require review.")
+            if record.get("branch") not in (None, branch):
+                raise WorkspaceError("approval", "Checkpoint approval belongs to a different feature branch.")
             parents = self._git(repo, "rev-list", "--parents", "-n", "1", commit).split()
             if parents != [commit, record.get("base_head")]:
                 raise WorkspaceError("approval", "Checkpoint parent differs from its approval; inspect before publishing.")

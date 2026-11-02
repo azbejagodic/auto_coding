@@ -10,6 +10,14 @@ from auto_coding.repository_activity import repository_busy
 from auto_coding.test_process_safety import assert_test_process_safe
 
 
+def validate_feature_branch(branch):
+    if not branch:
+        raise ValueError("Select a feature branch; detached HEAD or unavailable Git branch.")
+    if branch.lower() in {"main", "master"}:
+        raise ValueError("Runs are blocked on main/master. Switch to a feature branch first.")
+    return branch
+
+
 def validate_repository_root(path, *, run_command=None) -> Path:
     """Return an existing Git root, without changing it or creating storage."""
     run = run_command if run_command is not None else bounded_run
@@ -56,10 +64,10 @@ def launch_preflight(repo, runs_dir, *, run_command=None, other_active_run=None)
         branch = run(["git", "branch", "--show-current"], cwd=repo,
                      capture_output=True, text=True, encoding="utf-8", errors="surrogateescape", shell=False, timeout=10)
         result["branch"] = branch.stdout.strip() if not branch.returncode else None
-        if not result["branch"]:
-            result["errors"].append("Select a feature branch; detached HEAD or unavailable Git branch.")
-        elif result["branch"].lower() in {"main", "master"}:
-            result["errors"].append("Runs are blocked on main/master. Switch to a feature branch first.")
+        try:
+            validate_feature_branch(result["branch"])
+        except ValueError as exc:
+            result["errors"].append(str(exc))
         status = run(["git", "status", "--porcelain", "--untracked-files=all"],
                      cwd=repo, capture_output=True, text=True, encoding="utf-8", errors="surrogateescape", shell=False, timeout=10)
         result["clean"] = not status.stdout.strip() if not status.returncode else None
