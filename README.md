@@ -11,6 +11,21 @@ The existing simple runner saves approved local checkpoints by default. The dash
 
 ## Verification
 
+### Interrupted implementation attempts
+
+The runner saves a unique Codex A attempt identity before launch. A confirmed
+successful implementation is checkpointed with its exact staged diff before
+writing the captured output stream. Resume can reuse that implementation and
+continue controller verification and independent review without another A call.
+Attempt artifacts are never overwritten; repeated verification uses new output
+paths. A review-ready checkpoint still resumes B only.
+
+An interrupted running execution, a changed snapshot, or missing completion
+evidence stops recovery. Inspect the saved state and workspace ownership evidence;
+missing PIDs, missing locks and elapsed time do not establish safe cleanup. A
+successful execution whose snapshot could not be persisted requires inspection,
+rather than an automatic replay against existing changes.
+
 ### Repository-local branch protection
 
 `main`, `master` and detached HEAD are always blocked as execution targets.

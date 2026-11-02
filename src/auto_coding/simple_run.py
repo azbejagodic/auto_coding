@@ -110,7 +110,10 @@ def load_tasks(path: Path) -> tuple[list[dict], str]:
 
 def save_json(path: Path, value: dict) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
+    with temporary.open("w", encoding="utf-8") as stream:
+        stream.write(json.dumps(value, indent=2, ensure_ascii=False))
+        stream.flush()
+        os.fsync(stream.fileno())
     temporary.replace(path)
 
 
@@ -717,7 +720,11 @@ def verify_review_ready(repo: Path, logs: Path, state: dict, task: dict) -> tupl
                 or result.get("exit_code") != 0 or result.get("timed_out") is not False
                 or not isinstance(result.get("output_sha256"), str)):
             raise PilotError("Review-ready checkpoint has invalid test evidence")
-        output_path = logs / f"{task['id']}-{pending['attempt']:02d}-test-{index}.txt"
+        output_name = result.get("output", f"{task['id']}-{pending['attempt']:02d}-test-{index}.txt")
+        pattern = re.escape(f"{task['id']}-{pending['attempt']:02d}-test-{index}") + r"(?:-[0-9a-f]{32})?\.txt"
+        if not isinstance(output_name, str) or re.fullmatch(pattern, output_name) is None:
+            raise PilotError("Invalid review-ready test evidence path")
+        output_path = logs / output_name
         if (not output_path.is_file() or
                 hashlib.sha256(output_path.read_bytes()).hexdigest() != result["output_sha256"]):
             raise PilotError("Review-ready test output changed; tests must be rerun")
@@ -933,6 +940,164 @@ def review_ready_task(repo: Path, logs: Path, state: dict, state_path: Path,
                               "review_try": ordinal, "delay_seconds": delay})
 
 
+def write_attempt_evidence(path: Path, text: str) -> None:
+    """Create immutable attempt evidence, or reuse the exact same bytes."""
+    data = text.encode("utf-8")
+    try:
+        # Reserve exclusively before using the existing write_text injection
+        # hook. Only this newly created file may be written, never an old one.
+        with path.open("xb"):
+            pass
+    except FileExistsError:
+        if path.read_bytes() != data:
+            raise PilotError(f"Existing attempt evidence differs: {path.name}; inspect without overwriting") from None
+        return
+    path.write_text(text, encoding="utf-8", newline="")
+    with path.open("r+b") as stream:
+        os.fsync(stream.fileno())
+
+
+def verify_execution_checkpoint(repo, state, task):
+    pending = state.get("pending_execution")
+    if pending is None:
+        return
+    if (not isinstance(pending, dict) or pending.get("task") != task["id"]
+            or pending.get("repo") != str(repo) or pending.get("plan_sha256") != state["plan_sha256"]
+            or pending.get("branch") != state["branch"] or pending.get("base_head") != expected_run_head(state, state)
+            or not isinstance(pending.get("id"), str) or re.fullmatch(r"[0-9a-f]{32}", pending["id"]) is None
+            or type(pending.get("attempt")) is not int or pending["attempt"] < 1):
+        raise PilotError("Execution checkpoint identity does not match the saved task and Git base")
+    phase = pending.get("phase")
+    if phase in {"running", "uncertain"}:
+        stop_uncertain_saved_process(state, "Interrupted Codex A execution has no confirmed completion; inspect process ownership")
+    if phase not in {"unstarted", "completed"}:
+        raise PilotError("Unknown execution checkpoint state; inspect before continuing")
+    require_run_branch(repo, state["branch"])
+    if head(repo) != pending["base_head"] or not git_clean_staged(repo):
+        raise PilotError("Execution checkpoint Git HEAD or worktree changed; do not rerun Codex A")
+    assert_staged_paths_safe(repo)
+    digest = hashlib.sha256(git_patch(repo, ["diff", "--cached", "--binary", "--no-ext-diff"]).encode(
+        "utf-8", errors="surrogateescape")).hexdigest()
+    expected = pending.get("input_diff_sha256") if phase == "unstarted" else pending.get("diff_sha256")
+    if digest != expected:
+        raise PilotError("Execution checkpoint lacks the exact implementation snapshot; do not rerun Codex A")
+    if phase == "completed":
+        record = pending.get("record")
+        if (not isinstance(record, dict) or record.get("task") != task["id"]
+                or record.get("attempt") != pending["attempt"] or record.get("a_exit") != 0
+                or record.get("a_timed_out") is not False or record.get("a_cleanup_confirmed") is False):
+            raise PilotError("Execution checkpoint lacks successful Codex A evidence")
+
+
+def implementation_attempt(repo, logs, state, state_path, events, task, attempt, execute, timeout, model_a):
+    """Reserve an attempt before launch; checkpoint its exact result before evidence I/O."""
+    ident, base = task["id"], f"{task['id']}-{attempt:02d}"
+    pending = state.get("pending_execution")
+    if pending is not None:
+        verify_execution_checkpoint(repo, state, task)
+        if pending["attempt"] != attempt:
+            raise PilotError("Execution attempt differs from correction history")
+        if pending["phase"] == "completed":
+            print(f"[{ident}] Reusing confirmed Codex A execution {pending['id']}; controller verification remains required", flush=True)
+            events.emit("controller", "implementation_recovered", "observed", task_id=ident, attempt=attempt,
+                        metadata={"attempt_id": pending["id"], "execution_id": pending["execution_id"]})
+            return pending["record"], pending["diff_sha256"], []
+    else:
+        if any(logs.glob(base + "-*")):
+            raise PilotError("Attempt artifacts already exist without a matching execution identity; inspect before running Codex A")
+        pending = {"id": uuid.uuid4().hex, "task": ident, "attempt": attempt, "phase": "unstarted",
+                   "repo": str(repo), "plan_sha256": state["plan_sha256"], "branch": state["branch"],
+                   "base_head": head(repo), "input_diff_sha256": hashlib.sha256(git_patch(repo,
+                       ["diff", "--cached", "--binary", "--no-ext-diff"]).encode("utf-8", errors="surrogateescape")).hexdigest()}
+        state["pending_execution"] = pending
+        state["status"] = "stopped"
+        save_json(state_path, state)
+    developer_msg = ("Implement this task in the current Git repository. You may create the normal "
+        "source files you need INSIDE this repository. Do not change Git history, push, "
+        "read secrets, or modify files outside it. Run appropriate tests and fix code issues "
+        "before finishing. State exactly what you changed and tested.\n\nTASK:\n" + task["prompt"])
+    feedback = correction_context([h for h in state["history"] if h.get("task") == ident])
+    if feedback:
+        developer_msg += "\n\nPREVIOUS FAILURE OR REVIEW FEEDBACK:\n" + feedback
+    write_attempt_evidence(logs / f"{base}-a-prompt.txt", developer_msg)
+    answer_path = logs / f"{base}-a-answer.txt"
+    if answer_path.exists():
+        raise PilotError("Codex A answer already exists for an unstarted execution; inspect before launch")
+    argv = codex_argv(readonly=False, last_message=answer_path, schema=None, model=model_a)
+    execution = events.emit("Codex A", "process_started", "started", task_id=ident, attempt=attempt,
+        evidence={"prompt": f"{base}-a-prompt.txt", "stream": f"{base}-a-events.jsonl", "answer": answer_path.name},
+        metadata={"attempt_id": pending["id"]})
+    pending.update(phase="running", execution_id=execution["seq"])
+    state["status"] = "running"
+    save_json(state_path, state)
+    execution_started = _execution_clock()
+    try:
+        result = execute(argv, repo, timeout, prompt=developer_msg)
+    except BaseException as exc:
+        cleanup = getattr(exc, "cleanup_confirmed", None)
+        if cleanup is not True and not (cleanup is None and getattr(exc, "process_started", None) is False):
+            pending["phase"] = "uncertain"
+            record_process_uncertainty(state, state_path, "Codex A", execution)
+        else:
+            pending["phase"] = "unstarted" if getattr(exc, "process_started", None) is False else "completed"
+            state["status"] = "stopped"
+            save_json(state_path, state)
+        raise
+    code, output, timed = result
+    execution_finished = _execution_clock()
+    uncertain = cleanup_unverified(result)
+    record = {"task": ident, "attempt": attempt, "attempt_id": pending["id"], "a_exit": code,
+              "a_timed_out": timed, "a_cleanup_confirmed": getattr(result, "cleanup_confirmed", None),
+              "a_process_started": getattr(result, "process_started", None), "tests": [], "review": None}
+    pending.update(phase="uncertain" if uncertain else "completed", record=record)
+    state["status"] = "stopped"
+    if uncertain:
+        record_process_uncertainty(state, state_path, "Codex A", execution)
+    # Even if snapshot/evidence persistence fails next, this execution is never
+    # mistaken for an unstarted attempt. Without a saved hash recovery stops.
+    save_json(state_path, state)
+    measurement = execution_metadata(result, execution["seq"], execution_started, finished=execution_finished)
+    events.emit("Codex A", "process_finished", "cleanup_unverified" if uncertain else (
+        "timed_out" if timed else ("success" if code == 0 else "failed")),
+        task_id=ident, attempt=attempt, evidence={"stream": f"{base}-a-events.jsonl", "answer": answer_path.name},
+        metadata={"exit_code": code, "timed_out": timed} | measurement)
+    if uncertain:
+        write_attempt_evidence(logs / f"{base}-a-events.jsonl", output)
+        events.emit("controller", "stopped", "failed", task_id=ident, attempt=attempt,
+                    metadata={"reason": "Codex A process cleanup unverified", "execution_id": execution["seq"]})
+        return None
+    if code != 0 or timed:
+        record["feedback"] = "Codex A process failed or timed out; see events log"
+        state["history"].append(record)
+        state["pending_execution"] = None
+        save_json(state_path, state)
+        write_attempt_evidence(logs / f"{base}-a-events.jsonl", output)
+        events.emit("controller", "stopped", "failed", task_id=ident, attempt=attempt,
+                    evidence={"state": "state.json"}, metadata={"reason": "Codex A process failure"})
+        print(f"STOPPED: Codex A process failed; logs: {logs}")
+        return None
+    failed, digest = [], None
+    try:
+        require_run_branch(repo, state["branch"])
+        if head(repo) != pending["base_head"]:
+            raise PilotError("Git HEAD or branch changed during Codex A implementation")
+        if not files_overview(repo).strip():
+            failed.append(("No changed or created project files were found after Codex A ran.", ""))
+        else:
+            _, _, digest = staging_summary(repo)
+        pending["diff_sha256"] = digest
+        save_json(state_path, state)
+    except PilotError as exc:
+        record["feedback"] = str(exc)
+        state["history"].append(record)
+        save_json(state_path, state)
+        events.emit("controller", "stopped", "failed", task_id=ident, attempt=attempt,
+                    metadata={"reason": "checkpoint safety"})
+        return None
+    write_attempt_evidence(logs / f"{base}-a-events.jsonl", output)
+    return record, digest, failed
+
+
 def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False, attempts=3,
         auto_push=None, retry_review_once=False,
         model_a=None, model_b=None, timeout=1800,
@@ -980,7 +1145,9 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
             raise PilotError("One extra review call requires an exhausted review-ready checkpoint")
         if state.get("status") == "completed" and (state.get("pending_review") or state.get("pending_checkpoint")):
             raise PilotError("Completed state still has an unfinished checkpoint")
-        if state.get("status") not in {"stopped", "checkpointing", "completed"}:
+        recoverable_execution = (isinstance(state.get("pending_execution"), dict)
+                                 and state["pending_execution"].get("phase") in {"unstarted", "completed"})
+        if state.get("status") not in {"stopped", "checkpointing", "completed"} and not recoverable_execution:
             raise PilotError("Previous run may still be active or interrupted; inspect before resuming")
         manifest_path = logs / "run-manifest.json"
         if manifest_path.exists():
@@ -1027,6 +1194,13 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                 state["run_id"] = run_id
                 save_json(manifest_path, manifest)
                 save_json(state_path, state)
+            pending_execution = state.get("pending_execution")
+            if pending_execution is not None:
+                if state.get("pending_review") or state.get("pending_checkpoint"):
+                    raise PilotError("Conflicting implementation and review checkpoints")
+                if len(state["completed"]) >= len(tasks):
+                    raise PilotError("Execution checkpoint exists after all tasks completed")
+                verify_execution_checkpoint(repo, state, tasks[len(state["completed"])])
             recover_checkpoint(repo, state, state_path, events)
             if state.get("pending_review"):
                 pending_task = next((t for t in tasks if t["id"] == state["pending_review"].get("task")), None)
@@ -1035,7 +1209,7 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                 verify_review_ready(repo, logs, state, pending_task)
             if state["completed"] and not git_clean(repo):
                 # Dirty changes are legitimate only when the unfinished task was attempted.
-                if (not state.get("pending_review") and
+                if (not state.get("pending_review") and not state.get("pending_execution") and
                         not any(h["task"] not in state["completed"] for h in state["history"])):
                     raise PilotError("Unrecognized changes after last approved checkpoint")
         except (PilotError, OSError, KeyError, TypeError, ValueError) as exc:
@@ -1146,77 +1320,11 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
             state["status"] = "running"
             save_json(state_path, state)
             base = f"{ident}-{attempt:02d}"
-            developer_msg = ("Implement this task in the current Git repository. You may create the normal "
-                 "source files you need INSIDE this repository. Do not change Git history, push, "
-                 "read secrets, or modify files outside it. Run appropriate tests and fix code issues "
-                 "before finishing. State exactly what you changed and tested.\n\nTASK:\n" + task["prompt"])
-            feedback = correction_context([h for h in state["history"] if h.get("task") == ident])
-            if feedback:
-                developer_msg += "\n\nPREVIOUS FAILURE OR REVIEW FEEDBACK:\n" + feedback
-            (logs / f"{base}-a-prompt.txt").write_text(developer_msg, encoding="utf-8")
-            execution = events.emit("Codex A", "process_started", "started", task_id=ident, attempt=attempt,
-                        evidence={"prompt": f"{base}-a-prompt.txt", "stream": f"{base}-a-events.jsonl", "answer": f"{base}-a-answer.txt"})
-            answer_path = logs / f"{base}-a-answer.txt"
-            execution_started = _execution_clock()
-            try:
-                result = execute(codex_argv(readonly=False, last_message=answer_path,
-                                          schema=None, model=model_a), repo, timeout, prompt=developer_msg)
-            except BaseException as exc:
-                cleanup = getattr(exc, "cleanup_confirmed", None)
-                if cleanup is not True and not (cleanup is None and getattr(exc, "process_started", None) is False):
-                    record_process_uncertainty(state, state_path, "Codex A", execution)
-                raise
-            code, output, timed = result
-            execution_finished = _execution_clock()
-            uncertain = cleanup_unverified(result)
-            if uncertain:
-                record_process_uncertainty(state, state_path, "Codex A", execution)
-            measurement = execution_metadata(result, execution["seq"], execution_started, finished=execution_finished)
-            (logs / f"{base}-a-events.jsonl").write_text(output, encoding="utf-8")
-            events.emit("Codex A", "process_finished", "cleanup_unverified" if uncertain else (
-                        "timed_out" if timed else ("success" if code == 0 else "failed")), task_id=ident, attempt=attempt,
-                        evidence={"stream": f"{base}-a-events.jsonl", "answer": f"{base}-a-answer.txt"},
-                        metadata={"exit_code": code, "timed_out": timed}
-                                 | measurement)
-            record = {"task": ident, "attempt": attempt, "a_exit": code,
-                      "a_timed_out": timed, "a_cleanup_confirmed": getattr(result, "cleanup_confirmed", None),
-                      "a_process_started": getattr(result, "process_started", None), "tests": [], "review": None}
-            if uncertain:
-                events.emit("controller", "stopped", "failed", task_id=ident, attempt=attempt,
-                            metadata={"reason": "Codex A process cleanup unverified", "execution_id": execution["seq"]})
+            result = implementation_attempt(repo, logs, state, state_path, events, task,
+                                            attempt, execute, timeout, model_a)
+            if result is None:
                 return 1
-            if code != 0 or timed:
-                record["feedback"] = "Codex A process failed or timed out; see events log"
-                state["history"].append(record)
-                state["status"] = "stopped"
-                save_json(state_path, state)
-                events.emit("controller", "stopped", "failed", task_id=ident, attempt=attempt, evidence={"state": "state.json"}, metadata={"reason": "Codex A process failure"})
-                print(f"STOPPED: Codex A process failed; logs: {logs}")
-                return 1
-            if head(repo) != task_head or git(repo, ["branch", "--show-current"]) != state["branch"]:
-                record["feedback"] = "Git HEAD or branch changed during Codex A implementation"
-                state["history"].append(record)
-                state["status"] = "stopped"
-                save_json(state_path, state)
-                events.emit("controller", "stopped", "failed", task_id=ident, attempt=attempt,
-                            metadata={"reason": "Git HEAD changed during implementation"})
-                return 1
-            failed = []
-            if not files_overview(repo).strip():
-                failed.append(("No changed or created project files were found after Codex A ran.", ""))
-            tested_diff_sha = None
-            if not failed:
-                try:
-                    require_run_branch(repo, state["branch"])
-                    _, _, tested_diff_sha = staging_summary(repo)
-                except PilotError as exc:
-                    record["feedback"] = str(exc)
-                    state["history"].append(record)
-                    state["status"] = "stopped"
-                    save_json(state_path, state)
-                    events.emit("controller", "stopped", "failed", task_id=ident,
-                                attempt=attempt, metadata={"reason": "checkpoint safety"})
-                    return 1
+            record, tested_diff_sha, failed = result
             for index, cmd in enumerate(task["test_commands"], 1):
                 require_run_branch(repo, state["branch"])
                 if head(repo) != task_head:
@@ -1254,12 +1362,14 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                 measurement = execution_metadata(result, execution["seq"], test_started,
                                                  codex=False, finished=test_finished)
                 output_path = logs / f"{base}-test-{index}.txt"
-                output_path.write_text(output, encoding="utf-8")
+                if output_path.exists():
+                    output_path = logs / f"{base}-test-{index}-{uuid.uuid4().hex}.txt"
+                write_attempt_evidence(output_path, output)
                 record["tests"].append({"index": index, "exit_code": code, "timed_out": timed,
-                                        "output_sha256": hashlib.sha256(output_path.read_bytes()).hexdigest()})
+                                        "output_sha256": hashlib.sha256(output_path.read_bytes()).hexdigest(), "output": output_path.name})
                 events.emit("tests", "test_finished", "cleanup_unverified" if uncertain else (
                             "timed_out" if timed else ("success" if code == 0 else "failed")), task_id=ident, attempt=attempt,
-                            evidence={"output": f"{base}-test-{index}.txt"},
+                            evidence={"output": output_path.name},
                             metadata={"index": index, "exit_code": code, "timed_out": timed,
                                       "cleanup_confirmed": cleanup} | measurement)
                 if uncertain:
@@ -1270,7 +1380,7 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                 if code != 0 or timed:
                     # Preserve the existing repair feedback while omitting argv;
                     # event metadata contains only safe index/status details.
-                    failed.append((f"TEST {index} failed (exit {code}); see {base}-test-{index}.txt",
+                    failed.append((f"TEST {index} failed (exit {code}); see {output_path.name}",
                                    output[-MAX_TEST_FEEDBACK:]))
                     if timed:
                         break
@@ -1286,6 +1396,7 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                 feedback = "\n\n".join(parts)
                 record["feedback"] = feedback
                 state["history"].append(record)
+                state["pending_execution"] = None
                 save_json(state_path, state)
                 print(f"[{ident}] Tests failed; returning evidence to Codex A", flush=True)
                 if any(x["timed_out"] for x in record["tests"]):
@@ -1295,7 +1406,8 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                     print("STOPPED: test timeout (not a code-repair verdict)")
                     return 1
                 events.emit("controller", "correction_requested", "retry", task_id=ident, attempt=attempt,
-                            evidence={"test_output": [f"{base}-test-{i}.txt" for i in range(1, len(record["tests"])+1)]})
+                            evidence={"test_output": [result.get("output", f"{base}-test-{i}.txt")
+                                      for i, result in enumerate(record["tests"], 1)]})
                 continue
             try:
                 require_run_branch(repo, state["branch"])
@@ -1311,7 +1423,8 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                 events.emit("controller", "stopped", "failed", task_id=ident, attempt=attempt, metadata={"reason": "checkpoint safety"})
                 print(f"STOPPED: change checkpoint safety: {exc}")
                 return 1
-            (logs / f"{base}-diff.txt").write_text(diff, encoding="utf-8")
+            write_attempt_evidence(logs / f"{base}-diff.txt", diff)
+            state["pending_execution"] = None
             state["pending_review"] = {"task": ident, "attempt": attempt,
                                        "repo": str(repo), "plan_sha256": plan_sha,
                                         "branch": state["branch"],
