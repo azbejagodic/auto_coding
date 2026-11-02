@@ -17,6 +17,7 @@ from auto_coding.repository_activity import repository_busy
 from auto_coding.test_process_safety import assert_test_process_safe
 from auto_coding.repository_ownership import (managed_lock, execution_lock,
     assert_process_safe, preserve_process_uncertainty)
+from auto_coding.sensitive_paths import is_sensitive_path
 
 
 _uncertain_process = ContextVar("autocoding_uncertain_process", default=None)
@@ -461,13 +462,10 @@ class GitHubWorkspaceManager:
             parents = self._git(repo, "rev-list", "--parents", "-n", "1", commit).split()
             if parents != [commit, record.get("base_head")]:
                 raise WorkspaceError("approval", "Checkpoint parent differs from its approval; inspect before publishing.")
-            names = self._git(repo, "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", commit).split("\0")
+            names = self._git(repo, "diff-tree", "--root", "--no-commit-id", "--name-only", "-r", "-z", commit).split("\0")
             for name in filter(None, names):
-                parts = name.replace("\\", "/").lower().split("/")
-                if (is_generated_path(name) or any(p in {".git", ".ssh", ".aws"} for p in parts)
-                        or parts[-1].startswith(".env") or parts[-1] in {"credentials", "credentials.json", "id_rsa", "id_ed25519"}
-                        or parts[-1].endswith((".pem", ".key", ".p12", ".pfx"))):
-                    raise WorkspaceError("sensitive", "Generated or sensitive files block publication. Inspect the checkpoint locally.")
+                if is_generated_path(name) or is_sensitive_path(name):
+                    raise WorkspaceError("sensitive", f"Generated or sensitive file blocks publication: {name}; inspect locally.")
             patch = self._command(["git", "show", "--format=", "--binary", "--no-ext-diff", commit], repo, preserve=True)
             if hashlib.sha256(patch.encode("utf-8", errors="surrogateescape")).hexdigest() != record["diff_sha256"]:
                 raise WorkspaceError("approval", "Checkpoint bytes differ from the approved patch; inspect before publishing.")

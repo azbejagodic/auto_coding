@@ -27,6 +27,7 @@ from auto_coding.metrics import codex_usage, write_metrics
 from auto_coding.test_process_safety import TestProcessGate, assert_test_process_safe
 from auto_coding.repository_ownership import assert_process_safe
 from auto_coding.launch_preflight import validate_feature_branch
+from auto_coding.sensitive_paths import is_sensitive_path
 
 
 MAX_PLAN = 512 * 1024
@@ -300,11 +301,23 @@ def ignore_generated_locally(repo: Path) -> None:
                          + marker + "\n" + "\n".join(_GENERATED_GIT_EXCLUDES) + "\n")
 
 
+def reject_sensitive_paths(paths):
+    for item in paths:
+        if is_sensitive_path(item):
+            raise PilotError(f"Sensitive file in changes: {item}; inspect manually")
+
+
+def assert_staged_paths_safe(repo):
+    paths = git(repo, ["diff", "--cached", "--name-only", "-z"]).split("\0")
+    reject_sensitive_paths(item for item in paths if item)
+
+
 def staging_summary(repo: Path) -> tuple[str, str, str]:
     """Stage project changes only; omit build caches, never omit secret files."""
     ignore_generated_locally(repo)
     git(repo, ["add", "-A"])
     paths = [p for p in git(repo, ["diff", "--cached", "--name-only", "-z"]).split("\0") if p]
+    reject_sensitive_paths(paths)  # Never unstage a sensitive file as a generated artifact.
     for item in paths:
         if is_generated_path(item):
             # Handle the previous V2 failure, where a cache file is already staged.
@@ -319,13 +332,7 @@ def staging_summary(repo: Path) -> tuple[str, str, str]:
     paths = [p for p in git(repo, ["diff", "--cached", "--name-only", "-z"]).split("\0") if p]
     if not paths:
         raise PilotError("No changed or created project files in this task")
-    for item in paths:
-        components = item.replace("\\", "/").lower().split("/")
-        base = components[-1]
-        if (any(c in {".git", ".ssh"} for c in components)
-                or base in {".env", ".env.local", "id_rsa", "id_ed25519", "credentials.json"}
-                or base.endswith((".pem", ".p12", ".pfx", ".key"))):
-            raise PilotError(f"Sensitive file staged: {item}; inspect manually")
+    reject_sensitive_paths(paths)
     # Diff is used for both the reviewer and an approval-to-commit integrity check.
     diff = git_patch(repo, ["diff", "--cached", "--binary", "--no-ext-diff"])
     diff_hash = hashlib.sha256(diff.encode("utf-8", errors="surrogateescape")).hexdigest()
@@ -360,6 +367,7 @@ def local_commit(repo: Path, ident: str) -> str:
     assert_test_process_safe(repo)
     assert_process_safe(repo)
     require_run_branch(repo)
+    assert_staged_paths_safe(repo)
     # Local checkpoints only. Never push. The user can set their Git identity;
     # if it is absent, an explicitly non-public local-only identity is used.
     name = git(repo, ["config", "--get", "user.name"]) if call(["git", "config", "--get", "user.name"], repo, 15)[0] == 0 else "Auto-Coding (local)"
@@ -381,6 +389,8 @@ def verify_approved_commit(repo: Path, pending: dict, current: str | None, *, re
     if (not isinstance(current, str) or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", current)
             or (require_clean and (current != head(repo) or not git_clean(repo)))):
         raise PilotError("Checkpoint state ambiguous: inspect repository and logs")
+    names = git(repo, ["diff-tree", "--root", "--no-commit-id", "--name-only", "-r", "-z", current]).split("\0")
+    reject_sensitive_paths(item for item in names if item)
     message = git(repo, ["log", "-1", "--format=%s", current])
     lineage = git(repo, ["rev-list", "--parents", "-n", "1", current]).split()
     base = pending.get("base_head")
@@ -704,6 +714,7 @@ def verify_review_ready(repo: Path, logs: Path, state: dict, task: dict) -> tupl
         raise PilotError("Review-ready Git HEAD changed; tests must be rerun")
     if not git_clean_staged(repo):
         raise PilotError("Review-ready worktree has unstaged or untracked changes")
+    assert_staged_paths_safe(repo)
     diff = git_patch(repo, ["diff", "--cached", "--binary", "--no-ext-diff"])
     if (not diff or hashlib.sha256(diff.encode("utf-8", errors="surrogateescape")).hexdigest()
             != pending.get("diff_sha256")):

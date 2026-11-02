@@ -305,12 +305,19 @@ class WorkspaceTests(unittest.TestCase):
             self.assertNotIn("SECRET", str(caught.exception))
 
     def test_push_rejects_sensitive_and_generated_checkpoint_names(self):
-        for filename in (".env.production", "credentials.json", "cache.pyc"):
+        for filename in (".env.production", "credentials.json", "cache.pyc", ".aws/credentials",
+                         "nested/.env.local", "nested/credentials", "nested/private.KEY"):
             repo = self.connect()
             branch = "feature/" + filename.replace(".", "x")
             self.manager.create_branch("owner/repo", branch)
+            (repo / filename).parent.mkdir(parents=True, exist_ok=True)
             approved = self.checkpoint(repo, filename)
-            self.assert_error("sensitive", lambda: self.manager.push_approved("owner/repo", approved))
+            with self.assertRaises(WorkspaceError) as caught:
+                self.manager.push_approved("owner/repo", approved)
+            self.assertEqual(caught.exception.code, "sensitive")
+            self.assertIn(filename, str(caught.exception))
+            self.assertNotIn("approved change", str(caught.exception))
+            self.assertEqual((repo / filename).read_text(), "approved change")
         self.assertFalse(any("push" in argv for argv in self.calls))
 
     def test_controller_push_eligibility_uses_durable_approval_and_reopens_identity(self):
