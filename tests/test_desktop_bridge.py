@@ -393,8 +393,11 @@ class DesktopBridgeTests(unittest.TestCase):
                  "plan_sha256": hashlib.sha256(self.plan.read_bytes()).hexdigest()}
         (controller.logs / "state.json").write_text(json.dumps(state))
         process.poll.return_value = None
-        with patch("auto_coding.desktop_control.bounded_run",
-                   return_value=SimpleNamespace(returncode=0, stdout="feature/test")):
+        def git(argv, **kwargs):
+            if argv[1] == "config":
+                return SimpleNamespace(returncode=1, stdout="", stderr="")
+            return SimpleNamespace(returncode=0, stdout="feature/test", stderr="")
+        with patch("auto_coding.desktop_control.bounded_run", side_effect=git):
             self.assertTrue(bridge.resume()["ok"])
         self.assertEqual(popen.call_count, 2)
         self.assertIn("--resume", popen.call_args.args[0])

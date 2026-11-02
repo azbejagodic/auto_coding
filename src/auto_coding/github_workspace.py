@@ -17,7 +17,8 @@ from auto_coding.repository_activity import repository_busy
 from auto_coding.test_process_safety import assert_test_process_safe
 from auto_coding.repository_ownership import (managed_lock, execution_lock,
     assert_process_safe, preserve_process_uncertainty)
-from auto_coding.sensitive_paths import is_sensitive_path
+from auto_coding.sensitive_paths import is_sensitive_path, changed_paths, CHANGE_PATH_OPTIONS
+from auto_coding.launch_preflight import validate_feature_branch, parse_protected_branches, PROTECTED_BRANCH_KEY
 
 
 _uncertain_process = ContextVar("autocoding_uncertain_process", default=None)
@@ -377,6 +378,17 @@ class GitHubWorkspaceManager:
     def _branch(self, repo, name):
         if not isinstance(name, str) or not name or name.startswith("-") or name.lower() in {"main", "master"}:
             raise WorkspaceError("invalid_branch", "Choose a safe feature branch name; main/master are protected.")
+        try:
+            protected = parse_protected_branches(self._command(
+                ["git", "config", "--local", "--null", "--get-all", PROTECTED_BRANCH_KEY], repo,
+                allowed=(0, 1), preserve=True))
+            for protected_name in protected:
+                if protected_name.startswith("-"):
+                    raise ValueError("Configured protected branch name is not a valid literal Git branch")
+                self._git(repo, "check-ref-format", "refs/heads/" + protected_name)
+            validate_feature_branch(name, protected_branches=protected)
+        except ValueError as exc:
+            raise WorkspaceError("invalid_branch", str(exc)) from exc
         self._git(repo, "check-ref-format", "refs/heads/" + name)
 
     def create_branch(self, repository, name, *, base="main", confirmed_base=False):
@@ -462,8 +474,11 @@ class GitHubWorkspaceManager:
             parents = self._git(repo, "rev-list", "--parents", "-n", "1", commit).split()
             if parents != [commit, record.get("base_head")]:
                 raise WorkspaceError("approval", "Checkpoint parent differs from its approval; inspect before publishing.")
-            names = self._git(repo, "diff-tree", "--root", "--no-commit-id", "--name-only", "-r", "-z", commit).split("\0")
-            for name in filter(None, names):
+            try:
+                names = changed_paths(self._git(repo, "diff-tree", "--root", "--no-commit-id", "-r", *CHANGE_PATH_OPTIONS, commit))
+            except ValueError as exc:
+                raise WorkspaceError("approval", "Could not safely enumerate checkpoint change paths.") from exc
+            for name in names:
                 if is_generated_path(name) or is_sensitive_path(name):
                     raise WorkspaceError("sensitive", f"Generated or sensitive file blocks publication: {name}; inspect locally.")
             patch = self._command(["git", "show", "--format=", "--binary", "--no-ext-diff", commit], repo, preserve=True)

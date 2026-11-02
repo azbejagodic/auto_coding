@@ -10,11 +10,55 @@ from auto_coding.repository_activity import repository_busy
 from auto_coding.test_process_safety import assert_test_process_safe
 
 
-def validate_feature_branch(branch):
+PROTECTED_BRANCH_KEY = "autocoding.protectedBranch"
+
+
+def parse_protected_branches(output):
+    if not output:
+        return ()
+    if len(output) > 8192 or not output.endswith("\0"):
+        raise ValueError("Configured protected branches are incomplete or oversized")
+    names = output[:-1].split("\0")
+    if len(names) > 32 or any(not name or name != name.strip() or len(name) > 1024
+                              or any(ord(char) < 32 or ord(char) == 127 for char in name) for name in names):
+        raise ValueError("Invalid configured protected branch name")
+    return tuple(names)
+
+
+def _policy_command(run, repo, argv):
+    try:
+        return run(argv, cwd=repo, capture_output=True, text=True, encoding="utf-8",
+                   errors="surrogateescape", shell=False, timeout=10)
+    except BaseException as exc:
+        cleanup = getattr(exc, "cleanup_confirmed", None)
+        if cleanup is not True and not (cleanup is None and getattr(exc, "process_started", None) is False):
+            from auto_coding.github_workspace import mark_process_uncertain
+            mark_process_uncertain()
+        raise
+
+
+def configured_protected_branches(repo, *, run_command=None):
+    run = run_command if run_command is not None else bounded_run
+    result = _policy_command(run, repo, ["git", "config", "--local", "--null", "--get-all", PROTECTED_BRANCH_KEY])
+    if result.returncode == 1 and not result.stdout and not getattr(result, "stderr", None):
+        return ()  # Git's explicit 'key not present' result.
+    if result.returncode:
+        raise OSError("Could not read repository-local protected branches")
+    names = parse_protected_branches(result.stdout)
+    for name in names:
+        valid = _policy_command(run, repo, ["git", "check-ref-format", "refs/heads/" + name])
+        if name.startswith("-") or valid.returncode:
+            raise ValueError("Configured protected branch name is not a valid literal Git branch")
+    return names
+
+
+def validate_feature_branch(branch, *, protected_branches=()):
     if not branch:
         raise ValueError("Select a feature branch; detached HEAD or unavailable Git branch.")
     if branch.lower() in {"main", "master"}:
         raise ValueError("Runs are blocked on main/master. Switch to a feature branch first.")
+    if branch.casefold() in {name.casefold() for name in protected_branches}:
+        raise ValueError(f"Branch {branch!r} is protected by repository-local {PROTECTED_BRANCH_KEY}; use a development branch.")
     return branch
 
 
@@ -73,6 +117,11 @@ def launch_preflight(repo, runs_dir, *, run_command=None, other_active_run=None)
         result["clean"] = not status.stdout.strip() if not status.returncode else None
         if status.returncode:
             result["errors"].append("Could not check Git working tree.")
+        if not result["errors"]:
+            try:
+                validate_feature_branch(result["branch"], protected_branches=configured_protected_branches(repo, run_command=run))
+            except ValueError as exc:
+                result["errors"].append(str(exc))
     except (OSError, subprocess.TimeoutExpired) as exc:
         result["errors"].append(f"Git preflight failed: {exc}")
     return result

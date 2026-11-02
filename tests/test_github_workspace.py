@@ -1,6 +1,7 @@
 import json
 import hashlib
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -318,6 +319,67 @@ class WorkspaceTests(unittest.TestCase):
             self.assertIn(filename, str(caught.exception))
             self.assertNotIn("approved change", str(caught.exception))
             self.assertEqual((repo / filename).read_text(), "approved change")
+        self.assertFalse(any("push" in argv for argv in self.calls))
+
+    def change_checkpoint(self, source, destination, *, copy=False):
+        # Put the dummy source in the remote base, not an unapproved task commit.
+        file = self.seed / source
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text("DUMMY COPY/RENAME FIXTURE\n" * 20)
+        self.git(self.seed, "add", "-A")
+        self.git(self.seed, "commit", "-m", "source fixture")
+        self.git(self.seed, "push", str(self.remote), "main")
+        repo = self.connect()
+        self.manager.create_branch("owner/repo", "feature/change")
+        self.git(repo, "config", "diff.renames", "copies")
+        self.git(repo, "config", "user.name", "Test")
+        self.git(repo, "config", "user.email", "test@example.invalid")
+        parent = self.git(repo, "rev-parse", "HEAD")
+        if copy:
+            shutil.copyfile(repo / source, repo / destination)
+        else:
+            (repo / source).rename(repo / destination)
+        self.git(repo, "add", "-A")
+        patch_text = subprocess.run(["git", "diff", "--cached", "--binary", "--no-ext-diff"], cwd=repo,
+                                    capture_output=True, text=True, encoding="utf-8", check=True).stdout
+        self.git(repo, "commit", "-m", "approved checkpoint")  # Simulate a pre-correction checkpoint.
+        commit = self.git(repo, "rev-parse", "HEAD")
+        return repo, {commit: {"commit": commit, "base_head": parent,
+            "branch": "feature/change", "diff_sha256": hashlib.sha256(patch_text.encode()).hexdigest(),
+            "review": {"decision": "APPROVED", "issues": []}}}
+
+    def test_publication_rejects_sensitive_rename_source(self):
+        repo, approved = self.change_checkpoint(".env.production", "settings.txt")
+        before = self.git(repo, "rev-parse", "HEAD")
+        with self.assertRaises(WorkspaceError) as caught:
+            self.manager.push_approved("owner/repo", approved)
+        self.assertEqual(caught.exception.code, "sensitive")
+        self.assertIn(".env.production", str(caught.exception))
+        self.assertNotIn("DUMMY COPY/RENAME FIXTURE", str(caught.exception))
+        self.assertEqual(self.git(repo, "rev-parse", "HEAD"), before)
+        self.assertTrue((repo / "settings.txt").is_file())
+        self.assertFalse(any("push" in argv for argv in self.calls))
+
+    def test_publication_rejects_unchanged_sensitive_copy_source(self):
+        repo, approved = self.change_checkpoint(".aws/credentials", "settings.txt", copy=True)
+        with self.assertRaises(WorkspaceError) as caught:
+            self.manager.push_approved("owner/repo", approved)
+        self.assertEqual(caught.exception.code, "sensitive")
+        self.assertIn(".aws/credentials", str(caught.exception))
+        self.assertEqual((repo / ".aws/credentials").read_bytes(), (repo / "settings.txt").read_bytes())
+        self.assertFalse(any("push" in argv for argv in self.calls))
+
+    def test_publication_accepts_ordinary_rename(self):
+        repo, approved = self.change_checkpoint("ordinary source.txt", "ordinary destination.txt")
+        self.assertTrue(self.manager.push_approved("owner/repo", approved)["published"])
+        self.assertEqual(self.git(self.remote, "rev-parse", "feature/change"), next(iter(approved)))
+
+    def test_repository_configured_stable_branch_blocks_publication(self):
+        repo = self.connect()
+        self.manager.create_branch("owner/repo", "backend/core")
+        approved = self.checkpoint(repo)
+        self.git(repo, "config", "--local", "--add", "autocoding.protectedBranch", "backend/core")
+        self.assert_error("invalid_branch", lambda: self.manager.push_approved("owner/repo", approved))
         self.assertFalse(any("push" in argv for argv in self.calls))
 
     def test_controller_push_eligibility_uses_durable_approval_and_reopens_identity(self):

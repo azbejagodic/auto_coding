@@ -26,8 +26,8 @@ from auto_coding.process_runner import bounded_run, OutputLimitExceeded
 from auto_coding.metrics import codex_usage, write_metrics
 from auto_coding.test_process_safety import TestProcessGate, assert_test_process_safe
 from auto_coding.repository_ownership import assert_process_safe
-from auto_coding.launch_preflight import validate_feature_branch
-from auto_coding.sensitive_paths import is_sensitive_path
+from auto_coding.launch_preflight import validate_feature_branch, configured_protected_branches
+from auto_coding.sensitive_paths import is_sensitive_path, changed_paths, CHANGE_PATH_OPTIONS
 
 
 MAX_PLAN = 512 * 1024
@@ -248,7 +248,9 @@ def git_patch(repo: Path, args: list[str]) -> str:
 def require_run_branch(repo, expected=None):
     branch = git(repo, ["branch", "--show-current"])
     try:
-        validate_feature_branch(branch)
+        validate_feature_branch(branch, protected_branches=configured_protected_branches(repo, run_command=bounded_run))
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise PilotError("Could not verify repository-local branch protection; inspect Git configuration") from exc
     except ValueError as exc:
         raise PilotError(str(exc)) from exc
     if expected is not None and branch != expected:
@@ -307,16 +309,22 @@ def reject_sensitive_paths(paths):
             raise PilotError(f"Sensitive file in changes: {item}; inspect manually")
 
 
+def staged_change_paths(repo):
+    try:
+        return changed_paths(git(repo, ["diff", "--cached", *CHANGE_PATH_OPTIONS]))
+    except ValueError as exc:
+        raise PilotError("Could not safely enumerate staged Git change paths") from exc
+
+
 def assert_staged_paths_safe(repo):
-    paths = git(repo, ["diff", "--cached", "--name-only", "-z"]).split("\0")
-    reject_sensitive_paths(item for item in paths if item)
+    reject_sensitive_paths(staged_change_paths(repo))
 
 
 def staging_summary(repo: Path) -> tuple[str, str, str]:
     """Stage project changes only; omit build caches, never omit secret files."""
     ignore_generated_locally(repo)
     git(repo, ["add", "-A"])
-    paths = [p for p in git(repo, ["diff", "--cached", "--name-only", "-z"]).split("\0") if p]
+    paths = staged_change_paths(repo)
     reject_sensitive_paths(paths)  # Never unstage a sensitive file as a generated artifact.
     for item in paths:
         if is_generated_path(item):
@@ -329,7 +337,7 @@ def staging_summary(repo: Path) -> tuple[str, str, str]:
                 if exists == 0:
                     raise PilotError(f"Previously tracked generated file changed: {item}; inspect manually")
             git(repo, ["rm", "-q", "-f", "--cached", "--", item])
-    paths = [p for p in git(repo, ["diff", "--cached", "--name-only", "-z"]).split("\0") if p]
+    paths = staged_change_paths(repo)
     if not paths:
         raise PilotError("No changed or created project files in this task")
     reject_sensitive_paths(paths)
@@ -389,8 +397,11 @@ def verify_approved_commit(repo: Path, pending: dict, current: str | None, *, re
     if (not isinstance(current, str) or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", current)
             or (require_clean and (current != head(repo) or not git_clean(repo)))):
         raise PilotError("Checkpoint state ambiguous: inspect repository and logs")
-    names = git(repo, ["diff-tree", "--root", "--no-commit-id", "--name-only", "-r", "-z", current]).split("\0")
-    reject_sensitive_paths(item for item in names if item)
+    try:
+        names = changed_paths(git(repo, ["diff-tree", "--root", "--no-commit-id", "-r", *CHANGE_PATH_OPTIONS, current]))
+    except ValueError as exc:
+        raise PilotError("Could not safely enumerate committed Git change paths") from exc
+    reject_sensitive_paths(names)
     message = git(repo, ["log", "-1", "--format=%s", current])
     lineage = git(repo, ["rev-list", "--parents", "-n", "1", current]).split()
     base = pending.get("base_head")
