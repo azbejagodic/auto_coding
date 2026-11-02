@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from auto_coding import simple_run as runner
+from backend_fixtures import run_with_verification as verified_run
 from auto_coding.desktop_control import DesktopController
 from auto_coding.github_workspace import GitHubWorkspaceManager, WorkspaceError, managed_lock, reserve_job
 from auto_coding.repository_activity import repository_busy
@@ -66,7 +67,7 @@ class TestCleanupSafetyTests(unittest.TestCase):
 
     def run_fake(self, fake, **kwargs):
         with contextlib.redirect_stdout(io.StringIO()):
-            return runner.run(self.plan, self.repo, self.logs, execute=fake, **kwargs)
+            return verified_run(self.plan, self.repo, self.logs, execute=fake, **kwargs)
 
     def state(self):
         return json.loads((self.logs / "state.json").read_text())
@@ -140,7 +141,7 @@ class TestCleanupSafetyTests(unittest.TestCase):
         execute = Mock(side_effect=AssertionError("Execution must remain blocked"))
         for resume in (False, True):
             with self.subTest(resume=resume), self.assertRaises(TestProcessSafetyError):
-                runner.run(self.plan, self.repo, self.logs if resume else self.root / "new-logs",
+                verified_run(self.plan, self.repo, self.logs if resume else self.root / "new-logs",
                            resume=resume, execute=execute)
         with self.assertRaises(TestProcessSafetyError):
             reserve_job(self.repo)
@@ -193,7 +194,7 @@ else:
         gate.rmdir()
         execute = Mock()
         with self.assertRaises(TestProcessSafetyError):
-            runner.run(self.plan, self.repo, self.root / "new-logs", execute=execute)
+            verified_run(self.plan, self.repo, self.root / "new-logs", execute=execute)
         execute.assert_not_called()
         with self.assertRaises(WorkspaceError):
             manager._idle(self.repo)
@@ -236,7 +237,7 @@ else:
                 self.run_fake(fake)
         self.assertEqual(fake.calls, ["A", "test"])
         with self.assertRaises(TestProcessSafetyError):
-            runner.run(self.plan, self.repo, self.root / "different-logs", execute=Mock())
+            verified_run(self.plan, self.repo, self.root / "different-logs", execute=Mock())
 
     def test_uncertainty_is_saved_before_test_output_io(self):
         fake = FakeExecutor([runner._CallResult(125, "limit", False, False, True)])
@@ -276,7 +277,7 @@ else:
         self.assertEqual(fake.calls, ["A", "test"])
         self.assertIn("uncertain_test", self.state())
         with self.assertRaises(TestProcessSafetyError):
-            runner.run(self.plan, self.repo, self.root / "new-logs", execute=Mock())
+            verified_run(self.plan, self.repo, self.root / "new-logs", execute=Mock())
 
     def test_proven_clean_result_does_not_leave_uncertainty_after_output_write_failure(self):
         fake = FakeExecutor([runner._CallResult(0, "passed", False, True, True)])
@@ -373,7 +374,7 @@ else:
         with self.assertRaises(TestProcessSafetyError):
             assert_test_process_safe(self.repo)
         with self.assertRaises(TestProcessSafetyError):
-            runner.run(self.plan, self.repo, self.logs, execute=Mock())
+            verified_run(self.plan, self.repo, self.logs, execute=Mock())
 
     def test_gate_supports_git_worktree_pointers(self):
         worktree = self.root / "linked"

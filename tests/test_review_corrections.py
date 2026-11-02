@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from auto_coding import simple_run as runner
+from backend_fixtures import run_with_verification as verified_run
 from auto_coding.launch_preflight import (PROTECTED_BRANCH_KEY, configured_protected_branches,
     launch_preflight, validate_feature_branch)
 from auto_coding.sensitive_paths import changed_paths
@@ -55,7 +56,7 @@ class ReviewCorrectionTests(unittest.TestCase):
 
     def run_fake(self, fake, **options):
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            return runner.run(self.plan, self.repo, self.logs, execute=fake, **options)
+            return verified_run(self.plan, self.repo, self.logs, execute=fake, **options)
 
     def state(self):
         return json.loads((self.logs / 'state.json').read_text())

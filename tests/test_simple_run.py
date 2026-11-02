@@ -7,7 +7,8 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
-from auto_coding.simple_run import load_tasks, run, PilotError
+from auto_coding.simple_run import load_tasks, PilotError
+from backend_fixtures import run_with_verification as run
 from auto_coding.event_log import EventLog
 
 
@@ -479,7 +480,17 @@ class CheckpointAndRecoveryTests(unittest.TestCase):
         self.assertEqual(json.loads((self.logs/'state.json').read_text())['status'],'checkpointing')
         metrics_before = json.loads((self.logs/'metrics.json').read_text())['run']
         self.assertEqual(run(first_only,self.repo,self.logs,resume=True,execute=fake),0)
-        self.assertEqual(json.loads((self.logs/'metrics.json').read_text())['run'], metrics_before)
+        metrics_after = json.loads((self.logs/'metrics.json').read_text())['run']
+        # Commit recovery repeats neither agent. The newly required final suite
+        # is one new controller invocation, not a replay of task verification.
+        for key in metrics_before.keys() - {"tests"}:
+            self.assertEqual(metrics_after[key], metrics_before[key])
+        self.assertEqual(metrics_after["tests"]["invocations"], 1)
+        self.assertEqual(metrics_after["tests"]["observed_calls"], 1)
+        self.assertEqual(metrics_after["tests"]["duration_observations"], 1)
+        self.assertEqual(metrics_after["tests"]["outcomes"], {"success": 1})
+        self.assertEqual(metrics_after["tests"]["unconfirmed_invocations"], 0)
+        self.assertIsNone(metrics_after["tests"]["usage"])
         state=json.loads((self.logs/'state.json').read_text())
         self.assertEqual(state['completed'],['first'])
         self.assertEqual(len(seen),2)

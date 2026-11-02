@@ -16,7 +16,7 @@ jobs:
   unittest:
     name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:

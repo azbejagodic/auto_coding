@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from auto_coding import simple_run as runner
+from backend_fixtures import run_with_verification as verified_run
 from auto_coding.sensitive_paths import is_sensitive_path
 
 
@@ -117,7 +118,7 @@ class SensitiveChangeTests(unittest.TestCase):
         console = io.StringIO()
         try:
             with contextlib.redirect_stdout(console):
-                return runner.run(self.plan, self.repo, self.logs, execute=fake, **options)
+                return verified_run(self.plan, self.repo, self.logs, execute=fake, **options)
         finally:
             self.console = console.getvalue()
 

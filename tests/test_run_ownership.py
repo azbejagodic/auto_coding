@@ -12,6 +12,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from auto_coding import simple_run as runner
+from backend_fixtures import run_with_verification as verified_run
 from auto_coding.github_workspace import WorkspaceError, managed_job, reserve_job, cancel_reservation
 from auto_coding.repository_activity import repository_busy
 from auto_coding.repository_ownership import execution_lock, managed_lock
@@ -64,7 +65,7 @@ class RunOwnershipTests(unittest.TestCase):
 
     def run_fake(self, fake, **options):
         with contextlib.redirect_stdout(io.StringIO()):
-            return runner.run(self.plan, self.repo, self.logs, execute=fake, **options)
+            return verified_run(self.plan, self.repo, self.logs, execute=fake, **options)
 
     def state(self):
         return json.loads((self.logs / "state.json").read_text())
@@ -76,7 +77,7 @@ class RunOwnershipTests(unittest.TestCase):
         for resume, logs in ((True, self.logs), (False, self.root / "new-logs")):
             executor = Mock()
             with self.assertRaisesRegex(OSError, "cleanup remains unverified"):
-                runner.run(self.plan, self.repo, logs, resume=resume, execute=executor)
+                verified_run(self.plan, self.repo, logs, resume=resume, execute=executor)
             executor.assert_not_called()
         self.assertEqual(self.git("rev-parse", "HEAD"), self.initial_head)
         self.assertEqual(self.state()["completed"], [])
@@ -158,7 +159,7 @@ except WorkspaceError:
         self.assertEqual(self.state()["uncertain_process"]["actor"], "Codex A")
         executor = Mock()
         with self.assertRaisesRegex(OSError, "cleanup remains unverified"):
-            runner.run(self.plan, self.repo, self.root / "new", execute=executor)
+            verified_run(self.plan, self.repo, self.root / "new", execute=executor)
         executor.assert_not_called()
 
     def test_uncertain_b_is_saved_before_evidence_write_failure(self):
@@ -184,7 +185,7 @@ except WorkspaceError:
         job.rmdir()
         executor = Mock()
         with self.assertRaisesRegex(OSError, "cleanup remains unverified"):
-            runner.run(self.plan, self.repo, self.root / "new", execute=executor)
+            verified_run(self.plan, self.repo, self.root / "new", execute=executor)
         executor.assert_not_called()
 
     def test_saved_uncertainty_survives_loss_of_fake_repository_records(self):

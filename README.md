@@ -11,6 +11,52 @@ The existing simple runner saves approved local checkpoints by default. The dash
 
 ## Verification
 
+### Focused task checks and final verification
+
+Ordinary tasks ask Codex A to run their `test_commands` and report the actual
+results. Codex B receives that saved report as implementer claims, alongside the
+staged changes, and independently reviews it. The controller does not duplicate
+these focused checks unless `--controller-tests` is explicitly enabled. That mode
+is saved and cannot change during resume. Existing controller-tested checkpoints
+retain their original mode.
+
+New runs require an explicitly designated full unittest suite and a minimum test
+count in the prepared JSON plan, for example:
+
+```json
+{
+  "tasks": [{"id": "example", "prompt": "Externally prepared task instructions", "test_commands": [["python", "-m", "unittest", "tests.test_example"]]}],
+  "final_verification": {
+    "test_commands": [["python", "-B", "tests/ci_unittest.py"]],
+    "minimum_tests": 350,
+    "timeout_seconds": 1800
+  }
+}
+```
+
+The plan author must designate the project's actual full suite and appropriate
+minimum coverage; the example command/count apply to this backend. The final
+gate currently recognizes unittest summaries. It requires a successful exit,
+nonempty test evidence, sufficient test count, no skipped tests, and the exact
+final approved Git HEAD with a clean worktree. An arbitrary successful command
+or an implementer claim cannot mark a batch completed.
+
+Verification timeouts default to 1800 seconds and accept 30 through 86400 seconds,
+independently of the Codex A/B `--timeout`. Commands, coverage, timeout and testing
+mode are persisted for resume. TXT/MD and legacy runs can supply the verification
+policy alone in a JSON file using `--final-verification-config FILE`; subsequent
+resume can use the saved policy without that file. Conflicting settings stop.
+The backend CI job has a separate 60-minute budget for the complete regression
+suite; its Windows/Linux matrix, permissions and skip checks are unchanged.
+
+Failed final verification preserves approved commits and real output. Confirmed
+infrastructure failures can resume verification only. Missing or altered evidence
+requires fresh verification. Unverified cleanup keeps workspace protection.
+Post-commit test failures are not automatically attributed to a prepared task:
+provide an explicit scoped correction plan using the existing A/B loop, followed
+by fresh final verification. The controller never invents repair tasks or reopens
+approved work automatically.
+
 ### Interrupted implementation attempts
 
 The runner saves a unique Codex A attempt identity before launch. A confirmed

@@ -123,7 +123,7 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn("unfinished.txt", self.git(repo, "diff", "--cached", "--name-only"))
 
     def test_auto_push_resume_repairs_rejected_second_task_after_first_published(self):
-        from auto_coding.simple_run import run
+        from backend_fixtures import run_with_verification as run
         repo = self.connect()
         self.manager.create_branch("owner/repo", "feature/auto")
         plan, logs = self.root / "plan.json", self.root / "logs"

@@ -11,7 +11,8 @@ from contextlib import redirect_stderr
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import auto_coding.simple_run as runner
-from auto_coding.simple_run import (PilotError, run, checked_review, correction_context,
+from backend_fixtures import run_with_verification as run
+from auto_coding.simple_run import (PilotError, checked_review, correction_context,
                                    MAX_CORRECTION_CONTEXT, MAX_REVIEW_ISSUE_CHARS,
                                    MAX_REVIEW_ISSUES_TOTAL, MAX_VERDICT_BYTES)
 
@@ -119,8 +120,8 @@ class ReviewRecoveryTests(unittest.TestCase):
         self.assertEqual(state["history"][0]["tests"][0]["exit_code"], 0)
         metrics = self.metrics()
         for role in ("codex_a", "codex_b", "tests"):
-            self.assertEqual(metrics[role]["invocations"], 1)
-            self.assertEqual(metrics[role]["duration_observations"], 1)
+            self.assertEqual(metrics[role]["invocations"], 2 if role == "tests" else 1)
+            self.assertEqual(metrics[role]["duration_observations"], 2 if role == "tests" else 1)
             self.assertIsNone(metrics[role]["usage"])
         self.assertEqual(metrics["correction_attempts"], 0)
         self.assertEqual(metrics["review_retries"], 0)
@@ -328,7 +329,7 @@ class ReviewRecoveryTests(unittest.TestCase):
         self.assertIn("Fix the implementation", fake.a_prompts[1])
         self.assertEqual(self.metrics()["correction_attempts"], 1)
         self.assertEqual(self.metrics()["codex_a"]["invocations"], 2)
-        self.assertEqual(self.metrics()["tests"]["invocations"], 2)
+        self.assertEqual(self.metrics()["tests"]["invocations"], 3)
         self.assertEqual([h["attempt"] for h in self.state()["history"]], [1, 2])
         self.assertEqual([e["outcome"] for e in self.events() if e["event"] == "review_finished"],
                          ["rejected", "approved"])
@@ -534,11 +535,11 @@ class ReviewRecoveryTests(unittest.TestCase):
                       {"type": "item.completed", "item": {"text": secret}},
                       {"type": "turn.completed", "usage": usage}]
             return result[0], "\n".join(json.dumps(event) for event in events), result[2]
-        with patch.object(runner, "_execution_clock", side_effect=[0, 1, 1, 3, 3, 6]):
+        with patch.object(runner, "_execution_clock", side_effect=[0, 1, 1, 3, 3, 6, 6, 10]):
             self.assertEqual(run(self.plan, self.repo, self.logs, execute=measured), 0)
         metrics = self.metrics()
         self.assertEqual([metrics[role]["duration_seconds"] for role in ("codex_a", "tests", "codex_b")],
-                         [1, 2, 3])
+                         [1, 6, 3])
         for role in ("codex_a", "codex_b"):
             self.assertEqual(metrics[role]["usage"], {"input_tokens": 100, "cached_input_tokens": 40,
                                                      "output_tokens": 10})

@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from auto_coding import simple_run as runner
+from backend_fixtures import run_with_verification as verified_run
 
 
 class FakeExecutor:
@@ -65,7 +66,7 @@ class GitResumeTests(unittest.TestCase):
 
     def run_fake(self, fake, **options):
         with contextlib.redirect_stdout(io.StringIO()):
-            return runner.run(self.plan, self.repo, self.logs, execute=fake, **options)
+            return verified_run(self.plan, self.repo, self.logs, execute=fake, **options)
 
     def state(self):
         return json.loads((self.logs / "state.json").read_text())
@@ -118,7 +119,7 @@ class GitResumeTests(unittest.TestCase):
         target = self.root / "new"
         fake = FakeExecutor()
         with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(runner.run(self.plan, target, self.logs, create_repo=True, execute=fake), 0)
+            self.assertEqual(verified_run(self.plan, target, self.logs, create_repo=True, execute=fake), 0)
         self.assertEqual(runner.git(target, ["branch", "--show-current"]), "feature/auto-coding")
 
     def test_same_sha_branch_switch_on_resume_is_rejected(self):
@@ -241,7 +242,7 @@ class GitResumeTests(unittest.TestCase):
         self.assert_invalid_without_execution_or_git_mutation(resume=True)
         executor = Mock()
         with self.assertRaisesRegex(OSError, "cleanup remains unverified"):
-            runner.run(self.plan, self.repo, self.root / "fresh-logs", execute=executor)
+            verified_run(self.plan, self.repo, self.root / "fresh-logs", execute=executor)
         executor.assert_not_called()
 
     def test_legacy_timeout_does_not_override_saved_confirmed_cleanup(self):

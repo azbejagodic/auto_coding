@@ -22,12 +22,13 @@ from auto_coding.event_log import EventLog, EventLogError
 from auto_coding.github_workspace import (managed_job, WorkspaceError, cancel_reservation,
                                          mark_process_uncertain, GitHubWorkspaceManager,
                                          normalize_repository)
-from auto_coding.process_runner import bounded_run, OutputLimitExceeded
+from auto_coding.process_runner import bounded_run, OutputLimitExceeded, MAX_CAPTURE_BYTES
 from auto_coding.metrics import codex_usage, write_metrics
 from auto_coding.test_process_safety import TestProcessGate, assert_test_process_safe
 from auto_coding.repository_ownership import assert_process_safe
 from auto_coding.launch_preflight import validate_feature_branch, configured_protected_branches
 from auto_coding.sensitive_paths import is_sensitive_path, changed_paths, CHANGE_PATH_OPTIONS
+from auto_coding.final_verification import verification_policy, policy_sha256, unittest_evidence
 
 
 MAX_PLAN = 512 * 1024
@@ -84,8 +85,14 @@ def load_tasks(path: Path) -> tuple[list[dict], str]:
     if path.suffix.lower() != ".json":
         raise PilotError("Use TXT, MD, or JSON for the pilot")
     value = json.loads(raw.decode("utf-8-sig"))
-    if not isinstance(value, dict) or set(value) != {"tasks"} or not isinstance(value["tasks"], list):
-        raise PilotError("JSON must contain only a tasks array")
+    if (not isinstance(value, dict) or not {"tasks"} <= set(value) <= {"tasks", "final_verification"}
+            or not isinstance(value["tasks"], list)):
+        raise PilotError("JSON requires tasks and optional final_verification")
+    if "final_verification" in value:
+        try:
+            verification_policy(value["final_verification"])
+        except ValueError as exc:
+            raise PilotError(str(exc)) from exc
     if not 1 <= len(value["tasks"]) <= 30:
         raise PilotError("Expected between 1 and 30 tasks")
     result, ids = [], set()
@@ -106,6 +113,30 @@ def load_tasks(path: Path) -> tuple[list[dict], str]:
         ids.add(ident)
         result.append({"id": ident, "prompt": prompt.strip(), "test_commands": commands})
     return result, fingerprint
+
+
+def requested_verification(plan, fingerprint, override):
+    inline = None
+    if plan.suffix.lower() == ".json":
+        with plan.open("rb") as stream:
+            raw = stream.read(MAX_PLAN + 1)
+        if len(raw) > MAX_PLAN or hashlib.sha256(raw).hexdigest() != fingerprint:
+            raise PilotError("Prepared plan changed while loading verification settings")
+        inline = json.loads(raw.decode("utf-8-sig")).get("final_verification")
+    try:
+        inline = verification_policy(inline) if inline is not None else None
+        override = verification_policy(override) if override is not None else None
+    except ValueError as exc:
+        raise PilotError(str(exc)) from exc
+    if inline is not None and override is not None and inline != override:
+        raise PilotError("External verification configuration differs from the prepared plan")
+    return override if override is not None else inline
+
+
+def controller_commands(task, state):
+    # Old checkpoints were controller-tested. Never reinterpret their evidence
+    # as the new implementer-focused mode during review-only recovery.
+    return task["test_commands"] if state.get("controller_tests", True) else []
 
 
 def save_json(path: Path, value: dict) -> None:
@@ -663,7 +694,7 @@ def correction_context(prior: list[dict]) -> str:
     return result
 
 
-def review_prompt_for(task: dict, stat: str, diff: str, tests: list[dict]) -> str:
+def review_prompt_for(task: dict, stat: str, diff: str, tests: list[dict], implementer_tests="") -> str:
     return ("You are Codex B, an independent READ-ONLY reviewer. Inspect the current "
         "task's STAGED diff, all relevant project files, and tests. Previous tasks are locally "
         "committed. Do not blindly trust implementer claims or test results. Reject only for "
@@ -681,7 +712,29 @@ def review_prompt_for(task: dict, stat: str, diff: str, tests: list[dict]) -> st
         "and data-loss risks carefully. Merge to Main and per-task model/reasoning selection "
         "are deferred and are not approval blockers. Do not change files.\n\nTASK:\n" + task["prompt"] +
         "\n\nCURRENT TASK CHANGES:\n" + stat + "\n\nDIFF (truncated; inspect repository for full):\n" + diff[:35000] +
-        "\n\nTEST RESULTS:\n" + json.dumps(tests))
+        "\n\nTEST RESULTS:\n" + json.dumps(tests) +
+        "\n\nCONFIGURED FOCUSED CHECKS (argv):\n" + json.dumps(task["test_commands"]) +
+        ("\n\nIMPLEMENTER TEST REPORT (claims, not controller verification; independently check):\n"
+         + implementer_tests[:8000] + ("\n[report excerpt; inspect saved answer for the rest]" if len(implementer_tests) > 8000 else "")
+         if implementer_tests else ""))
+
+
+def implementation_report(logs, task, attempt, *, expected=None, required=False):
+    name = f"{task['id']}-{attempt:02d}-a-answer.txt"
+    path = logs / name
+    if not path.is_file() and not required and expected is None:
+        return None, ""
+    try:
+        with path.open("rb") as stream:
+            data = stream.read(128 * 1024 + 1)
+        if not data or len(data) > 128 * 1024:
+            raise ValueError("Missing or oversized implementer test report")
+        metadata = {"output": name, "sha256": hashlib.sha256(data).hexdigest()}
+        if expected is not None and metadata != expected:
+            raise ValueError("Implementer test report changed")
+        return metadata, data.decode("utf-8")
+    except (OSError, ValueError, UnicodeError) as exc:
+        raise PilotError("Implementer test report is missing, changed or unsafe to collect; inspect before review") from exc
 
 
 def verify_review_ready(repo: Path, logs: Path, state: dict, task: dict) -> tuple[dict, str]:
@@ -713,7 +766,7 @@ def verify_review_ready(repo: Path, logs: Path, state: dict, task: dict) -> tupl
             or record.get("attempt") != pending["attempt"] or record.get("a_exit") != 0
             or record.get("a_timed_out") is not False or record.get("review") is not None
             or record.get("a_cleanup_confirmed") is False
-            or not isinstance(tests, list) or len(tests) != len(task["test_commands"])):
+            or not isinstance(tests, list) or len(tests) != len(controller_commands(task, state))):
         raise PilotError("Review-ready checkpoint does not match the task or verified tests")
     for index, result in enumerate(tests, 1):
         if (not isinstance(result, dict) or result.get("index") != index
@@ -738,7 +791,14 @@ def verify_review_ready(repo: Path, logs: Path, state: dict, task: dict) -> tupl
             != pending.get("diff_sha256")):
         raise PilotError("Review-ready staged diff changed; tests must be rerun")
     stat = git(repo, ["diff", "--cached", "--stat"])
-    return record, review_prompt_for(task, stat, diff, tests)
+    if not state.get("controller_tests", True) and not isinstance(record.get("a_report"), dict):
+        raise PilotError("Review-ready checkpoint lacks the saved implementer report identity")
+    _, report = implementation_report(logs, task, pending["attempt"], expected=record.get("a_report"),
+                                      required=not state.get("controller_tests", True))
+    if report:
+        answer_path = logs / f"{task['id']}-{pending['attempt']:02d}-a-answer.txt"
+        report = f"Saved answer: {answer_path}\n" + report
+    return record, review_prompt_for(task, stat, diff, tests, report)
 
 
 def schedule_review_retry(pending: dict) -> float:
@@ -949,7 +1009,9 @@ def write_attempt_evidence(path: Path, text: str) -> None:
         with path.open("xb"):
             pass
     except FileExistsError:
-        if path.read_bytes() != data:
+        with path.open("rb") as stream:
+            previous = stream.read(len(data) + 1)
+        if previous != data:
             raise PilotError(f"Existing attempt evidence differs: {path.name}; inspect without overwriting") from None
         return
     path.write_text(text, encoding="utf-8", newline="")
@@ -1019,9 +1081,18 @@ def implementation_attempt(repo, logs, state, state_path, events, task, attempt,
     feedback = correction_context([h for h in state["history"] if h.get("task") == ident])
     if feedback:
         developer_msg += "\n\nPREVIOUS FAILURE OR REVIEW FEEDBACK:\n" + feedback
+    if not state.get("controller_tests", True):
+        developer_msg += ("\n\nRun the configured focused checks below as argv commands. Report each actual result, "
+                          "including failures or unavailable checks, in your final answer. Do not claim unrun tests passed. "
+                          "The controller's designated full suite runs after approved task commits.\n"
+                          + json.dumps(task["test_commands"]))
     write_attempt_evidence(logs / f"{base}-a-prompt.txt", developer_msg)
     answer_path = logs / f"{base}-a-answer.txt"
-    if answer_path.exists():
+    try:
+        answer_path.lstat()
+    except FileNotFoundError:
+        pass
+    else:
         raise PilotError("Codex A answer already exists for an unstarted execution; inspect before launch")
     argv = codex_argv(readonly=False, last_message=answer_path, schema=None, model=model_a)
     execution = events.emit("Codex A", "process_started", "started", task_id=ident, attempt=attempt,
@@ -1085,6 +1156,8 @@ def implementation_attempt(repo, logs, state, state_path, events, task, attempt,
             failed.append(("No changed or created project files were found after Codex A ran.", ""))
         else:
             _, _, digest = staging_summary(repo)
+        record["a_report"], _ = implementation_report(logs, task, attempt,
+                                                     required=not state.get("controller_tests", True))
         pending["diff_sha256"] = digest
         save_json(state_path, state)
     except PilotError as exc:
@@ -1098,17 +1171,186 @@ def implementation_attempt(repo, logs, state, state_path, events, task, attempt,
     return record, digest, failed
 
 
+def bind_verification(state, manifest, requested, controller_tests, *, resume):
+    saved = state.get("final_verification") if resume else None
+    try:
+        saved = verification_policy(saved) if saved is not None else None
+    except ValueError as exc:
+        raise PilotError("Saved final verification policy is invalid") from exc
+    if saved is not None and requested is not None and saved != requested:
+        raise PilotError("Final verification commands, coverage and timeout are fixed for this run")
+    policy = saved if saved is not None else requested
+    if policy is None:
+        raise PilotError("Missing designated final verification: supply final_verification in JSON or --final-verification-config; batch cannot complete")
+    mode = state.get("controller_tests", True) if resume else (controller_tests if controller_tests is not None else False)
+    if type(mode) is not bool or (controller_tests is not None and controller_tests != mode):
+        raise PilotError("Controller-focused test mode is fixed for this run")
+    digest = policy_sha256(policy)
+    if (manifest.get("verification_policy_sha256") not in (None, digest)
+            or manifest.get("controller_tests") not in (None, mode)):
+        raise PilotError("Verification settings differ from the saved run manifest")
+    state.update(final_verification=policy, controller_tests=mode)
+    manifest.update(verification_policy_sha256=digest, controller_tests=mode)
+
+
+def final_evidence_valid(repo, logs, state):
+    saved, policy = state.get("final_verification_result"), state["final_verification"]
+    if (not isinstance(saved, dict) or saved.get("status") != "passed"
+            or saved.get("head") != head(repo) or saved.get("branch") != state["branch"]
+            or saved.get("plan_sha256") != state["plan_sha256"]
+            or saved.get("policy_sha256") != policy_sha256(policy)
+            or type(saved.get("invocation")) is not int or saved["invocation"] < 1
+            or not isinstance(saved.get("tests"), list) or len(saved["tests"]) != len(policy["test_commands"])):
+        return False
+    count = 0
+    for index, item in enumerate(saved["tests"], 1):
+        name = f"final-verification-{saved['invocation']:04d}-test-{index}.txt"
+        if (not isinstance(item, dict) or item.get("output") != name or item.get("exit_code") != 0
+                or item.get("timed_out") is not False or item.get("cleanup_confirmed") is not True):
+            return False
+        try:
+            with (logs / name).open("rb") as stream:
+                data = stream.read(MAX_CAPTURE_BYTES + 1)
+            summary = unittest_evidence(data.decode("utf-8"))
+        except (OSError, UnicodeError):
+            return False
+        if (len(data) > MAX_CAPTURE_BYTES or hashlib.sha256(data).hexdigest() != item.get("output_sha256")
+                or not summary or not summary["successful"] or summary["skipped"] or summary["tests"] < 1):
+            return False
+        count += summary["tests"]
+    return count >= policy["minimum_tests"] and git_clean(repo)
+
+
+def final_verification(repo, logs, state, state_path, events, execute, tasks):
+    """Verify the final approved snapshot. Infrastructure failure never repairs code."""
+    assert_test_process_safe(repo)
+    assert_process_safe(repo)
+    require_run_branch(repo, state["branch"])
+    if state["completed"] != [task["id"] for task in tasks] or not git_clean(repo):
+        raise PilotError("Final verification requires every approved checkpoint and a clean worktree")
+    previous = state.get("final_verification_result")
+    if isinstance(previous, dict) and previous.get("status") == "running":
+        stop_uncertain_saved_process(state, "Interrupted final test execution lacks confirmed cleanup; inspect process ownership")
+    if final_evidence_valid(repo, logs, state):
+        return True
+    policy = state["final_verification"]
+    ordinal = state.get("final_verification_invocations", 0)
+    if type(ordinal) is not int or ordinal < 0:
+        raise PilotError("Saved final verification invocation count is invalid")
+    ordinal += 1
+    if any(logs.glob(f"final-verification-{ordinal:04d}-test-*.txt")):
+        raise PilotError("Final verification artifacts exist without matching invocation ownership; inspect before execution")
+    snapshot = head(repo)
+    saved = {"status": "prepared", "invocation": ordinal, "head": snapshot, "branch": state["branch"],
+             "plan_sha256": state["plan_sha256"], "policy_sha256": policy_sha256(policy), "tests": []}
+    state.update(final_verification_result=saved, final_verification_invocations=ordinal, status="stopped")
+    save_json(state_path, state)
+    events.emit("controller", "final_verification_started", "started", metadata={"head": snapshot, "invocation": ordinal,
+                "timeout_seconds": policy["timeout_seconds"], "minimum_tests": policy["minimum_tests"]})
+    count = 0
+    def stop(reason):
+        saved.update(status="failed", outcome=reason)
+        state["status"] = "stopped"
+        save_json(state_path, state)
+        events.emit("controller", "final_verification_finished", "failed", metadata={"reason": reason, "head": snapshot})
+        print(f"STOPPED: final verification {reason}; see final-verification-{ordinal:04d}-test-*.txt. "
+              "Approved commits are preserved. Resume retries verification only after infrastructure is fixed. "
+              "Code changes require an explicitly prepared correction task, fresh independent review and fresh final verification.", flush=True)
+        return False
+    for index, command in enumerate(policy["test_commands"], 1):
+        assert_test_process_safe(repo)
+        assert_process_safe(repo)
+        require_run_branch(repo, state["branch"])
+        if head(repo) != snapshot or not git_clean(repo):
+            return stop("snapshot_changed")
+        execution = events.emit("tests", "test_started", "started", task_id=tasks[-1]["id"], attempt=ordinal,
+                                metadata={"index": index, "stage": "final_verification"})
+        context = {"repo": str(repo), "logs": str(logs), "run_id": state["run_id"], "task": tasks[-1]["id"],
+                   "attempt": ordinal, "index": index, "execution_id": execution["seq"], "stage": "final_verification"}
+        gate = TestProcessGate(repo, context)
+        saved.update(status="running", execution={"index": index, "cleanup_confirmed": None})
+        save_json(state_path, state)
+        started = _execution_clock()
+        try:
+            result = execute(command, repo, policy["timeout_seconds"])
+        except BaseException as exc:
+            cleanup = getattr(exc, "cleanup_confirmed", None)
+            if cleanup is True or (cleanup is None and getattr(exc, "process_started", None) is False):
+                saved.update(status="failed", outcome="infrastructure_exception",
+                             execution={"index": index, "cleanup_confirmed": True})
+                save_json(state_path, state)
+                gate.finish_confirmed()
+            else:
+                saved["status"] = "uncertain"
+                record_test_uncertainty(state, state_path, gate)
+            raise
+        finished = _execution_clock()
+        code, output, timed = result
+        uncertain = cleanup_unverified(result)
+        saved.update(status="uncertain" if uncertain else "collecting_evidence",
+                     execution={"index": index, "cleanup_confirmed": not uncertain})
+        if uncertain:
+            record_test_uncertainty(state, state_path, gate)
+        else:
+            # Save actual cleanup proof before releasing the test gate or doing
+            # output I/O. A restart never infers cleanup from a missing gate.
+            save_json(state_path, state)
+            gate.finish_confirmed()
+        if len(output.encode("utf-8")) > MAX_CAPTURE_BYTES:
+            if uncertain:
+                return False
+            return stop("infrastructure_output_limit")
+        name = f"final-verification-{ordinal:04d}-test-{index}.txt"
+        write_attempt_evidence(logs / name, output)
+        summary = unittest_evidence(output)
+        item = {"index": index, "output": name, "output_sha256": hashlib.sha256((logs / name).read_bytes()).hexdigest(),
+                "exit_code": code, "timed_out": timed, "cleanup_confirmed": not uncertain, "summary": summary}
+        saved["tests"].append(item)
+        save_json(state_path, state)
+        events.emit("tests", "test_finished", "cleanup_unverified" if uncertain else (
+                    "timed_out" if timed else ("success" if code == 0 else "failed")),
+                    task_id=tasks[-1]["id"], attempt=ordinal, evidence={"output": name},
+                    metadata={"index": index, "stage": "final_verification", "exit_code": code, "timed_out": timed,
+                              "cleanup_confirmed": not uncertain} | execution_metadata(
+                                  result, execution["seq"], started, codex=False, finished=finished))
+        if uncertain:
+            return False
+        if timed or code in (125, 127):
+            return stop("infrastructure_timeout" if timed else "infrastructure_process_failure")
+        if code != 0:
+            missing_dependency = "ModuleNotFoundError:" in output or "_FailedTest" in output
+            return stop("test_failure" if summary and summary["failed"] and not missing_dependency else "infrastructure_failure")
+        if not summary or not summary["successful"] or summary["tests"] < 1 or summary["skipped"]:
+            return stop("incomplete_test_evidence")
+        count += summary["tests"]
+    require_run_branch(repo, state["branch"])
+    if head(repo) != snapshot or not git_clean(repo):
+        return stop("snapshot_changed")
+    if count < policy["minimum_tests"]:
+        return stop("insufficient_test_coverage")
+    saved.update(status="passed", outcome="passed", test_count=count)
+    save_json(state_path, state)
+    events.emit("controller", "final_verification_finished", "success", metadata={"head": snapshot, "tests": count})
+    return True
+
+
 def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False, attempts=3,
         auto_push=None, retry_review_once=False,
+        final_verification_config=None, controller_tests=None,
         model_a=None, model_b=None, timeout=1800,
         execute: Callable = call) -> int:
     if retry_review_once and not resume:
         raise PilotError("One extra review call requires --resume and an exhausted review-ready checkpoint")
+    if controller_tests is not None and type(controller_tests) is not bool:
+        raise PilotError("Controller-focused testing option must be boolean")
     tasks, plan_sha = load_tasks(plan)
+    requested_policy = requested_verification(plan, plan_sha, final_verification_config)
     repo = safe_repo(repo, create_repo)
     assert_test_process_safe(repo)
     assert_process_safe(repo)
     selected_branch = require_run_branch(repo)
+    if not resume and requested_policy is None:
+        raise PilotError("Missing designated final verification; provide final_verification with suite commands and minimum_tests before launching Codex A")
     if auto_push:
         identity = normalize_repository(auto_push["repository"])[0]
         branch = auto_push["branch"]
@@ -1189,6 +1431,9 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
             state["branch"] = manifest["branch"] = selected_branch
             state["initial_git_head"] = manifest["initial_git_head"]
             state["process_ownership"] = 1
+            bind_verification(state, manifest, requested_policy, controller_tests, resume=True)
+            save_json(manifest_path, manifest)
+            save_json(state_path, state)
             if not manifest_path.exists() or legacy_branch:
                 # The timeline and recorded Git history were validated first.
                 state["run_id"] = run_id
@@ -1224,9 +1469,9 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
             events.emit("controller", "legacy_branch_bound", "observed",
                         metadata={"branch": selected_branch, "reason": "existing Git evidence verified before binding"})
         events.emit("controller", "resume_reconciled", "success", metadata={"completed_tasks": list(state["completed"])})
-        if state.get("status") == "completed" and not auto_push:
+        if state.get("status") == "completed" and not auto_push and final_evidence_valid(repo, logs, state):
             require_run_branch(repo, state["branch"])
-            print("Already completed; approved Git checkpoints verified; no Codex invocation needed")
+            print("Already completed; approved Git checkpoints and final suite evidence verified; no invocation needed")
             return 0
     else:
         if resume:
@@ -1250,6 +1495,9 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
             if (manifest.get("branch") not in (None, selected_branch)
                     or manifest.get("initial_git_head") != head(repo)):
                 raise PilotError("Initialization Git HEAD or branch changed from the saved manifest")
+            if (manifest.get("verification_policy_sha256") not in (None, policy_sha256(requested_policy))
+                    or manifest.get("controller_tests") not in (None, controller_tests if controller_tests is not None else False)):
+                raise PilotError("Initialization verification settings differ from the saved manifest")
         elif timeline_path.exists():
             # EventLog validates every complete record and preserves any torn tail.
             data = timeline_path.read_bytes()
@@ -1278,6 +1526,7 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
         manifest = {"run_id": run_id, "plan_sha256": plan_sha,
                     "task_ids": [t["id"] for t in tasks], "initial_git_head": initial_head,
                     "start_time_utc": created, "target_repo": str(repo), "branch": selected_branch}
+        bind_verification(state, manifest, requested_policy, controller_tests, resume=False)
         if not manifest_path.exists():
             save_json(manifest_path, manifest)
         events = EventLog(timeline_path, run_id)
@@ -1325,18 +1574,19 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
             if result is None:
                 return 1
             record, tested_diff_sha, failed = result
-            for index, cmd in enumerate(task["test_commands"], 1):
+            commands = controller_commands(task, state)
+            for index, cmd in enumerate(commands, 1):
                 require_run_branch(repo, state["branch"])
                 if head(repo) != task_head:
                     raise PilotError("Git HEAD changed before controller verification")
                 execution = events.emit("tests", "test_started", "started", task_id=ident, attempt=attempt, metadata={"index": index})
-                print(f"[{ident}] Running test {index}/{len(task['test_commands'])}", flush=True)
+                print(f"[{ident}] Running test {index}/{len(commands)}", flush=True)
                 context = {"repo": str(repo), "logs": str(logs), "run_id": state["run_id"],
                            "task": ident, "attempt": attempt, "index": index, "execution_id": execution["seq"]}
                 gate = TestProcessGate(repo, context)
                 test_started = _execution_clock()
                 try:
-                    result = execute(cmd, repo, min(timeout, 300))
+                    result = execute(cmd, repo, state["final_verification"]["timeout_seconds"])
                 except BaseException as exc:
                     cleanup = getattr(exc, "cleanup_confirmed", None)
                     if (cleanup is True or (cleanup is None and getattr(exc, "process_started", None) is False)):
@@ -1448,6 +1698,8 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
     require_run_branch(repo, state["branch"])
     if head(repo) != expected_run_head(state, manifest):
         raise PilotError("Git HEAD changed before run completion")
+    if not final_verification(repo, logs, state, state_path, events, execute, tasks):
+        return 1
     state["status"] = "completed"
     state["current_task"] = None
     save_json(state_path, state)
@@ -1459,13 +1711,14 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
 @managed_job
 def run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False, attempts=3,
         model_a=None, model_b=None, timeout=1800, execute: Callable = call, auto_push=None,
-        retry_review_once=False) -> int:
+        retry_review_once=False, final_verification_config=None, controller_tests=None) -> int:
     """Run while ensuring controlled exceptions after log creation are recorded."""
     try:
         return _run(plan, repo, logs, create_repo=create_repo, resume=resume,
                     attempts=attempts, model_a=model_a, model_b=model_b,
                     timeout=timeout, execute=execute, auto_push=auto_push,
-                    retry_review_once=retry_review_once)
+                    retry_review_once=retry_review_once, final_verification_config=final_verification_config,
+                    controller_tests=controller_tests)
     except Exception as exc:
         log_dir = logs.resolve(strict=False)
         state_path = log_dir / "state.json"
@@ -1540,7 +1793,11 @@ def main(argv=None):
     parser.add_argument("--retry-review-once", action="store_true",
                         help="With --resume, authorize one additional Codex B call after its saved budget is exhausted")
     parser.add_argument("--attempts", type=int, default=3)
-    parser.add_argument("--timeout", type=int, default=1800)
+    parser.add_argument("--timeout", type=int, default=1800, help="Codex A/B process timeout in seconds")
+    parser.add_argument("--controller-tests", action="store_true", default=None,
+                        help="Opt in to controller-managed per-task focused checks; fixed across resume")
+    parser.add_argument("--final-verification-config", type=Path,
+                        help="JSON verification policy for TXT/MD or legacy plans; saved for subsequent resume")
     parser.add_argument("--model-a")
     parser.add_argument("--model-b")
     parser.add_argument("--auto-push-repository", help="Explicitly enable auto-push to this GitHub OWNER/REPO")
@@ -1559,9 +1816,17 @@ def main(argv=None):
         cancel_reservation(args.repo, os.environ.get("AUTOCODING_JOB_RESERVATION"))
         parser.error("codex command not found in PATH")
     try:
+        final_config = None
+        if args.final_verification_config is not None:
+            with args.final_verification_config.open("rb") as stream:
+                raw = stream.read(MAX_PLAN + 1)
+            if not raw or len(raw) > MAX_PLAN:
+                raise PilotError("Final verification configuration must be nonempty and smaller than 512 KB")
+            final_config = json.loads(raw.decode("utf-8-sig"))
         return run(args.plan, args.repo, args.logs, create_repo=args.create_repo,
                    resume=args.resume, attempts=args.attempts, timeout=args.timeout,
                     retry_review_once=args.retry_review_once,
+                   final_verification_config=final_config, controller_tests=args.controller_tests,
                    model_a=args.model_a, model_b=args.model_b,
                    auto_push=({"repository": normalize_repository(args.auto_push_repository)[0],
                                "branch": args.auto_push_branch} if args.auto_push_repository else None))

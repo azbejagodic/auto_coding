@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from auto_coding import simple_run as runner
+from backend_fixtures import run_with_verification as verified_run
 from auto_coding.repository_ownership import execution_lock
 from test_git_resume import FakeExecutor
 
@@ -41,7 +42,7 @@ class AttemptRecoveryTests(unittest.TestCase):
 
     def run_fake(self, execute, **kwargs):
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            return runner.run(self.plan, self.repo, self.logs, execute=execute, **kwargs)
+            return verified_run(self.plan, self.repo, self.logs, execute=execute, **kwargs)
 
     def stop_stream_write(self, fake):
         original = runner.write_attempt_evidence
@@ -97,7 +98,7 @@ class AttemptRecoveryTests(unittest.TestCase):
         with self.assertRaises(OSError):
             self.run_fake(other, resume=True)
         with self.assertRaises(OSError):
-            runner.run(self.plan, self.repo, self.root / "other", execute=other)
+            verified_run(self.plan, self.repo, self.root / "other", execute=other)
         other.assert_not_called()
 
     def test_returned_uncertain_result_preserves_observed_metrics_and_safety(self):
@@ -212,6 +213,22 @@ class AttemptRecoveryTests(unittest.TestCase):
             self.run_fake(execute)
         execute.assert_not_called()
         self.assertEqual(artifact.read_text(), "previous execution evidence")
+
+    def test_unstarted_resume_refuses_answer_entries_even_when_the_target_is_missing(self):
+        with patch.object(runner, "codex_argv", side_effect=runner.PilotError("before launch")):
+            with self.assertRaisesRegex(runner.PilotError, "before launch"):
+                self.run_fake(Mock())
+        answer = self.logs / "one-01-a-answer.txt"
+        self.assertFalse(answer.exists())
+        original = Path.lstat
+        def lstat(path, *args, **kwargs):
+            # A dangling link is an existing directory entry even though exists()
+            # is false. Simulate it without requiring Windows symlink privileges.
+            return object() if path == answer else original(path, *args, **kwargs)
+        execute = Mock()
+        with patch.object(Path, "lstat", lstat), self.assertRaisesRegex(runner.PilotError, "answer already exists"):
+            self.run_fake(execute, resume=True)
+        execute.assert_not_called()
 
     def test_immutable_evidence_reuses_identical_bytes_and_rejects_changes(self):
         target = self.root / "evidence.txt"
