@@ -16,7 +16,7 @@ STARTS = {("Codex A", "process_started"): "codex_a",
 FINISHES = {("Codex A", "process_finished"): "codex_a",
             ("Codex B", "review_process_finished"): "codex_b",
             ("tests", "test_finished"): "tests"}
-PROCESS_OUTCOMES = {"success", "failed", "timed_out", "interrupted"}
+PROCESS_OUTCOMES = {"success", "failed", "timed_out", "interrupted", "cleanup_unverified"}
 REVIEW_OUTCOMES = {"approved", "rejected", "process_failure", "timeout", "invalid_verdict",
                    "cleanup_unverified", "launch_failure", "output_limit"}
 

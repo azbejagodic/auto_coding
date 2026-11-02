@@ -14,6 +14,7 @@ import uuid
 from functools import wraps
 from auto_coding.process_runner import bounded_run, OutputLimitExceeded, MAX_CAPTURE_BYTES
 from auto_coding.repository_activity import repository_busy
+from auto_coding.test_process_safety import assert_test_process_safe
 
 
 _uncertain_process = ContextVar("autocoding_uncertain_process", default=None)
@@ -49,6 +50,7 @@ def serialized_launch(method):
 
 def reserve_job(repo):
     """Reserve under the checkout operation lock, before creating a child."""
+    assert_test_process_safe(repo)
     path = managed_lock(repo, ".job.lock")
     if path is None:
         return None
@@ -82,6 +84,7 @@ def cancel_reservation(repo, token):
 def managed_job(method):
     @wraps(method)
     def wrapped(plan, repo, logs, **kwargs):
+        assert_test_process_safe(repo)
         lock = managed_lock(repo)
         if not lock:
             return method(plan, repo, logs, **kwargs)
@@ -339,6 +342,7 @@ class GitHubWorkspaceManager:
         self._publication_tree(repo)
 
     def _publication_tree(self, repo):
+        assert_test_process_safe(repo)
         if not self._status(repo)["clean"]:
             raise WorkspaceError("dirty", "Commit or discard uncommitted changes before changing branches or publishing.")
         for marker in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD", "rebase-merge", "rebase-apply", "sequencer", "BISECT_START", "index.lock", "HEAD.lock"):
@@ -448,6 +452,7 @@ class GitHubWorkspaceManager:
 
     def publish_checkpoint(self, repo, identity, branch, sha, approved):
         """Synchronous publication by the coordinator owning the checkout job gate."""
+        assert_test_process_safe(repo)
         self._branch(repo, branch)
         if self._status(repo)["branch"] != branch or self._git(repo, "rev-parse", "HEAD") != sha:
             raise WorkspaceError("checkpoint", "Selected branch or checkpoint changed; inspect before Retry Push.")

@@ -7,6 +7,7 @@ import subprocess
 from auto_coding.github_workspace import managed_lock
 from auto_coding.process_runner import bounded_run
 from auto_coding.repository_activity import repository_busy
+from auto_coding.test_process_safety import assert_test_process_safe
 
 
 def validate_repository_root(path, *, run_command=None) -> Path:
@@ -34,6 +35,11 @@ def launch_preflight(repo, runs_dir, *, run_command=None, other_active_run=None)
     result = {"branch": None, "clean": None, "errors": [], "resume_error": None, "start_error": None}
     if repo is None:
         result["errors"].append("Select a Git repository root.")
+        return result
+    try:
+        assert_test_process_safe(repo)
+    except OSError as exc:
+        result["errors"].append(str(exc))
         return result
     repo, runs_dir = Path(repo), Path(runs_dir).expanduser().resolve()
     job_lock = managed_lock(repo, ".job.lock")
