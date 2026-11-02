@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import stat
 from auto_coding.test_process_safety import assert_test_process_safe
+from auto_coding.repository_ownership import assert_process_safe, execution_lock
 
 
 def _run_records(root: Path) -> list[Path]:
@@ -45,6 +46,14 @@ def repository_busy(repo, runs_dir, *, selected_repo=None, selected_logs=None,
     try:
         repo = Path(repo).resolve()
         assert_test_process_safe(repo)
+        assert_process_safe(repo)
+        job = execution_lock(repo, ".job.lock")
+        try:
+            job.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            return True
         logs = Path(selected_logs) if selected_logs is not None else None
         if selected_repo is not None and Path(selected_repo).resolve() == repo:
             if selected_activity is None or selected_activity(repo) is not False:

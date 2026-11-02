@@ -25,6 +25,7 @@ from auto_coding.github_workspace import (managed_job, WorkspaceError, cancel_re
 from auto_coding.process_runner import bounded_run, OutputLimitExceeded
 from auto_coding.metrics import codex_usage, write_metrics
 from auto_coding.test_process_safety import TestProcessGate, assert_test_process_safe
+from auto_coding.repository_ownership import assert_process_safe
 
 
 MAX_PLAN = 512 * 1024
@@ -154,6 +155,23 @@ def execution_metadata(result, execution_id: int, started: float, *, codex=True,
             "duration_seconds": duration,
             "process_started": getattr(result, "process_started", result[0] != 127),
             "usage": usage}
+
+
+def cleanup_unverified(result):
+    cleanup = getattr(result, "cleanup_confirmed", None)
+    return (cleanup is not None and cleanup is not True) or (result[2] and cleanup is not True)
+
+
+def record_process_uncertainty(state, state_path, actor, execution):
+    state["uncertain_process"] = {"actor": actor, "task": execution["task_id"],
+        "attempt": execution["attempt"], "execution_id": execution["seq"], "cleanup_confirmed": False}
+    state["status"] = "stopped"
+    try:
+        mark_process_uncertain()
+    finally:
+        save_json(state_path, state)
+    print(f"STOPPED: {actor} execution {execution['seq']} cleanup is unverified; "
+          "workspace execution and publication remain blocked.", flush=True)
 
 
 def record_test_uncertainty(state, state_path, gate):
@@ -328,6 +346,7 @@ def checked_review(verdict_path: Path) -> dict:
 
 def local_commit(repo: Path, ident: str) -> str:
     assert_test_process_safe(repo)
+    assert_process_safe(repo)
     # Local checkpoints only. Never push. The user can set their Git identity;
     # if it is absent, an explicitly non-public local-only identity is used.
     name = git(repo, ["config", "--get", "user.name"]) if call(["git", "config", "--get", "user.name"], repo, 15)[0] == 0 else "Auto-Coding (local)"
@@ -362,6 +381,7 @@ def verify_approved_commit(repo: Path, pending: dict, current: str | None) -> No
 def recover_checkpoint(repo: Path, state: dict, state_path: Path, events: EventLog | None = None) -> None:
     """Reconcile the tiny window between successful commit and state save."""
     assert_test_process_safe(repo)
+    assert_process_safe(repo)
     pending = state.get("pending_checkpoint")
     if not pending:
         return
@@ -412,6 +432,7 @@ def recover_checkpoint(repo: Path, state: dict, state_path: Path, events: EventL
 def publish_approved(repo, state, state_path, events):
     """Reconcile with the remote even when a previous saved result says published."""
     assert_test_process_safe(repo)
+    assert_process_safe(repo)
     config = state.get("auto_push")
     records = [r for r in state["history"] if r.get("commit")]
     if not config or not records:
@@ -523,6 +544,7 @@ def review_prompt_for(task: dict, stat: str, diff: str, tests: list[dict]) -> st
 def verify_review_ready(repo: Path, logs: Path, state: dict, task: dict) -> tuple[dict, str]:
     """Rebuild a review request only for the exact tested, staged implementation."""
     assert_test_process_safe(repo)
+    assert_process_safe(repo)
     pending = state.get("pending_review")
     if not isinstance(pending, dict):
         raise PilotError("Missing review-ready checkpoint")
@@ -650,9 +672,11 @@ def review_ready_task(repo: Path, logs: Path, state: dict, state_path: Path,
                                         schema=schema_path, model=model_b),
                              repo, timeout, prompt=review_prompt)
         except BaseException as exc:
-            if getattr(exc, "cleanup_confirmed", None) is not True:
+            cleanup = getattr(exc, "cleanup_confirmed", None)
+            if cleanup is not True and not (cleanup is None and getattr(exc, "process_started", None) is False):
                 pending["process_uncertain"] = True
                 pending["review_failure_kind"] = "cleanup_unverified"
+                record_process_uncertainty(state, state_path, "Codex B", execution)
             else:
                 pending["review_failure_kind"] = ("timeout" if isinstance(exc, subprocess.TimeoutExpired)
                                                   else "output_limit" if isinstance(exc, OutputLimitExceeded)
@@ -663,22 +687,27 @@ def review_ready_task(repo: Path, logs: Path, state: dict, state_path: Path,
             save_json(state_path, state)
             raise
         code, output, timed = result
-        measurement = execution_metadata(result, execution["seq"], execution_started)
+        execution_finished = _execution_clock()
+        uncertain = cleanup_unverified(result)
+        if uncertain:
+            pending["process_uncertain"] = True
+            pending["review_failure_kind"] = "cleanup_unverified"
+            record_process_uncertainty(state, state_path, "Codex B", execution)
+        measurement = execution_metadata(result, execution["seq"], execution_started, finished=execution_finished)
         (logs / stream_name).write_text(output, encoding="utf-8")
         events.emit("Codex B", "review_process_finished",
-                    "timed_out" if timed else ("success" if code == 0 else "failed"),
+                    "cleanup_unverified" if uncertain else (
+                        "timed_out" if timed else ("success" if code == 0 else "failed")),
                     task_id=ident, attempt=attempt, evidence={"stream": stream_name},
                     metadata={"exit_code": code, "timed_out": timed,
                               "review_try": ordinal, "review_invocation": ordinal}
                               | measurement)
-        if (getattr(result, "cleanup_confirmed", None) is not False and
-                (not timed or getattr(result, "cleanup_confirmed", None) is True)):
+        if not uncertain:
             # The reviewer has exited; a crash while parsing its verdict can
             # safely resume by making a fresh read-only review request.
             state["status"] = "stopped"
             save_json(state_path, state)
-        if (getattr(result, "cleanup_confirmed", None) is False or
-                (timed and getattr(result, "cleanup_confirmed", None) is not True)):
+        if uncertain:
             reason = "Codex B process cleanup unverified"
             failure_kind = "cleanup_unverified"
             pending["process_uncertain"] = True
@@ -765,6 +794,7 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
     tasks, plan_sha = load_tasks(plan)
     repo = safe_repo(repo, create_repo)
     assert_test_process_safe(repo)
+    assert_process_safe(repo)
     if auto_push:
         identity = normalize_repository(auto_push["repository"])[0]
         branch = auto_push["branch"]
@@ -783,6 +813,8 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
         state = json.loads(state_path.read_text(encoding="utf-8"))
         if "uncertain_test" in state:
             raise PilotError("Test-process cleanup remains unverified in saved state; inspect before resuming.")
+        if "uncertain_process" in state:
+            raise PilotError("Process cleanup is unverified in saved state; inspect before resuming.")
         if state.get("plan_sha256") != plan_sha or state.get("repo") != str(repo):
             raise PilotError("Resume plan or repository mismatch")
         if state.get("auto_push") != auto_push:
@@ -927,6 +959,7 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
         start = len(prior) + 1
         for attempt in range(start, attempts + 1):
             assert_test_process_safe(repo)
+            assert_process_safe(repo)
             events.emit("controller", "task_started", "started", task_id=ident, attempt=attempt)
             print(f"[{ident}] Codex A — attempt {attempt}", flush=True)
             state["status"] = "running"
@@ -945,17 +978,32 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                         evidence={"prompt": f"{base}-a-prompt.txt", "stream": f"{base}-a-events.jsonl", "answer": f"{base}-a-answer.txt"})
             answer_path = logs / f"{base}-a-answer.txt"
             execution_started = _execution_clock()
-            result = execute(codex_argv(readonly=False, last_message=answer_path,
-                                      schema=None, model=model_a), repo, timeout, prompt=developer_msg)
+            try:
+                result = execute(codex_argv(readonly=False, last_message=answer_path,
+                                          schema=None, model=model_a), repo, timeout, prompt=developer_msg)
+            except BaseException as exc:
+                cleanup = getattr(exc, "cleanup_confirmed", None)
+                if cleanup is not True and not (cleanup is None and getattr(exc, "process_started", None) is False):
+                    record_process_uncertainty(state, state_path, "Codex A", execution)
+                raise
             code, output, timed = result
-            measurement = execution_metadata(result, execution["seq"], execution_started)
+            execution_finished = _execution_clock()
+            uncertain = cleanup_unverified(result)
+            if uncertain:
+                record_process_uncertainty(state, state_path, "Codex A", execution)
+            measurement = execution_metadata(result, execution["seq"], execution_started, finished=execution_finished)
             (logs / f"{base}-a-events.jsonl").write_text(output, encoding="utf-8")
-            events.emit("Codex A", "process_finished", "timed_out" if timed else ("success" if code == 0 else "failed"), task_id=ident, attempt=attempt,
+            events.emit("Codex A", "process_finished", "cleanup_unverified" if uncertain else (
+                        "timed_out" if timed else ("success" if code == 0 else "failed")), task_id=ident, attempt=attempt,
                         evidence={"stream": f"{base}-a-events.jsonl", "answer": f"{base}-a-answer.txt"},
                         metadata={"exit_code": code, "timed_out": timed}
                                  | measurement)
             record = {"task": ident, "attempt": attempt, "a_exit": code,
                       "a_timed_out": timed, "tests": [], "review": None}
+            if uncertain:
+                events.emit("controller", "stopped", "failed", task_id=ident, attempt=attempt,
+                            metadata={"reason": "Codex A process cleanup unverified", "execution_id": execution["seq"]})
+                return 1
             if code != 0 or timed:
                 record["feedback"] = "Codex A process failed or timed out; see events log"
                 state["history"].append(record)
@@ -1199,6 +1247,7 @@ def main(argv=None):
         cancel_reservation(args.repo, os.environ.get("AUTOCODING_JOB_RESERVATION"))
         parser.error("--retry-review-once requires --resume")
     if bool(args.auto_push_repository) != bool(args.auto_push_branch):
+        cancel_reservation(args.repo, os.environ.get("AUTOCODING_JOB_RESERVATION"))
         parser.error("Auto-push requires both repository and feature branch")
     if not 1 <= args.attempts <= 10 or not 30 <= args.timeout <= 86400:
         cancel_reservation(args.repo, os.environ.get("AUTOCODING_JOB_RESERVATION"))
@@ -1214,6 +1263,9 @@ def main(argv=None):
                    auto_push=({"repository": normalize_repository(args.auto_push_repository)[0],
                                "branch": args.auto_push_branch} if args.auto_push_repository else None))
     except (PilotError, WorkspaceError, OSError, UnicodeError, json.JSONDecodeError) as exc:
+        # Only an unclaimed, matching reservation can be released here. A
+        # claimed or uncertain runner's gate is deliberately left untouched.
+        cancel_reservation(args.repo, os.environ.get("AUTOCODING_JOB_RESERVATION"))
         print(f"STOPPED: {exc}", file=sys.stderr)
         return 1
 

@@ -11,7 +11,17 @@ from auto_coding.desktop_control import DesktopController
 class FakeProcess:
     def __init__(self, argv, **kwargs):
         self.argv, self.kwargs, self.code, self.pid = argv, kwargs, None, 424242
-    def poll(self): return self.code
+        from auto_coding.repository_ownership import execution_lock
+        self.gate = execution_lock(Path(argv[argv.index("--repo") + 1]), ".job.lock")
+        reservation = self.gate / "reservation"
+        # Model the runner's one-time handoff and its confirmed-clean exit.
+        assert reservation.read_text() == kwargs["env"]["AUTOCODING_JOB_RESERVATION"]
+        reservation.unlink()
+
+    def poll(self):
+        if self.code is not None and self.gate.exists():
+            self.gate.rmdir()  # This fake child never creates subprocesses.
+        return self.code
 
 
 class DesktopControlTests(unittest.TestCase):
@@ -327,7 +337,9 @@ class DesktopControlTests(unittest.TestCase):
         }))
         result = reopened.resume()
         self.assertFalse(result["ok"])
-        self.assertIn("could not persist its child PID", result["error"])
+        self.assertIn("active or uncertain", result["error"])
+        self.assertTrue(reopened._launch_uncertain)
+        self.assertTrue(self.controller.process.gate.is_dir())
         self.assertEqual(popen.call_count, 1)
 
     @patch("auto_coding.desktop_control.Popen")

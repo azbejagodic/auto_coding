@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -380,6 +381,12 @@ class DesktopBridgeTests(unittest.TestCase):
         self.assertEqual(popen.call_count, 1)
         self.assertEqual(bridge.snapshot()["root"], str(controller.logs))
         self.assertTrue(bridge.job_status()["active"])
+        from auto_coding.github_workspace import managed_job
+        @managed_job
+        def fake_child_finished(plan, repo, logs):
+            pass  # Exercise the real claim/release; no agent or child is launched.
+        with patch.dict(os.environ, popen.call_args.kwargs["env"]):
+            fake_child_finished(self.plan, repo, controller.logs)
         process.poll.return_value = 1
         bridge.job_status()
         state = {"status": "stopped", "repo": str(repo),

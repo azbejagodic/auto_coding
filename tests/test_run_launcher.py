@@ -135,7 +135,10 @@ class RunLauncherTests(unittest.TestCase):
                                    attempts=2, popen=self.spawn)
         self.assertTrue(result["ok"])
         environment = self.spawn.call_args.kwargs["env"]
-        self.assertNotIn("AUTOCODING_JOB_RESERVATION", environment)
+        token = environment["AUTOCODING_JOB_RESERVATION"]
+        self.assertNotEqual(token, "parent-token")
+        from auto_coding.repository_ownership import execution_lock
+        self.assertEqual((execution_lock(repo, ".job.lock") / "reservation").read_text(), token)
         self.assertEqual(environment["PYTHONPATH"], str(Path(__file__).resolve().parents[1] / "src"))
 
     def test_spawn_failure_releases_only_its_reservation_and_records_stopped(self):

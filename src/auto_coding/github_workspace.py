@@ -15,6 +15,8 @@ from functools import wraps
 from auto_coding.process_runner import bounded_run, OutputLimitExceeded, MAX_CAPTURE_BYTES
 from auto_coding.repository_activity import repository_busy
 from auto_coding.test_process_safety import assert_test_process_safe
+from auto_coding.repository_ownership import (managed_lock, execution_lock,
+    assert_process_safe, preserve_process_uncertainty)
 
 
 _uncertain_process = ContextVar("autocoding_uncertain_process", default=None)
@@ -24,20 +26,16 @@ def mark_process_uncertain():
     """Retain the current job gate when subprocess descendants may survive."""
     marker = _uncertain_process.get()
     if marker is not None:
-        marker.touch()
-
-
-def managed_lock(repo, suffix=".lock"):
-    repo = Path(repo).resolve() if repo is not None else None
-    if repo and repo.parent.name == "workspaces" and re.fullmatch(r"[0-9a-f]{64}", repo.name):
-        return repo.parent / (repo.name + suffix)
-    return None
+        if callable(marker):
+            marker()
+        else:
+            marker.touch()
 
 
 def serialized_launch(method):
     @wraps(method)
     def wrapped(self, *args, **kwargs):
-        lock = managed_lock(self.repo)
+        lock = execution_lock(self.repo)
         try:
             if lock:
                 with checkout_lock(lock):
@@ -51,7 +49,8 @@ def serialized_launch(method):
 def reserve_job(repo):
     """Reserve under the checkout operation lock, before creating a child."""
     assert_test_process_safe(repo)
-    path = managed_lock(repo, ".job.lock")
+    assert_process_safe(repo)
+    path = execution_lock(repo, ".job.lock")
     if path is None:
         return None
     try:
@@ -68,8 +67,18 @@ def cancel_reservation(repo, token):
     """Release an unclaimed reservation when execution is known not to have begun."""
     if token is None:
         return
-    path = managed_lock(repo, ".job.lock")
+    path = execution_lock(repo, ".job.lock")
     if path is None:
+        return
+    try:
+        assert_test_process_safe(repo)
+        assert_process_safe(repo)
+        (path / "uncertain").lstat()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return  # Uncertainty cannot authorize releasing even a matching token.
+    else:
         return
     reservation = path / "reservation"
     try:
@@ -85,10 +94,11 @@ def managed_job(method):
     @wraps(method)
     def wrapped(plan, repo, logs, **kwargs):
         assert_test_process_safe(repo)
-        lock = managed_lock(repo)
+        assert_process_safe(repo)
+        lock = execution_lock(repo)
         if not lock:
             return method(plan, repo, logs, **kwargs)
-        job_path = managed_lock(repo, ".job.lock")
+        job_path = execution_lock(repo, ".job.lock")
         # A newly spawned desktop child can arrive before its parent finishes
         # persisting the launch PID. Wait briefly for that lock handoff.
         deadline = time.monotonic() + 10
@@ -102,6 +112,7 @@ def managed_job(method):
                     raise
                 time.sleep(0.05)
         try:
+            assert_process_safe(repo)
             token = os.environ.get("AUTOCODING_JOB_RESERVATION")
             reservation = job_path / "reservation"
             if (token and re.fullmatch(r"[0-9a-f]{32}", token)
@@ -117,26 +128,36 @@ def managed_job(method):
         finally:
             operation.__exit__(None, None, None)
         defaults = method.__kwdefaults__ or {}
+        uncertain = False
+        def keep_uncertain():
+            nonlocal uncertain
+            uncertain = True  # An I/O failure must never authorize gate release.
+            try:
+                preserve_process_uncertainty(repo, logs)
+            finally:
+                (job_path / "uncertain").touch()
+
         if "execute" in defaults:
             execute = kwargs.get("execute", defaults["execute"])
             def tracked_execute(*args, **options):
                 try:
                     result = execute(*args, **options)
                 except BaseException as exc:
-                    if getattr(exc, "cleanup_confirmed", False) is not True:
-                        (job_path / "uncertain").touch()
+                    cleanup = getattr(exc, "cleanup_confirmed", None)
+                    if cleanup is not True and not (cleanup is None and getattr(exc, "process_started", None) is False):
+                        keep_uncertain()
                     raise
                 cleanup = getattr(result, "cleanup_confirmed", None)
-                if cleanup is False or (result[2] and cleanup is not True):
-                    (job_path / "uncertain").touch()
+                if (cleanup is not None and cleanup is not True) or (result[2] and cleanup is not True):
+                    keep_uncertain()
                 return result
             kwargs["execute"] = tracked_execute
-        tracking = _uncertain_process.set(job_path / "uncertain")
+        tracking = _uncertain_process.set(keep_uncertain)
         try:
             return method(plan, repo, logs, **kwargs)
         finally:
             _uncertain_process.reset(tracking)
-            if not (job_path / "uncertain").exists():
+            if not uncertain and not (job_path / "uncertain").exists():
                 job_path.rmdir()
     return wrapped
 
@@ -453,6 +474,7 @@ class GitHubWorkspaceManager:
     def publish_checkpoint(self, repo, identity, branch, sha, approved):
         """Synchronous publication by the coordinator owning the checkout job gate."""
         assert_test_process_safe(repo)
+        assert_process_safe(repo)
         self._branch(repo, branch)
         if self._status(repo)["branch"] != branch or self._git(repo, "rev-parse", "HEAD") != sha:
             raise WorkspaceError("checkpoint", "Selected branch or checkpoint changed; inspect before Retry Push.")

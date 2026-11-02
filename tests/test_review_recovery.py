@@ -464,9 +464,9 @@ class ReviewRecoveryTests(unittest.TestCase):
         self.assertEqual(fake.b_calls, 1)
         self.assertTrue(self.state()["pending_review"]["process_uncertain"])
         self.assertEqual(self.retry_delays, [])
-        with self.assertRaisesRegex(PilotError, "cleanup is unverified"):
+        with self.assertRaisesRegex(OSError, "cleanup remains unverified"):
             self.run_fake(FakeExecutor(review_only=True), resume=True)
-        with self.assertRaisesRegex(PilotError, "cleanup is unverified"):
+        with self.assertRaisesRegex(OSError, "cleanup remains unverified"):
             self.run_fake(FakeExecutor(review_only=True), resume=True, retry_review_once=True)
 
     def test_confirmed_reviewer_timeout_retries_only_b(self):

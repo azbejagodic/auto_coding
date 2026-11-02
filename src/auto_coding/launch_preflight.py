@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 import subprocess
 
-from auto_coding.github_workspace import managed_lock
+from auto_coding.repository_ownership import execution_lock, assert_process_safe
 from auto_coding.process_runner import bounded_run
 from auto_coding.repository_activity import repository_busy
 from auto_coding.test_process_safety import assert_test_process_safe
@@ -38,17 +38,19 @@ def launch_preflight(repo, runs_dir, *, run_command=None, other_active_run=None)
         return result
     try:
         assert_test_process_safe(repo)
+        assert_process_safe(repo)
     except OSError as exc:
         result["errors"].append(str(exc))
         return result
     repo, runs_dir = Path(repo), Path(runs_dir).expanduser().resolve()
-    job_lock = managed_lock(repo, ".job.lock")
-    if job_lock and job_lock.exists():
+    job_lock = execution_lock(repo, ".job.lock")
+    job_busy = job_lock is not None and job_lock.exists()
+    if job_busy:
         result["errors"].append("An Auto-Coding runner is active or uncertain for this checkout.")
     if runs_dir == repo or runs_dir.is_relative_to(repo):
         result["start_error"] = "Run storage must be outside the project. Select a different project or configure external run storage."
     active = other_active_run() if other_active_run is not None else repository_busy(repo, runs_dir)
-    if active is not False:
+    if active is not False and not job_busy:
         result["errors"].append("An earlier desktop run may still be active. Open its logs and wait for it to stop.")
     try:
         branch = run(["git", "branch", "--show-current"], cwd=repo,

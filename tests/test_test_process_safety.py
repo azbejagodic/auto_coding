@@ -209,6 +209,12 @@ else:
         (gate / "execution.json").unlink()
         gate.rmdir()
         (gate.parent / "auto-coding-test-process-uncertain.json").unlink()
+        from auto_coding.repository_ownership import execution_lock
+        # The whole-run guard now also protects this fake test execution.
+        execution_lock(self.repo, ".process-uncertain.json").unlink()
+        job = execution_lock(self.repo, ".job.lock")
+        (job / "uncertain").unlink()
+        job.rmdir()
         execute = Mock()
         for status in ("stopped", "completed"):
             state = self.state()
