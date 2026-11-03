@@ -142,6 +142,9 @@ class ReviewPermissions:
     environment: dict[str, str]
     instructions: str
     identity: tuple[int, int]
+    executable: str = "codex"
+    profile: str = ""
+    settings: tuple[str, ...] = ()
 
     def cleanup(self):
         current = self.scratch.lstat()
@@ -177,7 +180,11 @@ def prepare_review(argv, repo, logs, git, *, check=check_cli):
         settings = [f'default_permissions="{name}"', policy,
                     'shell_environment_policy.set={' + ','.join(key+'='+json.dumps(item) for key,item in variables.items()) + '}',
                     'shell_environment_policy.experimental_use_profile=false']
-        executable = check(settings, name, repo, scratch) if check else argv[0]
+        executable = check(settings, name, repo, scratch) if check else (argv[0] if argv else "codex")
+        spec.executable, spec.profile, spec.settings = executable, name, tuple(settings)
+        spec.environment = environment
+        if argv is None:
+            return spec  # Workflow preflight reuses policy validation without building an agent request.
         command = list(argv[:-1])
         index = command.index("--sandbox")
         if command[index + 1] != "read-only":
@@ -191,7 +198,6 @@ def prepare_review(argv, repo, logs, git, *, check=check_cli):
         for setting in settings:
             command.extend(["-c", setting])
         spec.argv = [*command, argv[-1]]
-        spec.environment = environment
         spec.instructions = (f"\n\nREVIEW TEST ENVIRONMENT: target cwd is {repo}; writable scratch is {scratch}; "
             f"TEMP/TMP/TMPDIR must resolve to {scratch / 'tmp'}. Keep the supplied target PYTHONPATH. "
             "Run configured tests against the actual target, never a copy. Do not modify source or Git metadata. "

@@ -239,7 +239,12 @@ class ReviewerFlowTests(unittest.TestCase):
         self.assertEqual(event["metadata"]["verification_status"], "not_reported")
 
     def test_scratch_io_failure_after_confirmed_exit_does_not_invent_process_uncertainty(self):
-        with patch.object(permissions.ReviewPermissions, "cleanup", side_effect=PermissionError("retained")):
+        original = permissions.ReviewPermissions.cleanup
+        def cleanup(spec):
+            if spec.instructions:
+                raise PermissionError("retained reviewer scratch")
+            return original(spec)
+        with patch.object(permissions.ReviewPermissions, "cleanup", cleanup):
             self.assertEqual(self.run_fake(recovery.FakeExecutor([verdict("passed")])), 0)
         self.assertFalse(execution_lock(self.fixture.repo, ".job.lock").exists())
         self.assertTrue(any(item["event"] == "review_scratch_retained" for item in self.fixture.events()))
@@ -248,12 +253,14 @@ class ReviewerFlowTests(unittest.TestCase):
         execute = recovery.FakeExecutor([recovery.APPROVED] * 3)
         execute.__wrapped__ = runner.call
         with patch.object(runner, "check_cli", return_value="codex") as checker, \
+                patch.object(runner, "probe_review_storage") as storage, \
                 contextlib.redirect_stdout(io.StringIO()):
             result = runner.run(self.fixture.plan, self.fixture.repo, self.fixture.logs, execute=execute,
                                 controller_tests=True, final_verification_config={
                                     "test_commands": [["never-final"]], "minimum_tests": 1, "timeout_seconds": 30})
         self.assertEqual(result, 1)
-        self.assertEqual(checker.call_count, 3)
+        self.assertEqual(checker.call_count, 4)  # Workflow preflight, then three review attempts.
+        storage.assert_called_once()
         self.assertEqual((execute.a_calls, execute.test_calls, execute.b_calls), (1, 1, 3))
         self.assertEqual(self.fixture.state()["completed"], [])
 

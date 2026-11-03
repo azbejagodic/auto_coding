@@ -26,6 +26,7 @@ from auto_coding.github_workspace import (managed_job, WorkspaceError, cancel_re
 from auto_coding.process_runner import bounded_run, OutputLimitExceeded, MAX_CAPTURE_BYTES
 from auto_coding.reviewer_permissions import (activated, command_environment, prepare_review,
                                              check_cli, ReviewerEnvironmentError)
+from auto_coding.workflow_preflight import workflow_preflight, probe_review_storage
 from auto_coding.metrics import codex_usage, write_metrics
 from auto_coding.test_process_safety import TestProcessGate, assert_test_process_safe
 from auto_coding.repository_ownership import assert_process_safe
@@ -1608,6 +1609,7 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
     events.emit("controller", "plan_validated", "success", metadata={"task_count": len(tasks), "plan_sha256": plan_sha})
     schema_path = logs / "review-schema.json"
     schema_path.write_text(json.dumps(VERDICT_SCHEMA, indent=2), encoding="utf-8")
+    workflow_checked = False
     for task in tasks:
         ident = task["id"]
         if ident in state["completed"]:
@@ -1633,6 +1635,34 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
             task_head = expected_run_head(state, manifest)
             if head(repo) != task_head:
                 raise PilotError("Git HEAD changed from the approved task base")
+            pending_execution = state.get("pending_execution")
+            reusing_implementation = isinstance(pending_execution, dict) and pending_execution.get("phase") == "completed"
+            if not workflow_checked and not reusing_implementation:
+                preflight = events.emit("controller", "workflow_preflight_started", "started", task_id=ident, attempt=attempt)
+                production = unwrap(execute) is call
+                try:
+                    workflow_preflight(repo, logs, git, check=check_cli if production else None,
+                                       probe=probe_review_storage if production else None)
+                except BaseException as exc:
+                    uncertain = (hasattr(exc, "process_started") and getattr(exc, "process_started", None) is not False
+                                 and getattr(exc, "cleanup_confirmed", None) is not True)
+                    try:
+                        assert_process_safe(repo)
+                    except OSError:
+                        uncertain = True
+                    if uncertain:
+                        record_process_uncertainty(state, state_path, "workflow preflight", preflight)
+                    check = getattr(exc, "preflight_check", "workflow compatibility")
+                    correction = getattr(exc, "preflight_correction", "Select a separate compatible checkout and writable external run storage")
+                    events.emit("controller", "workflow_preflight_failed", "failed", task_id=ident, attempt=attempt,
+                                metadata={"check": check, "reason": str(exc)[:1000], "correction": correction,
+                                          "error_type": type(exc).__name__})
+                    if not isinstance(exc, Exception):
+                        raise
+                    raise PilotError(f"Workflow preflight [{check}] failed: {exc}. Correction: {correction}") from exc
+                workflow_checked = True
+                events.emit("controller", "workflow_preflight_finished", "success", task_id=ident, attempt=attempt,
+                            metadata={"reviewer_cli_checked": production, "native_storage_checked": production})
             events.emit("controller", "task_started", "started", task_id=ident, attempt=attempt)
             print(f"[{ident}] Codex A — attempt {attempt}", flush=True)
             state["status"] = "running"
