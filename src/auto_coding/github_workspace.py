@@ -141,6 +141,8 @@ def managed_job(method):
 
         if "execute" in defaults:
             execute = kwargs.get("execute", defaults["execute"])
+            # Preserve executor identity so reviewer preflight recognizes the real runner.
+            @wraps(execute)
             def tracked_execute(*args, **options):
                 try:
                     result = execute(*args, **options)

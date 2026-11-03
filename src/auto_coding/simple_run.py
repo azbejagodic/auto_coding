@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+from inspect import unwrap
 import datetime
 import json
 import math
@@ -23,7 +24,8 @@ from auto_coding.github_workspace import (managed_job, WorkspaceError, cancel_re
                                          mark_process_uncertain, GitHubWorkspaceManager,
                                          normalize_repository)
 from auto_coding.process_runner import bounded_run, OutputLimitExceeded, MAX_CAPTURE_BYTES
-from auto_coding.python_environment import target_environment
+from auto_coding.reviewer_permissions import (activated, command_environment, prepare_review,
+                                             check_cli, ReviewerEnvironmentError)
 from auto_coding.metrics import codex_usage, write_metrics
 from auto_coding.test_process_safety import TestProcessGate, assert_test_process_safe
 from auto_coding.repository_ownership import assert_process_safe
@@ -53,8 +55,12 @@ VERDICT_SCHEMA = {
         "issues": {"type": "array", "items": {"type": "string", "minLength": 1,
                                              "maxLength": MAX_REVIEW_ISSUE_CHARS}, "maxItems": 20},
         "summary": {"type": "string", "minLength": 1, "maxLength": MAX_REVIEW_SUMMARY_CHARS},
+        "verification": {"type": "object", "properties": {
+            "status": {"type": "string", "enum": ["passed", "failed", "environment_blocked", "not_run"]},
+            "details": {"type": "string", "minLength": 1, "maxLength": MAX_REVIEW_SUMMARY_CHARS}},
+            "required": ["status", "details"], "additionalProperties": False},
     },
-    "required": ["decision", "issues", "summary"],
+    "required": ["decision", "issues", "summary", "verification"],
     "additionalProperties": False,
 }
 
@@ -155,7 +161,7 @@ def call(argv: list[str], cwd: Path, timeout: int, *, prompt: str | None = None)
         result = bounded_run(argv, cwd=str(cwd), input=prompt, text=True,
                                 encoding="utf-8", errors="surrogateescape" if argv[0] == "git" else "replace",
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                timeout=timeout, check=False, shell=False, env=target_environment(cwd))
+                                timeout=timeout, check=False, shell=False, env=command_environment(cwd))
         return _CallResult(result.returncode, result.stdout or "", False, process_started=True)
     except subprocess.TimeoutExpired as exc:
         confirmed = getattr(exc, "cleanup_confirmed", False) is True
@@ -383,14 +389,15 @@ def staging_summary(repo: Path) -> tuple[str, str, str]:
     return stat, diff, diff_hash
 
 
-def checked_review(verdict_path: Path) -> dict:
+def checked_review(verdict_path: Path, *, require_verification=False) -> dict:
     try:
         with verdict_path.open("rb") as stream:
             raw = stream.read(MAX_VERDICT_BYTES + 1)
         if len(raw) > MAX_VERDICT_BYTES:
             raise ValueError("Oversized verdict")
         verdict = json.loads(raw.decode("utf-8"))
-        if (not isinstance(verdict, dict) or set(verdict) != {"decision", "issues", "summary"}
+        if (not isinstance(verdict, dict) or not {"decision", "issues", "summary"} <= set(verdict)
+                or not set(verdict) <= {"decision", "issues", "summary", "verification"}
                 or verdict["decision"] not in ("APPROVED", "REJECTED")
                 or not isinstance(verdict["issues"], list) or len(verdict["issues"]) > 20
                 or any(not isinstance(x, str) or not x.strip()
@@ -401,6 +408,15 @@ def checked_review(verdict_path: Path) -> dict:
                 or not isinstance(verdict["summary"], str) or not verdict["summary"].strip()
                 or len(verdict["summary"]) > MAX_REVIEW_SUMMARY_CHARS):
             raise ValueError("Invalid verdict")
+        if require_verification and "verification" not in verdict:
+            raise ValueError("Missing independent verification report")
+        if "verification" in verdict:
+            verification = verdict["verification"]
+            if (not isinstance(verification, dict) or set(verification) != {"status", "details"}
+                    or verification["status"] not in ("passed", "failed", "environment_blocked", "not_run")
+                    or not isinstance(verification["details"], str) or not verification["details"].strip()
+                    or len(verification["details"]) > MAX_REVIEW_SUMMARY_CHARS):
+                raise ValueError("Invalid independent verification report")
         return verdict
     except (ValueError, OSError, UnicodeError) as exc:
         raise PilotError("Invalid or missing Codex B verdict; see event logs") from exc
@@ -825,6 +841,15 @@ def stop_review_retry(logs, state, state_path, events, reason):
     return "stopped"
 
 
+def cleanup_review_scratch(spec, events, ident, attempt):
+    try:
+        spec.cleanup()
+    except (OSError, ReviewerEnvironmentError) as exc:
+        # Filesystem cleanup failure is not evidence of a surviving process.
+        events.emit("controller", "review_scratch_retained", "warning", task_id=ident, attempt=attempt,
+                    evidence={"scratch": spec.scratch.name}, metadata={"error_type": type(exc).__name__})
+
+
 def review_ready_task(repo: Path, logs: Path, state: dict, state_path: Path,
                       events: EventLog, task: dict, schema_path: Path,
                       execute: Callable, timeout: int, model_b: str | None, *,
@@ -870,20 +895,49 @@ def review_ready_task(repo: Path, logs: Path, state: dict, state_path: Path,
         # response from this invocation can authorize a commit.
         if verdict_path.exists():
             raise PilotError("Review verdict path already exists; inspect before retry")
-        pending["review_invocations"] = ordinal
-        pending.pop("review_retry_after", None)
-        state["status"] = "running"
-        save_json(state_path, state)
-        (logs / prompt_name).write_text(review_prompt, encoding="utf-8")
-        execution = events.emit("Codex B", "review_started", "started", task_id=ident, attempt=attempt,
-                    evidence={"prompt": prompt_name, "diff": f"{base}-diff.txt",
-                              "stream": stream_name, "verdict": verdict_name},
-                    metadata={"review_try": ordinal, "review_invocation": ordinal})
+        production = unwrap(execute) is call
+        preflight = events.emit("controller", "review_environment_check", "started", task_id=ident, attempt=attempt)
+        try:
+            spec = prepare_review(codex_argv(readonly=True, last_message=verdict_path,
+                                            schema=schema_path, model=model_b), repo, logs, git,
+                                  check=check_cli if production else None)
+        except BaseException as exc:
+            uncertain_preflight = (hasattr(exc, "process_started") and getattr(exc, "process_started", None) is not False
+                                   and getattr(exc, "cleanup_confirmed", None) is not True)
+            try:
+                assert_process_safe(repo)
+            except OSError:
+                uncertain_preflight = True
+            if uncertain_preflight:
+                pending["process_uncertain"] = True
+                record_process_uncertainty(state, state_path, "reviewer preflight", preflight)
+            pending["review_failure_kind"] = "cleanup_unverified" if pending.get("process_uncertain") else "environment_setup"
+            state["status"] = "stopped"
+            save_json(state_path, state)
+            events.emit("controller", "review_environment_failed", pending["review_failure_kind"],
+                        task_id=ident, attempt=attempt, metadata={"error_type": type(exc).__name__})
+            if not isinstance(exc, Exception):
+                raise
+            return stop_review_retry(logs, state, state_path, events,
+                                     f"Reviewer environment validation failed: {exc}; no reviewer launched")
+        review_prompt += spec.instructions
+        try:
+            pending["review_invocations"] = ordinal
+            pending.pop("review_retry_after", None)
+            state["status"] = "running"
+            save_json(state_path, state)
+            (logs / prompt_name).write_text(review_prompt, encoding="utf-8")
+            execution = events.emit("Codex B", "review_started", "started", task_id=ident, attempt=attempt,
+                        evidence={"prompt": prompt_name, "diff": f"{base}-diff.txt",
+                                  "stream": stream_name, "verdict": verdict_name},
+                        metadata={"review_try": ordinal, "review_invocation": ordinal, "scratch": spec.scratch.name})
+        except BaseException:
+            cleanup_review_scratch(spec, events, ident, attempt)  # No reviewer was launched.
+            raise
         try:
             execution_started = _execution_clock()
-            result = execute(codex_argv(readonly=True, last_message=verdict_path,
-                                        schema=schema_path, model=model_b),
-                             repo, timeout, prompt=review_prompt)
+            with activated(spec.environment):
+                result = execute(spec.argv, repo, timeout, prompt=review_prompt)
         except BaseException as exc:
             cleanup = getattr(exc, "cleanup_confirmed", None)
             if cleanup is not True and not (cleanup is None and getattr(exc, "process_started", None) is False):
@@ -898,6 +952,8 @@ def review_ready_task(repo: Path, logs: Path, state: dict, state_path: Path,
                     schedule_review_retry(pending)
             state["status"] = "stopped"
             save_json(state_path, state)
+            if not pending.get("process_uncertain"):
+                cleanup_review_scratch(spec, events, ident, attempt)
             raise
         code, output, timed = result
         execution_finished = _execution_clock()
@@ -920,6 +976,7 @@ def review_ready_task(repo: Path, logs: Path, state: dict, state_path: Path,
             # safely resume by making a fresh read-only review request.
             state["status"] = "stopped"
             save_json(state_path, state)
+            cleanup_review_scratch(spec, events, ident, attempt)
         if uncertain:
             reason = "Codex B process cleanup unverified"
             failure_kind = "cleanup_unverified"
@@ -934,17 +991,28 @@ def review_ready_task(repo: Path, logs: Path, state: dict, state_path: Path,
             reason, failure_kind = "Codex B process failure", "process_failure"
         else:
             try:
-                verdict = checked_review(verdict_path)
+                verdict = checked_review(verdict_path, require_verification=production)
             except PilotError:
                 reason, failure_kind = "invalid review verdict", "invalid_verdict"
             else:
                 # A read-only reviewer is still an external process; inspect the
                 # worktree after it exits before accepting either verdict.
                 verify_review_ready(repo, logs, state, task)
+                verification = verdict.get("verification", {"status": "not_reported"})
+                if (verdict["decision"] == "APPROVED" and
+                        (verification["status"] in {"failed", "environment_blocked"}
+                         or (verification["status"] == "not_run" and task["test_commands"]))):
+                    pending["review_failure_kind"] = "verification_" + verification["status"]
+                    state["status"] = "stopped"
+                    save_json(state_path, state)
+                    events.emit("Codex B", "review_verification_blocked", verification["status"],
+                                task_id=ident, attempt=attempt, evidence={"verdict": verdict_name})
+                    return stop_review_retry(logs, state, state_path, events,
+                                             "Independent review testing " + verification["status"] + "; inspect evidence, then resume B only")
                 record["review"] = verdict
                 events.emit("Codex B", "review_finished", verdict["decision"].lower(),
                             task_id=ident, attempt=attempt, evidence={"verdict": verdict_name},
-                            metadata={"execution_id": execution["seq"]})
+                            metadata={"execution_id": execution["seq"], "verification_status": verification["status"]})
                 if verdict["decision"] == "APPROVED" and not verdict["issues"]:
                     record.update(base_head=head(repo), diff_sha256=pending["diff_sha256"], branch=state["branch"])
                     state["pending_checkpoint"] = {"task": ident, "base_head": pending["base_head"],

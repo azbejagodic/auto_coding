@@ -210,7 +210,12 @@ class PythonEnvironmentTests(unittest.TestCase):
             nonlocal final_blocked
             if argv[0] == "codex":
                 role = "B" if "--output-schema" in argv else "A"
-                self.assertEqual(argv[argv.index("--sandbox") + 1], "read-only" if role == "B" else "workspace-write")
+                if role == "B":
+                    self.assertNotIn("--sandbox", argv)
+                    self.assertEqual(Path(argv[argv.index("--cd") + 1]), cwd)
+                    self.assertTrue(any(part.startswith('default_permissions="auto_coding_review_') for part in argv))
+                else:
+                    self.assertEqual(argv[argv.index("--sandbox") + 1], "workspace-write")
                 answer = argv[argv.index("--output-last-message") + 1]
                 calls.append(role)
                 return runner.call([sys.executable, "-B", "-c", agent, answer, role, json.dumps(command)],
