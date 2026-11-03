@@ -9,6 +9,7 @@ import sys
 
 from auto_coding.github_workspace import reserve_job, cancel_reservation
 from auto_coding.run_lifecycle import write_launch_metadata
+from auto_coding.python_environment import TARGET_PYTHONPATH, target_environment
 
 
 @dataclass
@@ -44,7 +45,11 @@ def launch_runner(state, *, repo, plan, logs, attempts, resume=False, publicatio
     env = os.environ.copy()
     # A reservation belongs only to this launch, never to a parent runner.
     env.pop("AUTOCODING_JOB_RESERVATION", None)
-    env["PYTHONPATH"] = src + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    # Only the trusted engine belongs on the controller's import path. Target
+    # execution gets its own environment in simple_run.call().
+    env[TARGET_PYTHONPATH] = target_environment(repo)["PYTHONPATH"]
+    env.pop("PYTHONHOME", None)
+    env["PYTHONPATH"] = src
     argv = [sys.executable, "-B", "-m", "auto_coding.simple_run", "--repo", str(repo),
             "--logs", str(logs), "--attempts", str(attempts)]
     if resume:

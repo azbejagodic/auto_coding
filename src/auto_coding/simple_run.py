@@ -23,6 +23,7 @@ from auto_coding.github_workspace import (managed_job, WorkspaceError, cancel_re
                                          mark_process_uncertain, GitHubWorkspaceManager,
                                          normalize_repository)
 from auto_coding.process_runner import bounded_run, OutputLimitExceeded, MAX_CAPTURE_BYTES
+from auto_coding.python_environment import target_environment
 from auto_coding.metrics import codex_usage, write_metrics
 from auto_coding.test_process_safety import TestProcessGate, assert_test_process_safe
 from auto_coding.repository_ownership import assert_process_safe
@@ -154,7 +155,7 @@ def call(argv: list[str], cwd: Path, timeout: int, *, prompt: str | None = None)
         result = bounded_run(argv, cwd=str(cwd), input=prompt, text=True,
                                 encoding="utf-8", errors="surrogateescape" if argv[0] == "git" else "replace",
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                timeout=timeout, check=False, shell=False)
+                                timeout=timeout, check=False, shell=False, env=target_environment(cwd))
         return _CallResult(result.returncode, result.stdout or "", False, process_started=True)
     except subprocess.TimeoutExpired as exc:
         confirmed = getattr(exc, "cleanup_confirmed", False) is True

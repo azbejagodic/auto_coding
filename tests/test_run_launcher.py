@@ -73,7 +73,7 @@ class RunLauncherTests(unittest.TestCase):
             return FakeProcess()
         self.spawn.side_effect = spawn
         with patch.dict(os.environ, {"AUTOCODING_JOB_RESERVATION": "parent-reservation",
-                                     "PYTHONPATH": "existing-path"}):
+                                     "PYTHONPATH": "existing-path", "PYTHONHOME": "wrong-python"}):
             environment = os.environ.copy()
             result = self.launch()
             self.assertEqual(dict(os.environ), environment)
@@ -83,7 +83,8 @@ class RunLauncherTests(unittest.TestCase):
                                "--logs", str(self.logs), "--attempts", "4", str(self.plan)])
         self.assertEqual(result, {"ok": True, "argv": argv, "error": None})
         self.assertEqual(options["cwd"], src)
-        self.assertEqual(options["env"]["PYTHONPATH"], src + os.pathsep + "existing-path")
+        self.assertEqual(options["env"]["PYTHONPATH"], src)
+        self.assertNotIn("PYTHONHOME", options["env"])
         self.assertFalse(options["shell"])
         self.assertEqual(options["stdin"], subprocess.DEVNULL)
         self.assertEqual(options["stderr"], subprocess.STDOUT)
