@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 from auto_coding import simple_run as runner
 from auto_coding.python_environment import TARGET_PYTHONPATH, target_environment
 from auto_coding.run_launcher import LaunchState, launch_runner
+from backend_fixtures import approved_plan_fixture
 
 
 class PythonEnvironmentTests(unittest.TestCase):
@@ -227,7 +228,7 @@ class PythonEnvironmentTests(unittest.TestCase):
                 final_blocked = True
                 return runner._CallResult(127, "Simulated final launch failure", False, True, False)
             return runner.call(argv, cwd, timeout, prompt=prompt)
-        with self.poisoned_environment(), contextlib.redirect_stdout(io.StringIO()):
+        with approved_plan_fixture(), self.poisoned_environment(), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(runner.run(plan, self.target, logs, execute=execute, controller_tests=True), 1)
             self.assertEqual(calls, ["A", "focused", "B", "final"])
             self.assertEqual(runner.run(plan, self.target, logs, execute=execute, resume=True), 0)

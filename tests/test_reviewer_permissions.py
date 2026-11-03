@@ -15,6 +15,7 @@ from auto_coding import simple_run as runner
 from auto_coding import reviewer_permissions as permissions
 from auto_coding.repository_ownership import execution_lock
 import test_review_recovery as recovery
+from backend_fixtures import approved_plan_fixture
 
 
 def verdict(status, *, rejected=False):
@@ -252,7 +253,7 @@ class ReviewerFlowTests(unittest.TestCase):
     def test_production_wrapper_requires_verification_and_checks_configuration(self):
         execute = recovery.FakeExecutor([recovery.APPROVED] * 3)
         execute.__wrapped__ = runner.call
-        with patch.object(runner, "check_cli", return_value="codex") as checker, \
+        with approved_plan_fixture(), patch.object(runner, "check_cli", return_value="codex") as checker, \
                 patch.object(runner, "probe_review_storage") as storage, \
                 contextlib.redirect_stdout(io.StringIO()):
             result = runner.run(self.fixture.plan, self.fixture.repo, self.fixture.logs, execute=execute,

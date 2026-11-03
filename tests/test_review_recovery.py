@@ -1,5 +1,6 @@
 """Review-only recovery uses fake executors and disposable Git repositories."""
 import json
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -151,7 +152,14 @@ class ReviewRecoveryTests(unittest.TestCase):
         self.assertEqual((first.a_calls, first.test_calls, first.b_calls), (1, 1, 1))
         self.assertEqual((resumed.a_calls, resumed.test_calls, resumed.b_calls), (0, 0, 2))
         self.assertEqual(self.retry_delays, [3.0, 15.0])
-        self.assertEqual(first.b_prompts[0], resumed.b_prompts[0])
+        # B07 creates a fresh writable scratch per reviewer invocation. The
+        # review request itself and its target context must survive restart.
+        scratch = r"review-scratch-[A-Za-z0-9_]+"
+        self.assertRegex(first.b_prompts[0], scratch)
+        self.assertRegex(resumed.b_prompts[0], scratch)
+        self.assertNotEqual(first.b_prompts[0], resumed.b_prompts[0])
+        self.assertEqual(re.sub(scratch, "<scratch>", first.b_prompts[0]),
+                         re.sub(scratch, "<scratch>", resumed.b_prompts[0]))
         invocations = [event["metadata"]["review_invocation"] for event in self.events()
                        if event["event"] == "review_started"]
         self.assertEqual(invocations, [1, 2, 3])

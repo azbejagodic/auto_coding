@@ -33,6 +33,7 @@ from auto_coding.repository_ownership import assert_process_safe
 from auto_coding.launch_preflight import validate_feature_branch, configured_protected_branches
 from auto_coding.sensitive_paths import is_sensitive_path, changed_paths, CHANGE_PATH_OPTIONS
 from auto_coding.final_verification import verification_policy, policy_sha256, unittest_evidence
+from auto_coding import plan_audit
 
 
 MAX_PLAN = 512 * 1024
@@ -1408,7 +1409,7 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
         auto_push=None, retry_review_once=False,
         final_verification_config=None, controller_tests=None,
         model_a=None, model_b=None, timeout=1800,
-        execute: Callable = call) -> int:
+        execute: Callable = call, approved_audit=None) -> int:
     if retry_review_once and not resume:
         raise PilotError("One extra review call requires --resume and an exhausted review-ready checkpoint")
     if controller_tests is not None and type(controller_tests) is not bool:
@@ -1492,6 +1493,7 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
         events = EventLog(logs / "events.jsonl", run_id)
         events.emit("controller", "resume_started", "started")
         try:
+            plan_audit.verify_resume(sys.modules[__name__], state, manifest, repo, plan_sha, tasks)
             if state.get("pending_review") and state.get("pending_checkpoint"):
                 raise PilotError("Conflicting review and approved checkpoints")
             if state.get("status") == "completed" and state["completed"] != [task["id"] for task in tasks]:
@@ -1546,6 +1548,8 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
     else:
         if resume:
             raise PilotError("No existing state to resume")
+        audit_binding = plan_audit.authorize(sys.modules[__name__], approved_audit, repo,
+                                            plan_sha, tasks, requested_policy, controller_tests)
         manifest_path = logs / "run-manifest.json"
         timeline_path = logs / "events.jsonl"
         created = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -1588,17 +1592,19 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                         metadata={"reason": "dirty worktree preflight"})
             raise PilotError("New run requires a clean working tree; use a disposable project")
         initial_head = head(repo)
+        if audit_binding.get("initial_git_head", initial_head) != initial_head:
+            raise PilotError("Initial Git HEAD changed after plan audit authorization")
         state = {"repo": str(repo), "plan_sha256": plan_sha, "status": "initializing",
                  "completed": [], "current_task": None, "history": [], "pending_checkpoint": None,
                  "pending_review": None,
                  "created_utc": created, "run_id": run_id, "auto_push": auto_push, "branch": selected_branch,
-                 "initial_git_head": initial_head, "process_ownership": 1}
+                 "initial_git_head": initial_head, "process_ownership": 1, "plan_audit": audit_binding}
         manifest = {"run_id": run_id, "plan_sha256": plan_sha,
                     "task_ids": [t["id"] for t in tasks], "initial_git_head": initial_head,
-                    "start_time_utc": created, "target_repo": str(repo), "branch": selected_branch}
+                    "start_time_utc": created, "target_repo": str(repo), "branch": selected_branch,
+                    "plan_audit": audit_binding}
         bind_verification(state, manifest, requested_policy, controller_tests, resume=False)
-        if not manifest_path.exists():
-            save_json(manifest_path, manifest)
+        save_json(manifest_path, manifest)
         events = EventLog(timeline_path, run_id)
         if not events.seq:
             events.emit("controller", "run_started", "started", evidence={"manifest": "run-manifest.json"})
@@ -1663,6 +1669,11 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                 workflow_checked = True
                 events.emit("controller", "workflow_preflight_finished", "success", task_id=ident, attempt=attempt,
                             metadata={"reviewer_cli_checked": production, "native_storage_checked": production})
+            if not state["history"] and not state["completed"] and not reusing_implementation and state.get("plan_audit"):
+                if load_tasks(plan)[1] != plan_sha:
+                    raise PilotError("Plan changed after audit authorization; no implementation launched")
+                plan_audit.authorize(sys.modules[__name__], state["plan_audit"]["directory"], repo,
+                                     plan_sha, tasks, state["final_verification"], state["controller_tests"])
             events.emit("controller", "task_started", "started", task_id=ident, attempt=attempt)
             print(f"[{ident}] Codex A — attempt {attempt}", flush=True)
             state["status"] = "running"
@@ -1810,14 +1821,14 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
 @managed_job
 def run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False, attempts=3,
         model_a=None, model_b=None, timeout=1800, execute: Callable = call, auto_push=None,
-        retry_review_once=False, final_verification_config=None, controller_tests=None) -> int:
+        retry_review_once=False, final_verification_config=None, controller_tests=None, approved_audit=None) -> int:
     """Run while ensuring controlled exceptions after log creation are recorded."""
     try:
         return _run(plan, repo, logs, create_repo=create_repo, resume=resume,
                     attempts=attempts, model_a=model_a, model_b=model_b,
                     timeout=timeout, execute=execute, auto_push=auto_push,
                     retry_review_once=retry_review_once, final_verification_config=final_verification_config,
-                    controller_tests=controller_tests)
+                    controller_tests=controller_tests, approved_audit=approved_audit)
     except Exception as exc:
         log_dir = logs.resolve(strict=False)
         state_path = log_dir / "state.json"
@@ -1882,7 +1893,21 @@ def git_clean_staged(repo: Path) -> bool:
             and not git(repo, ["ls-files", "--others", "--exclude-standard"]))
 
 
+@managed_job
+def audit(plan: Path, repo: Path, logs: Path, *, model, timeout=300, goal="",
+          final_verification_config=None, controller_tests=None, execute: Callable = call):
+    """Audit only; never enter the A/B execution loop."""
+    try:
+        return plan_audit.audit(sys.modules[__name__], plan, repo, logs, model=model, timeout=timeout,
+                               goal=goal, final_verification_config=final_verification_config,
+                               controller_tests=controller_tests, execute=execute)
+    except (ValueError, KeyError, TypeError) as exc:
+        raise PilotError(f"Plan audit failed: {exc}") from exc
+
+
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    action = argv.pop(0) if argv and argv[0] in {"audit", "start"} else "start"
     parser = argparse.ArgumentParser(description="Simple Codex A/B coordinator (local checkpoints; explicit opt-in push)")
     parser.add_argument("plan", type=Path, help="TXT, MD, or simple JSON task file")
     parser.add_argument("--repo", required=True, type=Path, help="Git repository to modify")
@@ -1899,9 +1924,20 @@ def main(argv=None):
                         help="JSON verification policy for TXT/MD or legacy plans; saved for subsequent resume")
     parser.add_argument("--model-a")
     parser.add_argument("--model-b")
+    parser.add_argument("--approved-audit", type=Path, help="Explicitly authorize starting with this APPROVE report directory")
+    parser.add_argument("--audit-model", help="Independent explicit model for the one-shot audit (High reasoning)")
+    parser.add_argument("--audit-goal", default="", help="Optional overall goal for the complete plan audit")
     parser.add_argument("--auto-push-repository", help="Explicitly enable auto-push to this GitHub OWNER/REPO")
     parser.add_argument("--auto-push-branch", help="Fixed origin feature branch for approved checkpoints")
     args = parser.parse_args(argv)
+    if action == "audit" and (not args.audit_model or args.resume or args.create_repo or args.approved_audit
+                              or args.retry_review_once or args.auto_push_repository or args.auto_push_branch
+                              or args.model_a or args.model_b):
+        cancel_reservation(args.repo, os.environ.get("AUTOCODING_JOB_RESERVATION"))
+        parser.error("audit requires --audit-model and excludes run, resume, publication and A/B model options")
+    if action != "audit" and (args.audit_model or args.audit_goal):
+        cancel_reservation(args.repo, os.environ.get("AUTOCODING_JOB_RESERVATION"))
+        parser.error("--audit-model and --audit-goal require the audit command")
     if args.retry_review_once and not args.resume:
         cancel_reservation(args.repo, os.environ.get("AUTOCODING_JOB_RESERVATION"))
         parser.error("--retry-review-once requires --resume")
@@ -1922,11 +1958,15 @@ def main(argv=None):
             if not raw or len(raw) > MAX_PLAN:
                 raise PilotError("Final verification configuration must be nonempty and smaller than 512 KB")
             final_config = json.loads(raw.decode("utf-8-sig"))
+        if action == "audit":
+            return audit(args.plan, args.repo, args.logs, model=args.audit_model, goal=args.audit_goal,
+                         timeout=min(args.timeout, 1800), final_verification_config=final_config,
+                         controller_tests=args.controller_tests)
         return run(args.plan, args.repo, args.logs, create_repo=args.create_repo,
                    resume=args.resume, attempts=args.attempts, timeout=args.timeout,
                     retry_review_once=args.retry_review_once,
                    final_verification_config=final_config, controller_tests=args.controller_tests,
-                   model_a=args.model_a, model_b=args.model_b,
+                   model_a=args.model_a, model_b=args.model_b, approved_audit=args.approved_audit,
                    auto_push=({"repository": normalize_repository(args.auto_push_repository)[0],
                                "branch": args.auto_push_branch} if args.auto_push_repository else None))
     except (PilotError, WorkspaceError, OSError, UnicodeError, json.JSONDecodeError) as exc:

@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 from auto_coding import simple_run as runner
 from auto_coding.final_verification import unittest_evidence, verification_policy
 from auto_coding.repository_ownership import execution_lock
+from backend_fixtures import approved_plan_fixture
 
 
 PASSED = "Ran 2 tests in 0.002s\n\nOK\n"
@@ -78,6 +79,9 @@ class VerificationPolicyTests(unittest.TestCase):
 
 class FinalVerificationTests(unittest.TestCase):
     def setUp(self):
+        authorization = approved_plan_fixture()
+        authorization.__enter__()
+        self.addCleanup(authorization.__exit__, None, None, None)
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name).resolve()

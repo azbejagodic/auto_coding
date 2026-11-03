@@ -14,6 +14,7 @@ from auto_coding import workflow_preflight as preflight
 from auto_coding.reviewer_permissions import ReviewerEnvironmentError
 from auto_coding.repository_ownership import execution_lock
 import test_review_recovery as recovery
+from backend_fixtures import approved_plan_fixture
 
 
 def snapshot(repo):
@@ -156,7 +157,7 @@ class WorkflowLaunchTests(unittest.TestCase):
     def test_real_executor_path_reuses_b07_configuration_check_before_a(self):
         execute = recovery.FakeExecutor()
         execute.__wrapped__ = runner.call
-        with patch.object(runner, "check_cli", side_effect=ReviewerEnvironmentError("Legacy loaded configuration")) as checker, \
+        with approved_plan_fixture(), patch.object(runner, "check_cli", side_effect=ReviewerEnvironmentError("Legacy loaded configuration")) as checker, \
                 patch.object(runner, "probe_review_storage") as probe, \
                 contextlib.redirect_stdout(io.StringIO()), \
                 self.assertRaisesRegex(runner.PilotError, "reviewer compatibility.*Legacy"):

@@ -5,12 +5,26 @@ assertions. Final-gate failures and scheduling are tested with the real run API
 in test_final_verification, without this helper.
 """
 import json
+from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 from auto_coding import simple_run as runner
 
 
 FINAL_POLICY = {"test_commands": [["fixture-final-suite"]], "minimum_tests": 1, "timeout_seconds": 1800}
+
+
+@contextmanager
+def approved_plan_fixture():
+    """Mock only the B08 prerequisite in existing downstream A/B safety tests.
+
+    The real authorization gate is exercised independently in test_plan_audit.
+    Existing fixtures include legacy TXT plans and unborn disposable repositories.
+    """
+    with patch.object(runner.plan_audit, "authorize", return_value={"directory": "fixture-approved"}), \
+            patch.object(runner.plan_audit, "verify_resume"):
+        yield
 
 
 def run_with_verification(plan, repo, logs, **kwargs):
@@ -37,4 +51,5 @@ def run_with_verification(plan, repo, logs, **kwargs):
             return runner._CallResult(0, "Ran 1 test in 0.001s\n\nOK\n", False, True, True)
         return execute(argv, cwd, timeout, **options)
     kwargs["execute"] = with_final
-    return runner.run(plan, repo, logs, **kwargs)
+    with approved_plan_fixture():
+        return runner.run(plan, repo, logs, **kwargs)

@@ -1,0 +1,347 @@
+"""B08 authorization and one-shot audit regressions; no real model calls."""
+import contextlib
+import copy
+import hashlib
+import io
+import json
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+from unittest.mock import patch
+
+from auto_coding import simple_run as runner
+from auto_coding import plan_audit as audit
+from auto_coding.repository_ownership import execution_lock
+from auto_coding.reviewer_permissions import command_environment, ReviewerEnvironmentError
+from test_final_verification import Executor, POLICY
+
+
+class PlanAuditTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        self.git("init", "-b", "feature/audit")
+        self.git("config", "user.name", "Test")
+        self.git("config", "user.email", "test@example.invalid")
+        (self.repo / "seed.txt").write_text("seed")
+        self.git("add", "-A")
+        self.git("commit", "-m", "seed")
+        self.plan = self.root / "plan.json"
+        self.document = {"tasks": [{"id": "one", "prompt": "Implement app.py"},
+                                   {"id": "two", "prompt": "Complete app.py"}], "final_verification": POLICY}
+        self.plan.write_text(json.dumps(self.document))
+        self.logs, self.run_logs = self.root / "audit", self.root / "run"
+        self.calls = []
+        self.report = {"decision": "APPROVE", "summary": "Feasible ordered plan", "overall_risk": "low",
+                       "tasks": [{"task_id": key, "findings": ["Task requirements are specific"],
+                                  "recommended_changes": [], "blocking_issues": []}
+                                 for key in ("one", "two")], "recommended_changes": [], "blocking_issues": []}
+        self.result = runner._CallResult(0, "audit completed", False, True, True)
+
+    def git(self, *args):
+        return subprocess.run(["git", *args], cwd=self.repo, capture_output=True,
+                              text=True, check=True, timeout=15).stdout.strip()
+
+    def files(self):
+        return {str(p.relative_to(self.repo)): hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in self.repo.rglob("*") if p.is_file()}
+
+    def execute(self, argv, cwd, timeout, *, prompt):
+        self.calls.append((argv, cwd, timeout, prompt))
+        self.assertEqual(cwd, self.repo)
+        self.assertNotIn("--sandbox", argv)
+        self.assertIn('model_reasoning_effort="high"', argv)
+        self.assertEqual(argv[argv.index("--model") + 1], "fake-audit-model")
+        environment = command_environment(cwd)
+        self.assertEqual(environment["TEMP"], environment["TMP"])
+        self.assertEqual(environment["TMP"], environment["TMPDIR"])
+        self.assertEqual(Path(environment["PYTHONPATH"].split(__import__("os").pathsep)[0]), cwd)
+        ledger = audit.ledger_path(cwd, self.identity())
+        self.assertEqual(audit.read_json(ledger)["status"], "invoking")
+        answer = Path(argv[argv.index("--output-last-message") + 1])
+        answer.write_text(json.dumps(self.report) if isinstance(self.report, dict) else self.report)
+        if isinstance(self.result, BaseException):
+            raise self.result
+        return self.result
+
+    def identity(self):
+        return {"plan_sha256": runner.load_tasks(self.plan)[1], "target": audit.snapshot(runner, self.repo),
+                "verification_policy": POLICY}
+
+    def do_audit(self, **kwargs):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return runner.audit(self.plan, self.repo, self.logs, model="fake-audit-model",
+                                execute=self.execute, **kwargs)
+
+    def start(self, execute=None, **kwargs):
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            return runner.run(self.plan, self.repo, self.run_logs, execute=execute or Executor(), **kwargs)
+
+    def test_approve_durable_evidence_all_tasks_one_call_read_only(self):
+        before = self.files()
+        self.assertEqual(self.do_audit(), 0)
+        self.assertEqual(self.files(), before)
+        self.assertEqual(len(self.calls), 1)
+        self.assertIn(self.document["tasks"][0]["prompt"], self.calls[0][3])
+        self.assertIn(self.document["tasks"][1]["prompt"], self.calls[0][3])
+        evidence, report = audit.load_evidence(runner, self.logs, self.repo,
+                                              runner.load_tasks(self.plan)[1], ["one", "two"])
+        self.assertEqual(evidence["configuration"]["reasoning"], "high")
+        self.assertEqual(report["decision"], "APPROVE")
+        self.assertFalse((self.logs / "state.json").exists())
+        self.assertFalse(list(self.logs.glob("review-scratch-*")))
+
+    def test_unchanged_audit_reuses_report_without_call(self):
+        self.do_audit()
+        self.assertEqual(self.do_audit(), 0)
+        self.assertEqual(len(self.calls), 1)
+        with self.assertRaisesRegex(runner.PilotError, "different settings"):
+            self.do_audit(goal="changed goal")
+        self.assertEqual(len(self.calls), 1)
+
+    def test_start_requires_explicit_approval_and_cannot_resume_failed_start(self):
+        fake = Executor()
+        with self.assertRaisesRegex(runner.PilotError, "require an approved"):
+            self.start(fake)
+        with self.assertRaisesRegex(runner.PilotError, "No existing state"):
+            self.start(fake, resume=True)
+        self.assertEqual(fake.calls, [])
+
+    def test_approved_start_and_completed_resume_have_no_audit_call(self):
+        self.do_audit()
+        fake = Executor()
+        self.assertEqual(self.start(fake, approved_audit=self.logs), 0)
+        self.assertEqual(fake.calls, ["A", "B", "A", "B", "final"])
+        self.assertEqual(self.start(fake, resume=True), 0)
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(len(fake.calls), 5)
+
+    def test_review_only_resume_preserves_binding_and_does_not_audit(self):
+        self.do_audit()
+        first = Executor(reviews=[(1, "connection failed", False)] * 3)
+        with patch.object(runner, "_review_sleep"), patch.object(runner, "_review_clock", side_effect=range(1000, 1200, 20)):
+            self.assertEqual(self.start(first, approved_audit=self.logs), 1)
+        self.assertEqual(first.calls, ["A", "B", "B", "B"])
+        second = Executor(implementation="VERSION = 'second task'\n")
+        self.assertEqual(self.start(second, resume=True, retry_review_once=True), 0)
+        self.assertEqual(second.calls, ["B", "A", "B", "final"])
+        self.assertEqual(len(self.calls), 1)
+
+    def test_revise_blocks_start(self):
+        self.report.update(decision="REVISE", recommended_changes=["Specify observable acceptance criteria for task one"])
+        self.assertEqual(self.do_audit(), 1)
+        fake = Executor()
+        with self.assertRaisesRegex(runner.PilotError, "not APPROVE"):
+            self.start(fake, approved_audit=self.logs)
+        self.assertEqual(fake.calls, [])
+
+    def test_block_blocks_start(self):
+        self.report.update(decision="BLOCK", blocking_issues=["Task two depends on a missing external service"])
+        self.assertEqual(self.do_audit(), 1)
+        with self.assertRaises(runner.PilotError):
+            self.start(approved_audit=self.logs)
+
+    def test_malformed_output_consumes_single_invocation_and_never_approves(self):
+        self.report = "not JSON"
+        with self.assertRaises(runner.PilotError):
+            self.do_audit()
+        with self.assertRaisesRegex(runner.PilotError, "already reserved"):
+            self.do_audit()
+        with self.assertRaises(runner.PilotError):
+            self.start(approved_audit=self.logs)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_contradictory_or_incomplete_verdicts_are_invalid(self):
+        invalid = []
+        value = copy.deepcopy(self.report); value["blocking_issues"] = ["real blocker"]; invalid.append(value)
+        value = copy.deepcopy(self.report); value["tasks"][1]["task_id"] = "one"; invalid.append(value)
+        value = copy.deepcopy(self.report); value["decision"] = "APPROVED"; invalid.append(value)
+        value = copy.deepcopy(self.report); value["decision"] = "REVISE"; invalid.append(value)
+        value = copy.deepcopy(self.report); value["tasks"][0]["findings"] = []; invalid.append(value)
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                audit.validate_report(value, ["one", "two"])
+
+    def test_verified_timeout_is_not_approval_and_releases_job_lock(self):
+        self.result = runner._CallResult(124, "timeout diagnostics", True, True, True)
+        with self.assertRaisesRegex(runner.PilotError, "process failed"):
+            self.do_audit()
+        self.assertFalse(execution_lock(self.repo, ".job.lock").exists())
+        self.assertFalse((self.logs / "audit-evidence.json").exists())
+        self.assertIn("timeout diagnostics", (self.logs / "audit-output.txt").read_text())
+
+    def test_unverified_cleanup_preserves_workspace_protection(self):
+        self.result = runner._CallResult(0, "parent exited", False, False, True)
+        with self.assertRaisesRegex(runner.PilotError, "cleanup unverified"):
+            self.do_audit()
+        self.assertTrue(execution_lock(self.repo, ".job.lock").exists())
+        self.assertTrue(execution_lock(self.repo, ".process-uncertain.json").exists())
+        self.assertTrue(list(self.logs.glob("review-scratch-*")))
+        with self.assertRaisesRegex(OSError, "unverified"):
+            self.start(approved_audit=self.logs)
+
+    def test_changed_plan_invalidates_approval(self):
+        self.do_audit()
+        self.plan.write_text(self.plan.read_text() + "\n")
+        with self.assertRaisesRegex(runner.PilotError, "mismatch"):
+            self.start(approved_audit=self.logs)
+
+    def test_changed_head_invalidates_approval(self):
+        self.do_audit()
+        self.git("commit", "--allow-empty", "-m", "changed")
+        with self.assertRaisesRegex(runner.PilotError, "initial target"):
+            self.start(approved_audit=self.logs)
+
+    def test_unstaged_and_untracked_changes_invalidate_approval(self):
+        self.do_audit()
+        for path in ("seed.txt", "unexpected.txt"):
+            before = self.repo / path
+            before.write_text("changed")
+            with self.subTest(path=path), self.assertRaisesRegex(runner.PilotError, "clean target"):
+                self.start(approved_audit=self.logs)
+            if path == "seed.txt":
+                before.write_text("seed")
+            else:
+                before.unlink()
+
+    def test_report_tampering_is_detected(self):
+        self.do_audit()
+        value = audit.read_json(self.logs / "audit-report.json")
+        value["summary"] = "tampered"
+        runner.save_json(self.logs / "audit-report.json", value)
+        with self.assertRaisesRegex(runner.PilotError, "report changed"):
+            self.start(approved_audit=self.logs)
+
+    def test_resume_cannot_drop_one_saved_audit_binding(self):
+        self.do_audit()
+        self.assertEqual(self.start(approved_audit=self.logs), 0)
+        path = self.run_logs / "state.json"
+        state = audit.read_json(path)
+        del state["plan_audit"]
+        runner.save_json(path, state)
+        with self.assertRaisesRegex(runner.PilotError, "Saved plan audit"):
+            self.start(resume=True)
+
+    def test_preflight_failure_spends_no_model_call(self):
+        with patch.object(runner, "workflow_preflight", side_effect=ReviewerEnvironmentError("legacy sandbox conflict")):
+            with self.assertRaisesRegex(runner.PilotError, "legacy sandbox"):
+                self.do_audit()
+        self.assertEqual(self.calls, [])
+
+    def test_confirmed_launch_failure_is_diagnostic_not_approval(self):
+        failure = OSError("audit executable unavailable")
+        failure.process_started = False
+        self.result = failure
+        with self.assertRaisesRegex(OSError, "executable unavailable"):
+            self.do_audit()
+        self.assertFalse(execution_lock(self.repo, ".job.lock").exists())
+        self.assertFalse((self.logs / "audit-evidence.json").exists())
+        with self.assertRaisesRegex(runner.PilotError, "already reserved"):
+            self.do_audit()
+        self.assertEqual(len(self.calls), 1)
+
+    def test_uncertain_preflight_retains_workspace_protection_without_audit_call(self):
+        failure = OSError("native probe cleanup uncertain")
+        failure.process_started = True
+        failure.cleanup_confirmed = False
+        with patch.object(runner, "workflow_preflight", side_effect=failure):
+            with self.assertRaisesRegex(OSError, "native probe"):
+                self.do_audit()
+        self.assertEqual(self.calls, [])
+        self.assertTrue(execution_lock(self.repo, ".process-uncertain.json").exists())
+
+    def test_scratch_removal_failure_does_not_claim_uncertain_process_cleanup(self):
+        from auto_coding.reviewer_permissions import ReviewPermissions
+        original = ReviewPermissions.cleanup
+        def cleanup(spec):
+            if self.calls:
+                raise PermissionError("scratch ACL prevents removal")
+            return original(spec)
+        with patch.object(ReviewPermissions, "cleanup", cleanup):
+            self.assertEqual(self.do_audit(), 0)
+        self.assertFalse(execution_lock(self.repo, ".job.lock").exists())
+        self.assertFalse(execution_lock(self.repo, ".process-uncertain.json").exists())
+        events = [json.loads(line) for line in (self.logs / "events.jsonl").read_text().splitlines()]
+        self.assertTrue(any(event["event"] == "plan_audit_scratch_retained" for event in events))
+
+    def test_legacy_completed_run_recovers_without_audit_invocation(self):
+        self.do_audit()
+        self.start(approved_audit=self.logs)
+        # A pre-B08 completed state has neither of the new optional bindings.
+        for name in ("state.json", "run-manifest.json"):
+            path = self.run_logs / name
+            record = audit.read_json(path)
+            del record["plan_audit"]
+            runner.save_json(path, record)
+        fake = Executor()
+        with patch.object(runner, "audit", side_effect=AssertionError("No resume audit")):
+            self.assertEqual(self.start(fake, resume=True), 0)
+        self.assertEqual(fake.calls, [])
+
+    def test_changed_verification_policy_and_audit_evidence_are_rejected(self):
+        self.do_audit()
+        evidence_path = self.logs / "audit-evidence.json"
+        value = audit.read_json(evidence_path)
+        value["configuration"]["model"] = "another-model"
+        runner.save_json(evidence_path, value)
+        with self.assertRaisesRegex(runner.PilotError, "evidence was altered"):
+            self.start(approved_audit=self.logs)
+
+    def test_changed_controller_testing_mode_invalidates_approval(self):
+        self.do_audit()
+        fake = Executor()
+        with self.assertRaisesRegex(runner.PilotError, "configuration"):
+            self.start(fake, approved_audit=self.logs, controller_tests=True)
+        self.assertEqual(fake.calls, [])
+
+    def test_matching_controller_testing_mode_starts(self):
+        self.assertEqual(self.do_audit(controller_tests=True), 0)
+        fake = Executor()
+        self.assertEqual(self.start(fake, approved_audit=self.logs, controller_tests=True), 0)
+        self.assertEqual(fake.calls, ["A", "B", "A", "B", "final"])
+
+    def test_change_during_preflight_is_rechecked_before_first_a(self):
+        self.do_audit()
+        original = runner.workflow_preflight
+        def changed(*args, **kwargs):
+            original(*args, **kwargs)
+            (self.repo / "unexpected.txt").write_text("external change")
+        fake = Executor()
+        with patch.object(runner, "workflow_preflight", side_effect=changed):
+            with self.assertRaisesRegex(runner.PilotError, "clean target"):
+                self.start(fake, approved_audit=self.logs)
+        self.assertEqual(fake.calls, [])
+
+    def test_different_target_cannot_reuse_approval(self):
+        self.do_audit()
+        other = self.root / "other"
+        subprocess.run(["git", "clone", "--no-hardlinks", str(self.repo), str(other)],
+                       check=True, capture_output=True, timeout=20)
+        with self.assertRaisesRegex(runner.PilotError, "repository.*mismatch"):
+            runner.run(self.plan, other, self.run_logs, execute=Executor(), approved_audit=self.logs)
+
+    def test_large_plan_context_is_rejected_not_truncated(self):
+        self.document["tasks"][0]["prompt"] = "x" * (audit.MAX_CONTEXT + 1)
+        self.plan.write_text(json.dumps(self.document))
+        with self.assertRaises(runner.PilotError):
+            self.do_audit()
+        self.assertEqual(self.calls, [])
+
+    def test_cli_audit_and_start_are_separate(self):
+        common = [str(self.plan), "--repo", str(self.repo), "--logs", str(self.logs)]
+        with patch.object(runner.shutil, "which", return_value="codex"), \
+                patch.object(runner, "audit", return_value=0) as auditor, \
+                patch.object(runner, "run", return_value=0) as run:
+            self.assertEqual(runner.main(["audit", *common, "--audit-model", "chosen-model"]), 0)
+            run.assert_not_called()
+            self.assertEqual(auditor.call_args.kwargs["model"], "chosen-model")
+            self.assertEqual(runner.main(["start", *common, "--approved-audit", str(self.logs)]), 0)
+            self.assertEqual(run.call_args.kwargs["approved_audit"], self.logs)
+
+
+if __name__ == "__main__":
+    unittest.main()

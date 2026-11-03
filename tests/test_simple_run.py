@@ -125,7 +125,15 @@ class SimpleRunnerTests(unittest.TestCase):
         self.assertEqual(state['completed'], ['task-1'])
         self.assertEqual(state['status'], 'completed')
         self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[1][0][calls[1][0].index('--sandbox') + 1], 'read-only')
+        reviewer_argv = calls[1][0]
+        self.assertNotIn('--sandbox', reviewer_argv)
+        self.assertIn('--strict-config', reviewer_argv)
+        self.assertEqual(reviewer_argv[reviewer_argv.index('--cd') + 1], str(self.repo.resolve()))
+        settings = [value for index, value in enumerate(reviewer_argv) if reviewer_argv[index - 1] == '-c']
+        self.assertTrue(any(value.startswith('default_permissions="auto_coding_review_') for value in settings))
+        self.assertTrue(any('extends=":read-only"' in value and 'network={enabled=false}' in value
+                            and f'{json.dumps(self.repo.resolve().as_posix())}= "read"' in value
+                            and '= "write"' in value for value in settings))
         for policy in ('substantive, reproducible blockers', 'CURRENT task/slice',
                        'List ALL such blockers', 'optional polish', 'non-blocking suggestions'):
             self.assertIn(policy, calls[1][1])
