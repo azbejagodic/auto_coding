@@ -31,16 +31,21 @@ class FakeExecutor:
         self.b_calls = 0
         self.a_prompts = []
         self.b_prompts = []
+        self.a_timeouts = []
+        self.b_timeouts = []
+        self.test_timeouts = []
 
     def __call__(self, argv, cwd, timeout, *, prompt=None):
         if argv[0] == "fake-test":
             if self.review_only:
                 raise AssertionError("Verified tests must not rerun")
             self.test_calls += 1
+            self.test_timeouts.append(timeout)
             return 0, "tests passed", False
         answer = Path(argv[argv.index("--output-last-message") + 1])
         if "--output-schema" in argv:
             self.b_calls += 1
+            self.b_timeouts.append(timeout)
             self.b_prompts.append(prompt)
             response = self.responses.pop(0) if self.responses else APPROVED
             if isinstance(response, tuple):
@@ -53,6 +58,7 @@ class FakeExecutor:
         if self.review_only:
             raise AssertionError("Codex A must not rerun")
         self.a_calls += 1
+        self.a_timeouts.append(timeout)
         self.a_prompts.append(prompt)
         (cwd / "app.txt").write_text(f"implementation {self.a_calls}", encoding="utf-8")
         answer.write_text("done", encoding="utf-8")
@@ -86,9 +92,9 @@ class ReviewRecoveryTests(unittest.TestCase):
         self.retry_delays.append(seconds)
         self.retry_now += seconds
 
-    def run_fake(self, fake, *, resume=False, retry_review_once=False):
+    def run_fake(self, fake, *, resume=False, retry_review_once=False, **kwargs):
         return run(self.plan, self.repo, self.logs, resume=resume, execute=fake,
-                   retry_review_once=retry_review_once)
+                   retry_review_once=retry_review_once, **kwargs)
 
     def state(self):
         return json.loads((self.logs / "state.json").read_text(encoding="utf-8"))
@@ -114,6 +120,8 @@ class ReviewRecoveryTests(unittest.TestCase):
         fake = FakeExecutor()
         self.assertEqual(self.run_fake(fake), 0)
         self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (1, 1, 1))
+        self.assertEqual(fake.a_timeouts, [1800])
+        self.assertEqual(fake.b_timeouts, [1800])
         state = self.state()
         self.assertEqual(state["completed"], ["one"])
         self.assertIsNone(state["pending_review"])
@@ -126,6 +134,13 @@ class ReviewRecoveryTests(unittest.TestCase):
             self.assertIsNone(metrics[role]["usage"])
         self.assertEqual(metrics["correction_attempts"], 0)
         self.assertEqual(metrics["review_retries"], 0)
+
+    def test_omitted_review_timeout_inherits_custom_implementation_timeout(self):
+        fake = FakeExecutor()
+        self.assertEqual(self.run_fake(fake, timeout=75), 0)
+        self.assertEqual(fake.a_timeouts, [75])
+        self.assertEqual(fake.b_timeouts, [75])
+        self.assertEqual(fake.test_timeouts, [1800])
 
     def test_connection_failure_retries_only_b(self):
         fake = FakeExecutor([1, APPROVED])
@@ -140,7 +155,7 @@ class ReviewRecoveryTests(unittest.TestCase):
         first = FakeExecutor([1])
         self.retry_sleep.side_effect = RuntimeError("application restarted during wait")
         with self.assertRaisesRegex(RuntimeError, "restarted"):
-            self.run_fake(first)
+            self.run_fake(first, timeout=90, review_timeout=240)
         saved = self.state()["pending_review"]
         self.assertEqual(saved["review_invocations"], 1)
         self.assertEqual(saved["review_retry_after"], 1005.0)
@@ -148,9 +163,12 @@ class ReviewRecoveryTests(unittest.TestCase):
         self.retry_now += 2
         self.retry_sleep.side_effect = self.advance_retry_clock
         resumed = FakeExecutor([1, APPROVED], review_only=True)
-        self.assertEqual(self.run_fake(resumed, resume=True), 0)
+        self.assertEqual(self.run_fake(resumed, resume=True, timeout=90, review_timeout=240), 0)
         self.assertEqual((first.a_calls, first.test_calls, first.b_calls), (1, 1, 1))
         self.assertEqual((resumed.a_calls, resumed.test_calls, resumed.b_calls), (0, 0, 2))
+        self.assertEqual(first.a_timeouts, [90])
+        self.assertEqual(first.b_timeouts, [240])
+        self.assertEqual(resumed.b_timeouts, [240, 240])
         self.assertEqual(self.retry_delays, [3.0, 15.0])
         # B07 creates a fresh writable scratch per reviewer invocation. The
         # review request itself and its target context must survive restart.
@@ -331,8 +349,10 @@ class ReviewRecoveryTests(unittest.TestCase):
 
     def test_rejection_corrects_with_fresh_tests_and_review(self):
         fake = FakeExecutor([REJECTED, APPROVED])
-        self.assertEqual(self.run_fake(fake), 0)
+        self.assertEqual(self.run_fake(fake, timeout=90, review_timeout=240), 0)
         self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (2, 2, 2))
+        self.assertEqual(fake.a_timeouts, [90, 90])
+        self.assertEqual(fake.b_timeouts, [240, 240])
         self.assertEqual(self.retry_delays, [])
         self.assertIn("Fix the implementation", fake.a_prompts[1])
         self.assertEqual(self.metrics()["correction_attempts"], 1)
@@ -626,8 +646,9 @@ class ReviewRecoveryTests(unittest.TestCase):
                 result.cleanup_confirmed = False
                 return result
         fake = FakeExecutor([UncertainResult()])
-        self.assertEqual(self.run_fake(fake), 1)
+        self.assertEqual(self.run_fake(fake, timeout=90, review_timeout=240), 1)
         self.assertEqual(fake.b_calls, 1)
+        self.assertEqual(fake.b_timeouts, [240])
         self.assertTrue(self.state()["pending_review"]["process_uncertain"])
         self.assertEqual(self.retry_delays, [])
         with self.assertRaisesRegex(OSError, "cleanup remains unverified"):
@@ -642,8 +663,11 @@ class ReviewRecoveryTests(unittest.TestCase):
                 result.cleanup_confirmed = True
                 return result
         fake = FakeExecutor([ConfirmedTimeout(), APPROVED])
-        self.assertEqual(self.run_fake(fake), 0)
+        self.assertEqual(self.run_fake(fake, timeout=90, review_timeout=240), 0)
         self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (1, 1, 2))
+        self.assertEqual(fake.a_timeouts, [90])
+        self.assertEqual(fake.b_timeouts, [240, 240])
+        self.assertEqual(fake.test_timeouts, [1800])
         self.assertEqual(self.retry_delays, [5.0])
         retry = next(event for event in self.events() if event["event"] == "review_retry")
         self.assertEqual(retry["metadata"]["failure_kind"], "timeout")
@@ -843,6 +867,47 @@ class CorrectionContextTests(unittest.TestCase):
             self.assertEqual(checked_review(verdict_path), REJECTED)
             verdict_path.write_text(json.dumps(APPROVED), encoding="utf-8")
             self.assertEqual(checked_review(verdict_path), APPROVED)
+
+
+class ReviewTimeoutCliTests(unittest.TestCase):
+    def test_separate_review_timeout_reaches_runner_at_existing_bounds(self):
+        argv = ["tasks.json", "--repo", "project", "--logs", "logs", "--timeout", "90"]
+        with patch.object(runner, "run", return_value=0) as execute, \
+                patch.object(runner.shutil, "which", return_value="codex"):
+            for seconds in (30, 240, 86400):
+                with self.subTest(seconds=seconds):
+                    self.assertEqual(runner.main(argv + ["--review-timeout", str(seconds)]), 0)
+                    self.assertEqual(execute.call_args.kwargs["timeout"], 90)
+                    self.assertEqual(execute.call_args.kwargs["review_timeout"], seconds)
+
+    def test_omitted_review_timeout_leaves_inheritance_to_runner(self):
+        argv = ["tasks.json", "--repo", "project", "--logs", "logs", "--timeout", "75"]
+        with patch.object(runner, "run", return_value=0) as execute, \
+                patch.object(runner.shutil, "which", return_value="codex"):
+            self.assertEqual(runner.main(argv), 0)
+            self.assertEqual(execute.call_args.kwargs["timeout"], 75)
+            self.assertIsNone(execute.call_args.kwargs["review_timeout"])
+
+    def test_invalid_review_timeout_stops_before_execution(self):
+        argv = ["tasks.json", "--repo", "project", "--logs", "logs", "--review-timeout"]
+        with patch.object(runner, "run") as execute, \
+                patch.object(runner, "cancel_reservation"), redirect_stderr(io.StringIO()):
+            for value in ("29", "86401", "not-an-integer"):
+                with self.subTest(value=value), self.assertRaises(SystemExit) as invalid:
+                    runner.main(argv + [value])
+                self.assertEqual(invalid.exception.code, 2)
+            execute.assert_not_called()
+
+    def test_review_timeout_does_not_change_plan_audit_timeout(self):
+        argv = ["audit", "tasks.json", "--repo", "project", "--logs", "logs",
+                "--audit-model", "explicit-model", "--timeout", "3600", "--review-timeout", "240"]
+        with patch.object(runner, "audit", return_value=0) as audit, \
+                patch.object(runner, "run") as execute, \
+                patch.object(runner.shutil, "which", return_value="codex"):
+            self.assertEqual(runner.main(argv), 0)
+            self.assertEqual(audit.call_args.kwargs["timeout"], 1800)
+            self.assertNotIn("review_timeout", audit.call_args.kwargs)
+            execute.assert_not_called()
 
 
 class ReviewRetryCliTests(unittest.TestCase):

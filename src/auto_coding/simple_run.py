@@ -1547,8 +1547,9 @@ def final_verification(repo, logs, state, state_path, events, execute, tasks):
 def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False, attempts=3,
         auto_push=None, retry_review_once=False,
         final_verification_config=None, controller_tests=None,
-        model_a=None, model_b=None, timeout=1800,
+        model_a=None, model_b=None, timeout=1800, review_timeout=None,
         execute: Callable = call, approved_audit=None) -> int:
+    review_timeout = timeout if review_timeout is None else review_timeout
     if retry_review_once and not resume:
         raise PilotError("One extra review call requires --resume and an exhausted review-ready checkpoint")
     if controller_tests is not None and type(controller_tests) is not bool:
@@ -1766,7 +1767,7 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
             if state["pending_review"].get("task") != ident:
                 raise PilotError("Review-ready task is out of sequence")
             outcome = review_ready_task(repo, logs, state, state_path, events, task,
-                                        schema_path, execute, timeout, model_b,
+                                        schema_path, execute, review_timeout, model_b,
                                         retry_review_once=retry_review_once)
             if outcome == "stopped":
                 return 1
@@ -1939,7 +1940,7 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
             state["status"] = "stopped"
             save_json(state_path, state)
             outcome = review_ready_task(repo, logs, state, state_path, events, task,
-                                        schema_path, execute, timeout, model_b)
+                                        schema_path, execute, review_timeout, model_b)
             if outcome == "stopped":
                 return 1
             if outcome == "approved":
@@ -1965,13 +1966,13 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
 
 @managed_job
 def run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False, attempts=3,
-        model_a=None, model_b=None, timeout=1800, execute: Callable = call, auto_push=None,
+        model_a=None, model_b=None, timeout=1800, review_timeout=None, execute: Callable = call, auto_push=None,
         retry_review_once=False, final_verification_config=None, controller_tests=None, approved_audit=None) -> int:
     """Run while ensuring controlled exceptions after log creation are recorded."""
     try:
         return _run(plan, repo, logs, create_repo=create_repo, resume=resume,
                     attempts=attempts, model_a=model_a, model_b=model_b,
-                    timeout=timeout, execute=execute, auto_push=auto_push,
+                    timeout=timeout, review_timeout=review_timeout, execute=execute, auto_push=auto_push,
                     retry_review_once=retry_review_once, final_verification_config=final_verification_config,
                     controller_tests=controller_tests, approved_audit=approved_audit)
     except Exception as exc:
@@ -2062,7 +2063,10 @@ def main(argv=None):
     parser.add_argument("--retry-review-once", action="store_true",
                         help="With --resume, authorize one additional Codex B call after its saved budget is exhausted")
     parser.add_argument("--attempts", type=int, default=3)
-    parser.add_argument("--timeout", type=int, default=1800, help="Codex A/B process timeout in seconds")
+    parser.add_argument("--timeout", type=int, default=1800,
+                        help="Codex A process timeout in seconds; also used for B unless --review-timeout is set")
+    parser.add_argument("--review-timeout", type=int,
+                        help="Codex B process timeout in seconds (defaults to --timeout)")
     parser.add_argument("--controller-tests", action="store_true", default=None,
                         help="Opt in to controller-managed per-task focused checks; fixed across resume")
     parser.add_argument("--final-verification-config", type=Path,
@@ -2089,7 +2093,8 @@ def main(argv=None):
     if bool(args.auto_push_repository) != bool(args.auto_push_branch):
         cancel_reservation(args.repo, os.environ.get("AUTOCODING_JOB_RESERVATION"))
         parser.error("Auto-push requires both repository and feature branch")
-    if not 1 <= args.attempts <= 10 or not 30 <= args.timeout <= 86400:
+    if (not 1 <= args.attempts <= 10 or not 30 <= args.timeout <= 86400
+            or (args.review_timeout is not None and not 30 <= args.review_timeout <= 86400)):
         cancel_reservation(args.repo, os.environ.get("AUTOCODING_JOB_RESERVATION"))
         parser.error("invalid attempts or timeout")
     if shutil.which("codex") is None:
@@ -2108,7 +2113,7 @@ def main(argv=None):
                          timeout=min(args.timeout, 1800), final_verification_config=final_config,
                          controller_tests=args.controller_tests)
         return run(args.plan, args.repo, args.logs, create_repo=args.create_repo,
-                   resume=args.resume, attempts=args.attempts, timeout=args.timeout,
+                   resume=args.resume, attempts=args.attempts, timeout=args.timeout, review_timeout=args.review_timeout,
                     retry_review_once=args.retry_review_once,
                    final_verification_config=final_config, controller_tests=args.controller_tests,
                    model_a=args.model_a, model_b=args.model_b, approved_audit=args.approved_audit,
