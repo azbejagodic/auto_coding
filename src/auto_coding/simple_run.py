@@ -748,11 +748,18 @@ def review_prompt_for(task: dict, stat: str, diff: str, tests: list[dict], imple
                     "behavior for regressions introduced by the fixes. Report all remaining or newly discovered "
                     "issues together. Do not automatically approve solely because these findings were fixed.\n"
                     + "\n".join(f"- {issue}" for issue in issues))
-    return ("You are Codex B, an independent READ-ONLY reviewer. Inspect the current "
+    return ("You are Codex B, an independent READ-ONLY reviewer. Start with the complete "
+        "current-task Git diff and TASK requirements below. Inspect all staged changes in the repository "
+        "even if the embedded DIFF is truncated. Inspect the current "
         "task's entire implementation: STAGED diff, affected behavior, relevant project files and tests, "
-        "error paths, and important state transitions. Stay within this task's scope; do not audit unrelated "
+        "error paths, and important state transitions. Inspect surrounding code, dependencies and relevant "
+        "tests when needed to establish correctness. Review all significant changes and affected behavior. "
+        "Stay within this task's scope; do not investigate unrelated "
         "repository code. Previous tasks are locally "
-        "committed. Do not blindly trust implementer claims or test results. Reject only for "
+        "committed. Do not blindly trust implementer claims or test results; never approve solely on those "
+        "claims. Avoid rerunning passing tests without a concrete reason; do not run the full test suite by "
+        "default. If test evidence is insufficient or suspicious, independently investigate with minimal "
+        "relevant checks where feasible. Reject only for "
         "substantive, reproducible blockers in the CURRENT task/slice. Do not stop reviewing after the first "
         "blocking bug; continue through the remaining affected functionality. Report EVERY distinct actionable "
         "issue discovered together in one verdict, with no fixed finding count. Include correctness bugs, "
@@ -1195,8 +1202,13 @@ def implementation_attempt(repo, logs, state, state_path, events, task, attempt,
         save_json(state_path, state)
     developer_msg = ("Implement this task in the current Git repository. You may create the normal "
         "source files you need INSIDE this repository. Do not change Git history, push, "
-        "read secrets, or modify files outside it. Run appropriate tests and fix code issues "
-        "before finishing. State exactly what you changed and tested.\n\nTASK:\n" + task["prompt"])
+        "read secrets, or modify files outside it. Implement only this task and necessary related changes. "
+        "Run focused tests relevant to modified behavior. Avoid the full test suite during individual tasks "
+        "unless explicitly required or justified, and do not rerun unchanged passing tests unnecessarily. "
+        "Before finishing, inspect the complete current-task Git diff, including staged and unstaged changes, "
+        "and any untracked new files for mistakes, regressions, unintended changes and unmet requirements. "
+        "Fix confirmed problems and rerun affected tests where needed. Report actual test commands, results "
+        "and remaining limitations.\n\nTASK:\n" + task["prompt"])
     feedback = correction_context([h for h in state["history"] if h.get("task") == ident])
     if feedback:
         developer_msg += "\n\nPREVIOUS FAILURE OR REVIEW FEEDBACK:\n" + feedback

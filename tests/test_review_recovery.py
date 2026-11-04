@@ -398,6 +398,21 @@ class ReviewRecoveryTests(unittest.TestCase):
             self.assertIn(text, prompt)
         self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (1, 1, 1))
 
+    def test_implementer_prompt_limits_scope_and_requires_focused_verification_and_diff_review(self):
+        fake = FakeExecutor()
+        self.assertEqual(self.run_fake(fake), 0)
+        prompt = fake.a_prompts[0]
+        for text in ("only this task and necessary related changes", "focused tests relevant to modified behavior",
+                     "Avoid the full test suite during individual tasks", "unless explicitly required or justified",
+                     "do not rerun unchanged passing tests unnecessarily", "complete current-task Git diff",
+                     "staged and unstaged changes", "untracked new files", "mistakes, regressions, unintended changes",
+                     "unmet requirements", "Fix confirmed problems and rerun affected tests where needed",
+                     "Report actual test commands, results and remaining limitations"):
+            self.assertIn(text, prompt)
+        for text in ("Do not change Git history, push", "read secrets, or modify files outside it"):
+            self.assertIn(text, prompt)
+        self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (1, 1, 1))
+
     def test_reviewer_must_continue_past_first_blocker_and_cover_affected_paths(self):
         fake = FakeExecutor()
         self.assertEqual(self.run_fake(fake), 0)
@@ -409,6 +424,19 @@ class ReviewRecoveryTests(unittest.TestCase):
                      "never omit independent defects", "confirmed defects from speculative concerns",
                      "code location", "impact", "Approve only if", "Stay within this task's scope"):
             self.assertIn(text, prompt)
+        for text in ("Start with the complete current-task Git diff and TASK requirements",
+                     "Inspect all staged changes in the repository", "surrounding code, dependencies and relevant tests",
+                     "Review all significant changes and affected behavior", "do not investigate unrelated",
+                     "Avoid rerunning passing tests without a concrete reason", "do not run the full test suite by default",
+                     "test evidence is insufficient or suspicious", "minimal relevant checks where feasible",
+                     "never approve solely on those claims"):
+            self.assertIn(text, prompt)
+
+    def test_reviewer_prompt_keeps_full_staged_diff_access_when_excerpt_is_truncated(self):
+        prompt = runner.review_prompt_for({"prompt": "Implement one", "test_commands": []}, "", "x" * 35001, [])
+        self.assertIn("Inspect all staged changes in the repository even if the embedded DIFF is truncated", prompt)
+        self.assertIn("DIFF (truncated; inspect repository for full):", prompt)
+        self.assertNotIn("x" * 35001, prompt)
 
     def test_complete_multi_issue_verdict_reaches_a_and_next_b_without_extra_calls(self):
         issues = ["app.txt:12 reset returns stale data; reproduce with reset twice; clear state",
