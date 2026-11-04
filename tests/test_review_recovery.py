@@ -954,6 +954,249 @@ class CorrectionContextTests(unittest.TestCase):
             self.assertEqual(checked_review(verdict_path), APPROVED)
 
 
+class AgentCallBudgetTests(unittest.TestCase):
+    def setUp(self):
+        self.fixture = ReviewRecoveryTests("test_successful_a_tests_b_commit")
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        self.repo, self.logs, self.plan = self.fixture.repo, self.fixture.logs, self.fixture.plan
+
+    def run_fake(self, fake, **kwargs):
+        return self.fixture.run_fake(fake, **kwargs)
+
+    def state(self):
+        return self.fixture.state()
+
+    def reservations(self):
+        return [event for event in self.fixture.events()
+                if (event["actor"], event["event"]) in {
+                    ("Codex A", "process_started"), ("Codex B", "review_started")}]
+
+    def test_shared_limit_reserves_before_launch_and_excludes_tests_and_git(self):
+        fake = FakeExecutor()
+        def execute(argv, cwd, timeout, *, prompt=None):
+            if "--output-last-message" in argv:
+                self.assertEqual(len(self.reservations()), fake.a_calls + fake.b_calls + 1)
+            return fake(argv, cwd, timeout, prompt=prompt)
+        self.assertEqual(self.run_fake(execute, max_agent_calls=2), 0)
+        self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (1, 1, 1))
+        self.assertEqual(len(self.reservations()), 2)
+        self.assertEqual(self.state()["completed"], ["one"])
+        self.assertIsNone(self.fixture.metrics()["codex_a"]["usage"])
+        self.assertIsNone(self.fixture.metrics()["codex_b"]["usage"])
+
+    def test_pending_reviewer_stops_at_limit_and_resume_cannot_reset_it(self):
+        fake = FakeExecutor()
+        self.assertEqual(self.run_fake(fake, max_agent_calls=1), 1)
+        self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (1, 1, 0))
+        self.assertEqual(self.state()["pending_review"]["review_invocations"], 0)
+        self.assertEqual(self.state()["completed"], [])
+        self.assertIsNone(self.state()["pending_checkpoint"])
+        resumed = FakeExecutor(review_only=True)
+        for options in ({}, {"max_agent_calls": 1}):
+            self.assertEqual(self.run_fake(resumed, resume=True, **options), 1)
+        self.assertEqual((resumed.a_calls, resumed.test_calls, resumed.b_calls), (0, 0, 0))
+        self.assertEqual(len(self.reservations()), 1)
+        self.assertEqual(self.state()["max_agent_calls"], 1)
+        self.assertEqual(self.fixture.events()[-1]["metadata"]["reason"], "agent call budget exhausted")
+
+    def test_exhaustion_retains_prior_approved_commits(self):
+        self.plan.write_text(json.dumps({"tasks": [
+            {"id": "one", "prompt": "First", "test_commands": [["fake-test"]]},
+            {"id": "two", "prompt": "Second", "test_commands": [["fake-test"]]}]}), encoding="utf-8")
+        fake = FakeExecutor()
+        self.assertEqual(self.run_fake(fake, max_agent_calls=2), 1)
+        self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (1, 1, 1))
+        state = self.state()
+        self.assertEqual(state["completed"], ["one"])
+        approved = state["history"][0]["commit"]
+        self.assertEqual(runner.head(self.repo), approved)
+        self.assertEqual(state["pending_execution"]["phase"], "unstarted")
+        resumed = FakeExecutor(review_only=True)
+        self.assertEqual(self.run_fake(resumed, resume=True), 1)
+        self.assertEqual((resumed.a_calls, resumed.test_calls, resumed.b_calls), (0, 0, 0))
+        self.assertEqual(runner.head(self.repo), approved)
+        self.assertEqual(len(self.reservations()), 2)
+
+    def test_infrastructure_retries_spend_shared_budget(self):
+        fake = FakeExecutor([1, 1, APPROVED])
+        self.assertEqual(self.run_fake(fake, max_agent_calls=3, review_timeout=240), 1)
+        self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (1, 1, 2))
+        self.assertEqual(fake.b_timeouts, [240, 240])
+        self.assertEqual(self.fixture.retry_delays, [5.0])
+        self.assertEqual(len(self.reservations()), 3)
+        self.assertEqual(runner.task_review_rounds(self.state(), "one"), 0)
+        self.assertEqual(self.state()["pending_review"]["review_invocations"], 2)
+        resumed = FakeExecutor(review_only=True)
+        self.assertEqual(self.run_fake(resumed, resume=True), 1)
+        self.assertEqual(resumed.b_calls, 0)
+
+    def test_saved_valid_verdict_finishes_at_exhausted_limit_without_another_call(self):
+        fake = FakeExecutor()
+        with patch.object(runner, "finish_review_verdict", side_effect=RuntimeError("saved verdict interruption")):
+            with self.assertRaisesRegex(RuntimeError, "saved verdict interruption"):
+                self.run_fake(fake, max_agent_calls=2)
+        self.assertEqual(self.state()["pending_review"]["review_result"]["verdict"], APPROVED)
+        resumed = FakeExecutor(review_only=True)
+        self.assertEqual(self.run_fake(resumed, resume=True), 0)
+        self.assertEqual((resumed.a_calls, resumed.test_calls, resumed.b_calls), (0, 0, 0))
+        self.assertEqual(len(self.reservations()), 2)
+        self.assertEqual(self.state()["completed"], ["one"])
+
+    def test_completed_implementation_recovery_is_not_counted_twice(self):
+        write = runner.write_attempt_evidence
+        def interrupted(path, text):
+            if path.name == "one-01-a-events.jsonl":
+                raise OSError("implementation evidence interruption")
+            return write(path, text)
+        fake = FakeExecutor()
+        with patch.object(runner, "write_attempt_evidence", side_effect=interrupted):
+            with self.assertRaisesRegex(OSError, "implementation evidence interruption"):
+                self.run_fake(fake, max_agent_calls=1)
+        self.assertEqual(self.state()["pending_execution"]["phase"], "completed")
+        resumed = FakeExecutor()
+        self.assertEqual(self.run_fake(resumed, resume=True), 1)
+        self.assertEqual((resumed.a_calls, resumed.test_calls, resumed.b_calls), (0, 1, 0))
+        self.assertEqual(len(self.reservations()), 1)
+
+    def test_crash_after_a_reservation_does_not_grant_a_free_call(self):
+        emit = runner.EventLog.emit
+        def interrupted(events, actor, event, outcome, **kwargs):
+            result = emit(events, actor, event, outcome, **kwargs)
+            if actor == "Codex A" and event == "process_started":
+                raise RuntimeError("after A reservation")
+            return result
+        fake = FakeExecutor()
+        with patch.object(runner.EventLog, "emit", interrupted):
+            with self.assertRaisesRegex(RuntimeError, "after A reservation"):
+                self.run_fake(fake, max_agent_calls=1)
+        self.assertEqual(fake.a_calls, 0)
+        self.assertEqual(len(self.reservations()), 1)
+        resumed = FakeExecutor(review_only=True)
+        self.assertEqual(self.run_fake(resumed, resume=True), 1)
+        self.assertEqual((resumed.a_calls, resumed.test_calls, resumed.b_calls), (0, 0, 0))
+        self.assertEqual(len(self.reservations()), 1)
+
+    def test_crash_after_b_reservation_does_not_grant_a_free_call(self):
+        emit = runner.EventLog.emit
+        def interrupted(events, actor, event, outcome, **kwargs):
+            result = emit(events, actor, event, outcome, **kwargs)
+            if actor == "Codex B" and event == "review_started":
+                raise RuntimeError("after B reservation")
+            return result
+        fake = FakeExecutor()
+        with patch.object(runner.EventLog, "emit", interrupted):
+            with self.assertRaisesRegex(RuntimeError, "after B reservation"):
+                self.run_fake(fake, max_agent_calls=2)
+        self.assertEqual((fake.a_calls, fake.b_calls), (1, 0))
+        resumed = FakeExecutor(review_only=True)
+        self.assertEqual(self.run_fake(resumed, resume=True), 1)
+        self.assertEqual((resumed.a_calls, resumed.test_calls, resumed.b_calls), (0, 0, 0))
+        self.assertEqual(len(self.reservations()), 2)
+
+    def test_initialization_crash_preserves_policy_before_state_or_manifest_exists(self):
+        save = runner.save_json
+        def interrupted(path, value):
+            if path.name == "run-manifest.json":
+                raise OSError("manifest initialization interruption")
+            return save(path, value)
+        fake = FakeExecutor()
+        with patch.object(runner, "save_json", side_effect=interrupted):
+            with self.assertRaisesRegex(OSError, "manifest initialization interruption"):
+                self.run_fake(fake, max_agent_calls=1)
+        self.assertFalse((self.logs / "state.json").exists())
+        self.assertFalse((self.logs / "run-manifest.json").exists())
+        with self.assertRaisesRegex(PilotError, "budget differs"):
+            self.run_fake(fake, max_agent_calls=2)
+        self.assertEqual(self.run_fake(fake), 1)
+        self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (1, 1, 0))
+        self.assertEqual(self.state()["max_agent_calls"], 1)
+        self.assertEqual(len(self.reservations()), 1)
+
+    def test_changed_invalid_or_removed_saved_budget_is_rejected(self):
+        self.assertEqual(self.run_fake(FakeExecutor(), max_agent_calls=1), 1)
+        state = self.state()
+        manifest_path = self.logs / "run-manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        cases = [(value, value) for value in (0, True, "1", runner.MAX_AGENT_CALL_LIMIT + 1, 2, None)]
+        cases += [("removed", "removed"), ("removed", 1)]
+        for saved, bound in cases:
+            changed_state, changed_manifest = dict(state), dict(manifest)
+            for target, value in ((changed_state, saved), (changed_manifest, bound)):
+                if value == "removed":
+                    target.pop("max_agent_calls", None)
+                else:
+                    target["max_agent_calls"] = value
+            (self.logs / "state.json").write_text(json.dumps(changed_state), encoding="utf-8")
+            manifest_path.write_text(json.dumps(changed_manifest), encoding="utf-8")
+            resumed = FakeExecutor(review_only=True)
+            with self.subTest(saved=saved, bound=bound), self.assertRaises(PilotError):
+                self.run_fake(resumed, resume=True)
+            self.assertEqual((resumed.a_calls, resumed.test_calls, resumed.b_calls), (0, 0, 0))
+        (self.logs / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        with self.assertRaisesRegex(PilotError, "budget is fixed"):
+            self.run_fake(FakeExecutor(review_only=True), resume=True, max_agent_calls=2)
+        self.assertEqual(len(self.reservations()), 1)
+
+    def test_omitted_option_preserves_unlimited_corrections(self):
+        fake = FakeExecutor([REJECTED, APPROVED])
+        self.assertEqual(self.run_fake(fake), 0)
+        self.assertEqual((fake.a_calls, fake.b_calls), (2, 2))
+        self.assertIsNone(self.state()["max_agent_calls"])
+        self.assertEqual(len(self.reservations()), 4)
+
+    def test_legacy_runs_without_budget_remain_unlimited(self):
+        first = FakeExecutor([failed_review("Quota exceeded. Check your plan and billing details.")])
+        with patch.object(runner, "bind_agent_call_budget"):
+            self.assertEqual(self.run_fake(first), 1)
+        self.assertNotIn("max_agent_calls", self.state())
+        legacy_events = self.fixture.events()
+        for event in legacy_events:
+            if event["event"] == "run_started":
+                event.get("metadata", {}).pop("max_agent_calls", None)
+        (self.logs / "events.jsonl").write_text("".join(json.dumps(event) + "\n" for event in legacy_events), encoding="utf-8")
+        with self.assertRaisesRegex(PilotError, "budget is fixed"):
+            self.run_fake(FakeExecutor(review_only=True), resume=True, max_agent_calls=5)
+        resumed = FakeExecutor(review_only=True)
+        self.assertEqual(self.run_fake(resumed, resume=True), 0)
+        self.assertEqual((resumed.a_calls, resumed.test_calls, resumed.b_calls), (0, 0, 1))
+        self.assertNotIn("max_agent_calls", self.state())
+        self.assertEqual(len(self.reservations()), 3)
+
+
+class AgentCallBudgetCliTests(unittest.TestCase):
+    def test_valid_limits_and_omission_reach_runner(self):
+        argv = ["tasks.json", "--repo", "project", "--logs", "logs"]
+        with patch.object(runner, "run", return_value=0) as execute, \
+                patch.object(runner.shutil, "which", return_value="codex"):
+            for limit in (None, 1, runner.MAX_AGENT_CALL_LIMIT):
+                options = [] if limit is None else ["--max-agent-calls", str(limit)]
+                self.assertEqual(runner.main(argv + options), 0)
+                self.assertEqual(execute.call_args.kwargs["max_agent_calls"], limit)
+
+    def test_invalid_limits_never_execute_agents(self):
+        argv = ["tasks.json", "--repo", "project", "--logs", "logs", "--max-agent-calls"]
+        with patch.object(runner, "run") as execute, patch.object(runner, "cancel_reservation"), \
+                redirect_stderr(io.StringIO()):
+            for value in ("0", "-1", str(runner.MAX_AGENT_CALL_LIMIT + 1), "1.5", "invalid"):
+                with self.subTest(value=value), self.assertRaises(SystemExit) as invalid:
+                    runner.main(argv + [value])
+                self.assertEqual(invalid.exception.code, 2)
+            execute.assert_not_called()
+
+    def test_workflow_budget_does_not_apply_to_pre_run_audit(self):
+        argv = ["audit", "tasks.json", "--repo", "project", "--logs", "logs", "--audit-model", "explicit-model"]
+        with patch.object(runner, "audit", return_value=0) as audit, \
+                patch.object(runner.shutil, "which", return_value="codex"), \
+                patch.object(runner, "cancel_reservation"), redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                runner.main(argv + ["--max-agent-calls", "1"])
+            audit.assert_not_called()
+            self.assertEqual(runner.main(argv), 0)
+            self.assertNotIn("max_agent_calls", audit.call_args.kwargs)
+
+
 class ReviewFailureCategoryTests(unittest.TestCase):
     def test_verified_cli_error_forms(self):
         cases = [
