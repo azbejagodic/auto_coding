@@ -22,6 +22,10 @@ APPROVED = {"decision": "APPROVED", "issues": [], "summary": "OK"}
 REJECTED = {"decision": "REJECTED", "issues": ["Fix the implementation"], "summary": "Incomplete"}
 
 
+def failed_review(message, code=1):
+    return code, json.dumps({"type": "turn.failed", "error": {"message": message}}), False
+
+
 class FakeExecutor:
     def __init__(self, responses=(), *, review_only=False):
         self.responses = list(responses)
@@ -51,7 +55,7 @@ class FakeExecutor:
             if isinstance(response, tuple):
                 return response
             if isinstance(response, int):
-                return response, "reviewer connection failed", False
+                return failed_review("unexpected status 503 Service Unavailable: upstream unavailable", code=response)
             answer.write_text(json.dumps(response) if isinstance(response, dict) else response,
                               encoding="utf-8")
             return 0, "review completed", False
@@ -151,6 +155,84 @@ class ReviewRecoveryTests(unittest.TestCase):
         self.assertEqual(self.metrics()["review_retries"], 1)
         self.assertEqual(self.metrics()["review_outcomes"], {"process_failure": 1, "approved": 1})
 
+    def assert_stopped_process_failure(self, fake, category):
+        self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (1, 1, 1))
+        self.assertEqual(self.retry_delays, [])
+        state = self.state()
+        self.assertEqual(state["status"], "stopped")
+        self.assertEqual(state["completed"], [])
+        self.assertEqual(state["history"], [])
+        self.assertIsNone(state["pending_checkpoint"])
+        pending = state["pending_review"]
+        self.assertEqual(pending["review_failure_kind"], "process_failure")
+        self.assertEqual(pending["review_failure_category"], category)
+        self.assertEqual(pending["review_invocations"], 1)
+        self.assertEqual(pending["review_invocation_limit"], 3)
+        self.assertNotIn("review_retry_after", pending)
+        self.assertEqual(runner.task_review_rounds(state, "one"), 0)
+        failure = next(event for event in self.events() if event["event"] == "review_failed")
+        self.assertEqual(failure["outcome"], "process_failure")
+        self.assertEqual(failure["metadata"]["failure_category"], category)
+        self.assertFalse(any(event["event"] in {"review_retry", "checkpoint_committed", "correction_requested"}
+                             for event in self.events()))
+
+    def test_authentication_failure_stops_and_explicit_resume_reuses_review_checkpoint(self):
+        secret = "DUMMY-AUTH-CREDENTIAL"
+        response = failed_review(f"unexpected status 401 Unauthorized: expired credential {secret}")
+        fake = FakeExecutor([response, APPROVED])
+        def failed_with_verdict(argv, cwd, timeout, *, prompt=None):
+            result = fake(argv, cwd, timeout, prompt=prompt)
+            if "--output-schema" in argv:
+                # Even a valid leftover verdict cannot authorize a failed execution.
+                Path(argv[argv.index("--output-last-message") + 1]).write_text(json.dumps(APPROVED), encoding="utf-8")
+            return result
+        self.assertEqual(self.run_fake(failed_with_verdict, timeout=90, review_timeout=240), 1)
+        self.assert_stopped_process_failure(fake, "permanent")
+        self.assertTrue((self.logs / "one-01-b-events.jsonl").is_file())
+        self.assertNotIn(secret, (self.logs / "state.json").read_text(encoding="utf-8"))
+        self.assertNotIn(secret, (self.logs / "events.jsonl").read_text(encoding="utf-8"))
+        resumed = FakeExecutor(review_only=True)
+        self.assertEqual(self.run_fake(resumed, resume=True, timeout=90, review_timeout=240), 0)
+        self.assertEqual((resumed.a_calls, resumed.test_calls, resumed.b_calls), (0, 0, 1))
+        self.assertEqual(fake.a_timeouts, [90])
+        self.assertEqual(fake.b_timeouts, [240])
+        self.assertEqual(resumed.b_timeouts, [240])
+        self.assertEqual(runner.task_review_rounds(self.state(), "one"), 1)
+
+    def test_quota_exhaustion_does_not_retry(self):
+        fake = FakeExecutor([failed_review("Quota exceeded. Check your plan and billing details."), APPROVED])
+        self.assertEqual(self.run_fake(fake), 1)
+        self.assert_stopped_process_failure(fake, "permanent")
+
+    def test_unsupported_model_configuration_does_not_retry(self):
+        fake = FakeExecutor([failed_review("unexpected status 404 Not Found: model is unavailable"), APPROVED])
+        self.assertEqual(self.run_fake(fake), 1)
+        self.assert_stopped_process_failure(fake, "permanent")
+
+    def test_unknown_process_error_stops_instead_of_guessing_connection_failure_is_transient(self):
+        fake = FakeExecutor([(1, "reviewer connection failed", False), APPROVED])
+        self.assertEqual(self.run_fake(fake), 1)
+        self.assert_stopped_process_failure(fake, "unknown")
+
+    def test_transient_cli_connection_timeout_retries_with_review_timeout(self):
+        fake = FakeExecutor([failed_review("request timed out"), APPROVED])
+        self.assertEqual(self.run_fake(fake, timeout=90, review_timeout=240), 0)
+        self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (1, 1, 2))
+        self.assertEqual(fake.b_timeouts, [240, 240])
+        self.assertEqual(self.retry_delays, [5.0])
+        failure = next(event for event in self.events() if event["event"] == "review_failed")
+        self.assertEqual(failure["metadata"]["failure_category"], "transient")
+
+    def test_transient_process_error_with_unverified_cleanup_never_retries(self):
+        output = failed_review("unexpected status 503 Service Unavailable: temporary error")[1]
+        fake = FakeExecutor([runner._CallResult(1, output, False, False, True), APPROVED])
+        self.assertEqual(self.run_fake(fake), 1)
+        self.assertEqual(fake.b_calls, 1)
+        self.assertEqual(self.retry_delays, [])
+        self.assertTrue(self.state()["pending_review"]["process_uncertain"])
+        with self.assertRaisesRegex(OSError, "cleanup remains unverified"):
+            self.run_fake(FakeExecutor(review_only=True), resume=True)
+
     def test_restart_during_delay_preserves_deadline_and_remaining_budget(self):
         first = FakeExecutor([1])
         self.retry_sleep.side_effect = RuntimeError("application restarted during wait")
@@ -184,6 +266,7 @@ class ReviewRecoveryTests(unittest.TestCase):
 
     def test_exhaustion_survives_restarts_and_explicit_grant_is_only_one_call(self):
         self.stopped_at_review()
+        self.assertEqual(self.state()["pending_review"]["review_failure_category"], "transient")
         resumed = FakeExecutor([1, 1, 1], review_only=True)
         for _ in range(2):
             self.assertEqual(self.run_fake(resumed, resume=True), 1)
@@ -204,6 +287,8 @@ class ReviewRecoveryTests(unittest.TestCase):
         self.assertEqual(self.metrics()["codex_a"], before["codex_a"])
         self.assertEqual(self.metrics()["tests"], before["tests"])
         self.assertEqual(self.metrics()["codex_b"]["invocations"], 4)
+        self.assertTrue(all(event["metadata"]["failure_category"] == "transient"
+                            for event in self.events() if event["event"] == "review_failed"))
 
     def test_unused_explicit_authorization_survives_restart_without_stacking(self):
         self.stopped_at_review()
@@ -867,6 +952,51 @@ class CorrectionContextTests(unittest.TestCase):
             self.assertEqual(checked_review(verdict_path), REJECTED)
             verdict_path.write_text(json.dumps(APPROVED), encoding="utf-8")
             self.assertEqual(checked_review(verdict_path), APPROVED)
+
+
+class ReviewFailureCategoryTests(unittest.TestCase):
+    def test_verified_cli_error_forms(self):
+        cases = [
+            ("unexpected status 401 Unauthorized: invalid credentials", "permanent"),
+            ("unexpected status 402 Payment Required: billing limit", "permanent"),
+            ("unexpected status 400 Bad Request: unsupported model configuration", "permanent"),
+            ("unexpected status 403 Forbidden: permission denied", "permanent"),
+            ("unexpected status 404 Not Found: unavailable model", "permanent"),
+            ("Quota exceeded. Check your plan and billing details.", "permanent"),
+            ("You’ve hit your usage limit. Try again later.", "permanent"),
+            ("unexpected status 500 Internal Server Error: temporary error", "transient"),
+            ("unexpected status 502 Bad Gateway: temporary error", "transient"),
+            ("unexpected status 503 Service Unavailable: temporary error", "transient"),
+            ("unexpected status 504 Gateway Timeout: temporary error", "transient"),
+            ("request timed out", "transient"),
+            ("Selected model is at capacity. Please try a different model.", "transient"),
+            ("We’re currently experiencing high demand, which may cause temporary errors.", "transient"),
+            ("unexpected status 429 Too Many Requests: unspecified limit", "unknown"),
+            ("unrecognized error", "unknown"),
+        ]
+        for message, expected in cases:
+            for event in ({"type": "error", "message": message},
+                          {"type": "turn.failed", "error": {"message": message}}):
+                with self.subTest(message=message, type=event["type"]):
+                    self.assertEqual(runner.review_process_failure_category(json.dumps(event)), expected)
+
+    def test_source_prompts_agent_text_and_tool_output_do_not_classify_failures(self):
+        message = "unexpected status 503 Service Unavailable: temporary error"
+        for output in (message, "ERROR: " + message, "{broken JSON", "[]", "null",
+                       json.dumps({"prompt": message}),
+                       json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": failed_review(message)[1]}}),
+                       json.dumps({"type": "item.completed", "item": {"type": "command_execution", "aggregated_output": failed_review(message)[1]}}),
+                       json.dumps({"type": "turn.failed", "error": None})):
+            with self.subTest(output=output):
+                self.assertEqual(runner.review_process_failure_category(output), "unknown")
+
+    def test_permanent_errors_win_and_unknown_final_errors_do_not_inherit_transience(self):
+        permanent = failed_review("unexpected status 401 Unauthorized: invalid credentials")[1]
+        transient = failed_review("unexpected status 503 Service Unavailable: temporary error")[1]
+        unknown = failed_review("unrecognized final error")[1]
+        self.assertEqual(runner.review_process_failure_category(permanent + "\n" + transient), "permanent")
+        self.assertEqual(runner.review_process_failure_category(transient + "\n" + permanent), "permanent")
+        self.assertEqual(runner.review_process_failure_category(transient + "\n" + unknown), "unknown")
 
 
 class ReviewTimeoutCliTests(unittest.TestCase):

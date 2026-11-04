@@ -876,6 +876,54 @@ def verify_review_ready(repo: Path, logs: Path, state: dict, task: dict) -> tupl
     return record, review_prompt_for(task, stat, diff, tests, report, preceding)
 
 
+def _review_error_message_category(message) -> str:
+    # Known CLI forms from openai/codex codex-rs/protocol/src/error.rs.
+    if not isinstance(message, str):
+        return "unknown"
+    if (message == "Quota exceeded. Check your plan and billing details."
+            or message.startswith("You’ve hit your usage limit.")):
+        return "permanent"
+    status = re.match(r"unexpected status ([1-5][0-9]{2})(?: [A-Za-z ]+)?:", message)
+    if status:
+        if int(status[1]) in {400, 401, 402, 403, 404}:
+            return "permanent"
+        if int(status[1]) in {500, 502, 503, 504}:
+            return "transient"
+    if message in {
+        "request timed out",
+        "Selected model is at capacity. Please try a different model.",
+        "We’re currently experiencing high demand, which may cause temporary errors.",
+    }:
+        return "transient"
+    return "unknown"
+
+
+def review_process_failure_category(output: str) -> str:
+    """Read CLI error envelopes, never agent messages, tool output or bare stderr.
+
+    codex exec exposes message-only errors (codex-rs/exec/src/exec_events.rs).
+    A permanent error wins; otherwise use the last error, not an earlier retry notice.
+    """
+    category = "unknown"
+    for line in output.splitlines():
+        try:
+            event = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "turn.failed":
+            error = event.get("error")
+        elif event.get("type") == "error":
+            error = event
+        else:
+            continue
+        category = _review_error_message_category(error.get("message") if isinstance(error, dict) else None)
+        if category == "permanent":
+            return category
+    return category
+
+
 def schedule_review_retry(pending: dict) -> float:
     delay = REVIEW_RETRY_DELAYS[min(pending["review_invocations"] - 1, len(REVIEW_RETRY_DELAYS) - 1)]
     pending["review_retry_after"] = _review_clock() + delay
@@ -1112,6 +1160,7 @@ def review_ready_task(repo: Path, logs: Path, state: dict, state_path: Path,
         try:
             pending["review_invocations"] = ordinal
             pending.pop("review_retry_after", None)
+            pending.pop("review_failure_category", None)
             state["status"] = "running"
             save_json(state_path, state)
             (logs / prompt_name).write_text(review_prompt, encoding="utf-8")
@@ -1190,12 +1239,19 @@ def review_ready_task(repo: Path, logs: Path, state: dict, state_path: Path,
                 save_json(state_path, state)
                 return finish_review_verdict(repo, logs, state, state_path, events, task, production=production)
         pending["review_failure_kind"] = failure_kind
-        retryable = failure_kind in {"process_failure", "timeout", "invalid_verdict"}
+        category = review_process_failure_category(output) if failure_kind == "process_failure" else None
+        if category is not None:
+            pending["review_failure_category"] = category
+        else:
+            pending.pop("review_failure_category", None)
+        retryable = (failure_kind in {"timeout", "invalid_verdict"}
+                     or (failure_kind == "process_failure" and category == "transient"))
         delay = schedule_review_retry(pending) if retryable else 0
         state["status"] = "stopped"
         save_json(state_path, state)
         events.emit("Codex B", "review_failed", failure_kind, task_id=ident, attempt=attempt,
-                    metadata={"execution_id": execution["seq"], "review_invocation": ordinal})
+                    metadata={"execution_id": execution["seq"], "review_invocation": ordinal}
+                             | ({"failure_category": category} if category is not None else {}))
         if not retryable or ordinal >= limit:
             return stop_review_retry(logs, state, state_path, events, reason)
         events.emit("controller", "review_retry", "retry", task_id=ident, attempt=attempt,
