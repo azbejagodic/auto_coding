@@ -342,7 +342,7 @@ class ReviewRecoveryTests(unittest.TestCase):
         self.assertEqual([e["outcome"] for e in self.events() if e["event"] == "review_finished"],
                          ["rejected", "approved"])
 
-    def test_multiple_rejections_retain_prior_fixes_and_fresh_verification(self):
+    def test_second_rejection_stops_and_retains_complete_findings_across_resume(self):
         first = {"decision": "REJECTED", "issues": ["app.py: reproduce missing reset",
                                                     "app.py: reproduce incorrect save"],
                  "summary": "Two blockers"}
@@ -350,15 +350,32 @@ class ReviewRecoveryTests(unittest.TestCase):
                                                      "app.py: reproduce broken reload"],
                   "summary": "Save and reload still fail"}
         fake = FakeExecutor([first, second, APPROVED])
-        self.assertEqual(self.run_fake(fake), 0)
-        self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (3, 3, 3))
-        correction = fake.a_prompts[2]
+        self.assertEqual(run(self.plan, self.repo, self.logs, execute=fake, attempts=10), 1)
+        self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (2, 2, 2))
+        state = self.state()
+        self.assertEqual(state["status"], "stopped")
+        self.assertEqual(state["completed"], [])
+        self.assertIsNone(state["pending_review"])
+        self.assertIsNone(state["pending_checkpoint"])
+        self.assertEqual([entry["review"] for entry in state["history"]], [first, second])
+        self.assertFalse(any(event["event"] == "checkpoint_committed" for event in self.events()))
+        self.assertEqual([event["event"] for event in self.events()].count("correction_requested"), 1)
+        self.assertTrue((self.logs / "one-02-b-verdict.json").is_file())
+        correction = correction_context(state["history"])
         for issue in ("missing reset", "incorrect save", "broken reload"):
             self.assertEqual(correction.count(issue), 1)
         self.assertIn("CURRENT CODEX B BLOCKERS (attempt 2)", correction)
         self.assertIn("EARLIER REVIEW ISSUES TO RECHECK", correction)
         self.assertIn("Preserve behavior that already works", correction)
         self.assertIn("do not rework an issue that is already fixed", correction)
+        # Older checkpoints have verdict history but no explicit round metadata.
+        for record in state["history"]:
+            record.pop("review_rounds", None)
+        (self.logs / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        resumed = FakeExecutor(review_only=True)
+        self.assertEqual(run(self.plan, self.repo, self.logs, execute=resumed, resume=True, attempts=10), 1)
+        self.assertEqual((resumed.a_calls, resumed.test_calls, resumed.b_calls), (0, 0, 0))
+        self.assertEqual(self.events()[-1]["metadata"]["reason"], "substantive review round limit")
 
     def test_failed_tests_do_not_erase_prior_reviewer_feedback(self):
         fake = FakeExecutor([REJECTED, APPROVED])
@@ -462,20 +479,57 @@ class ReviewRecoveryTests(unittest.TestCase):
         self.assertIn("regressions introduced by the fixes", rereview)
         self.assertIn("Do not automatically approve", rereview)
 
-    def test_later_rejection_supplies_its_full_finding_set_to_following_review(self):
+    def test_saved_valid_verdict_survives_interruption_without_an_extra_review(self):
         first = {"decision": "REJECTED", "issues": ["reset misses error path", "save omits rollback"],
                  "summary": "First review"}
         second = {"decision": "REJECTED", "issues": ["save still omits rollback", "reload now fails"],
                   "summary": "Correction introduced reload regression"}
-        fake = FakeExecutor([first, second, APPROVED])
-        self.assertEqual(self.run_fake(fake), 0)
-        self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (3, 3, 3))
+        fake = FakeExecutor([first])
+        with patch.object(runner, "finish_review_verdict", side_effect=RuntimeError("interrupted before disposition")):
+            with self.assertRaisesRegex(RuntimeError, "interrupted before disposition"):
+                self.run_fake(fake)
+        self.assertEqual(self.state()["pending_review"]["review_result"]["verdict"], first)
+        resumed = FakeExecutor([second, APPROVED])
+        self.assertEqual(self.run_fake(resumed, resume=True), 1)
+        self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (1, 1, 1))
+        self.assertEqual((resumed.a_calls, resumed.test_calls, resumed.b_calls), (1, 1, 1))
         for issue in second["issues"]:
-            self.assertIn(issue, fake.a_prompts[2])
-            self.assertIn(issue, fake.b_prompts[2])
-        self.assertIn("reset misses error path", fake.a_prompts[2])
-        self.assertNotIn("reset misses error path", fake.b_prompts[2])
-        self.assertIn("Correction introduced reload regression", fake.a_prompts[2])
+            self.assertIn(issue, self.state()["history"][1]["review"]["issues"])
+        for issue in first["issues"]:
+            self.assertIn(issue, resumed.a_prompts[0])
+            self.assertIn(issue, resumed.b_prompts[0])
+        self.assertEqual(runner.task_review_rounds(self.state(), "one"), 2)
+        self.assertEqual(self.state()["completed"], [])
+
+    def test_infrastructure_failures_do_not_consume_the_two_substantive_rounds(self):
+        fake = FakeExecutor([1, "invalid", REJECTED, 1, "invalid", APPROVED])
+        self.assertEqual(self.run_fake(fake), 0)
+        self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (2, 2, 6))
+        self.assertEqual(runner.task_review_rounds(self.state(), "one"), 2)
+        self.assertEqual(self.retry_delays, [5.0, 15.0, 5.0, 15.0])
+
+    def test_saved_second_approval_resumes_without_an_extra_review(self):
+        finish = runner.finish_review_verdict
+        def interrupt_second(*args, **kwargs):
+            if args[2]["history"]:
+                raise RuntimeError("interrupted after second verdict")
+            return finish(*args, **kwargs)
+        fake = FakeExecutor([REJECTED, APPROVED])
+        with patch.object(runner, "finish_review_verdict", side_effect=interrupt_second):
+            with self.assertRaisesRegex(RuntimeError, "interrupted after second verdict"):
+                self.run_fake(fake)
+        self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (2, 2, 2))
+        self.assertEqual(self.state()["completed"], [])
+        saved = self.logs / "one-02-b-verdict.json"
+        original = saved.read_bytes()
+        saved.write_text(json.dumps(APPROVED | {"summary": "tampered"}), encoding="utf-8")
+        resumed = FakeExecutor(review_only=True)
+        with self.assertRaisesRegex(PilotError, "Saved review response changed"):
+            self.run_fake(resumed, resume=True)
+        saved.write_bytes(original)
+        self.assertEqual(self.run_fake(resumed, resume=True), 0)
+        self.assertEqual((resumed.a_calls, resumed.test_calls, resumed.b_calls), (0, 0, 0))
+        self.assertEqual(runner.task_review_rounds(self.state(), "one"), 2)
 
     def test_restarted_review_keeps_preceding_rejection_context(self):
         issues = ["reset still loses state", "save still hides write failures"]

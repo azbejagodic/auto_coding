@@ -196,9 +196,25 @@ class ReviewerFlowTests(unittest.TestCase):
     def test_real_code_rejections_still_get_fresh_a_tests_and_b(self):
         execute = recovery.FakeExecutor([verdict("failed", rejected=True),
                                          verdict("environment_blocked", rejected=True), verdict("passed")])
-        self.assertEqual(self.run_fake(execute), 0)
-        self.assertEqual((execute.a_calls, execute.test_calls, execute.b_calls), (3, 3, 3))
+        self.assertEqual(self.run_fake(execute), 1)
+        self.assertEqual((execute.a_calls, execute.test_calls, execute.b_calls), (2, 2, 2))
         self.assertIn("behavior is wrong", execute.a_prompts[1])
+        self.assertEqual(self.fixture.state()["completed"], [])
+
+    def test_valid_approvals_with_blocked_verification_consume_rounds_across_resume(self):
+        first = recovery.FakeExecutor([verdict("environment_blocked")])
+        self.assertEqual(self.run_fake(first), 1)
+        second = recovery.FakeExecutor([verdict("environment_blocked")], review_only=True)
+        self.assertEqual(self.run_fake(second, resume=True), 1)
+        self.assertEqual(runner.task_review_rounds(self.fixture.state(), "one"), 2)
+        state = self.fixture.state()
+        state["pending_review"]["record"].pop("review_rounds")
+        (self.fixture.logs / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        resumed = recovery.FakeExecutor([verdict("passed")], review_only=True)
+        self.assertEqual(self.run_fake(resumed, resume=True), 1)
+        self.assertEqual(self.run_fake(resumed, resume=True, retry_review_once=True), 1)
+        self.assertEqual(resumed.b_calls, 0)
+        self.assertEqual(self.fixture.state()["completed"], [])
 
     def test_failed_or_unexecuted_tests_never_authorize_a_commit(self):
         for status in ("failed", "not_run"):

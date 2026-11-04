@@ -40,6 +40,7 @@ from auto_coding import plan_audit
 MAX_PLAN = 512 * 1024
 MAX_OUTPUT = 16 * 1024 * 1024
 MAX_REVIEW_PROCESS_ATTEMPTS = 3
+MAX_TASK_REVIEW_ROUNDS = 2
 REVIEW_RETRY_DELAYS = (5.0, 15.0)
 # Kept separate from other process clocks so tests can control review waits.
 _review_clock = time.time
@@ -907,6 +908,131 @@ def cleanup_review_scratch(spec, events, ident, attempt):
                     evidence={"scratch": spec.scratch.name}, metadata={"error_type": type(exc).__name__})
 
 
+def task_review_rounds(state: dict, ident: str) -> int:
+    """Count substantive verdicts, including legacy history and blocked verification."""
+    records = [record for record in state["history"] if record.get("task") == ident]
+    pending = state.get("pending_review")
+    if pending and pending.get("task") == ident:
+        records.append(pending["record"])
+    total = 0
+    for record in records:
+        review = record.get("review")
+        minimum = int(isinstance(review, dict) and review.get("decision") in {"APPROVED", "REJECTED"})
+        rounds = record.get("review_rounds", minimum)
+        if type(rounds) is not int or rounds < minimum or rounds < 0:
+            raise PilotError("Saved substantive review count is invalid; inspect before resume")
+        total += rounds
+    return total
+
+
+def restore_legacy_review_rounds(state, events):
+    """Older checkpoints recorded blocked valid approvals only in the timeline."""
+    blocked = {}
+    for line in events.path.read_text(encoding="utf-8").splitlines():
+        event = json.loads(line)
+        if event["event"] == "review_verification_blocked":
+            key = (event["task_id"], event["attempt"])
+            blocked[key] = blocked.get(key, 0) + 1
+    records = list(state["history"])
+    if state.get("pending_review"):
+        records.append(state["pending_review"]["record"])
+    for record in records:
+        count = blocked.get((record.get("task"), record.get("attempt")), 0)
+        if count and "review_rounds" not in record:
+            record["review_rounds"] = count + int(isinstance(record.get("review"), dict))
+
+
+def stop_review_rounds(logs, state, state_path, events, ident):
+    state["status"] = "stopped"
+    save_json(state_path, state)
+    events.emit("controller", "stopped", "failed", task_id=ident,
+                metadata={"reason": "substantive review round limit", "review_rounds": task_review_rounds(state, ident),
+                          "review_round_limit": MAX_TASK_REVIEW_ROUNDS})
+    print(f"STOPPED: substantive Codex B review round limit for {ident}. Findings and checkpoints retained in {logs}.")
+    return "stopped"
+
+
+def finish_review_verdict(repo, logs, state, state_path, events, task, *, production):
+    """Consume a saved valid response once, even if interrupted before disposition."""
+    pending = state["pending_review"]
+    record, _ = verify_review_ready(repo, logs, state, task)
+    ident, attempt = pending["task"], pending["attempt"]
+    if task_review_rounds(state, ident) >= MAX_TASK_REVIEW_ROUNDS:
+        return stop_review_rounds(logs, state, state_path, events, ident)
+    ordinal = pending["review_invocations"]
+    suffix = "" if ordinal == 1 else f"-retry-{ordinal}"
+    verdict_name = f"{ident}-{attempt:02d}-b{suffix}-verdict.json"
+    result = pending["review_result"]
+    verdict = checked_review(logs / verdict_name, require_verification=production)
+    if (not isinstance(result, dict) or verdict != result.get("verdict")
+            or type(result.get("execution_id")) is not int or result["execution_id"] < 1):
+        raise PilotError("Saved review response changed; inspect before resume")
+    record["review_rounds"] = record.get("review_rounds", 0) + 1
+    pending.pop("review_result")
+    verification = verdict.get("verification", {"status": "not_reported"})
+    if (verdict["decision"] == "APPROVED" and
+            (verification["status"] in {"failed", "environment_blocked"}
+             or (verification["status"] == "not_run" and task["test_commands"]))):
+        pending["review_failure_kind"] = "verification_" + verification["status"]
+        state["status"] = "stopped"
+        save_json(state_path, state)
+        events.emit("Codex B", "review_verification_blocked", verification["status"],
+                    task_id=ident, attempt=attempt, evidence={"verdict": verdict_name})
+        if task_review_rounds(state, ident) >= MAX_TASK_REVIEW_ROUNDS:
+            return stop_review_rounds(logs, state, state_path, events, ident)
+        return stop_review_retry(logs, state, state_path, events,
+                                 "Independent review testing " + verification["status"] + "; inspect evidence, then resume B only")
+    record["review"] = verdict
+    if verdict["decision"] == "APPROVED" and not verdict["issues"]:
+        record.update(base_head=head(repo), diff_sha256=pending["diff_sha256"], branch=state["branch"])
+        state["pending_checkpoint"] = {"task": ident, "base_head": pending["base_head"],
+                                        "diff_sha256": pending["diff_sha256"], "record": record,
+                                        "branch": state["branch"]}
+        state["status"] = "checkpointing"
+    else:
+        record["feedback"] = "Codex B rejected:\n" + "\n".join(verdict["issues"])
+        state["history"].append(record)
+    state["pending_review"] = None
+    if verdict["decision"] == "REJECTED":
+        state["status"] = "stopped" if task_review_rounds(state, ident) >= MAX_TASK_REVIEW_ROUNDS else "running"
+    save_json(state_path, state)
+    events.emit("Codex B", "review_finished", verdict["decision"].lower(),
+                task_id=ident, attempt=attempt, evidence={"verdict": verdict_name},
+                metadata={"execution_id": result["execution_id"], "verification_status": verification["status"]})
+    if verdict["decision"] == "APPROVED" and not verdict["issues"]:
+        base = f"{ident}-{attempt:02d}"
+        events.emit("Git", "checkpoint_started", "started", task_id=ident,
+                    attempt=attempt, evidence={"diff": f"{base}-diff.txt"})
+        try:
+            require_run_branch(repo, state["branch"])
+            commit = local_commit(repo, ident)
+            verify_approved_commit(repo, state["pending_checkpoint"], commit)
+            require_run_branch(repo, state["branch"])
+        except PilotError as exc:
+            events.emit("Git", "stopped", "failed", task_id=ident, attempt=attempt,
+                        evidence={"state": "state.json"},
+                        metadata={"reason": "checkpoint pending reconciliation", "error_type": type(exc).__name__})
+            print(f"STOPPED: local checkpoint failed: {exc}")
+            return "stopped"
+        events.emit("Git", "checkpoint_committed", "success", task_id=ident,
+                    attempt=attempt, metadata={"commit": commit})
+        state["completed"].append(ident)
+        state["history"].append(record | {"commit": commit})
+        state["pending_checkpoint"] = None
+        state["status"] = "stopped" if state.get("auto_push") else "running"
+        save_json(state_path, state)
+        events.emit("controller", "task_completed", "success", task_id=ident,
+                    attempt=attempt, metadata={"commit": commit})
+        print(f"[{ident}] APPROVED — saved local checkpoint {commit[:8]}", flush=True)
+        return "approved" if publish_approved(repo, state, state_path, events) else "stopped"
+    if task_review_rounds(state, ident) >= MAX_TASK_REVIEW_ROUNDS:
+        return stop_review_rounds(logs, state, state_path, events, ident)
+    events.emit("controller", "correction_requested", "retry", task_id=ident,
+                attempt=attempt, evidence={"verdict": verdict_name})
+    print(f"[{ident}] Rejected; returning Codex B feedback to Codex A", flush=True)
+    return "rejected"
+
+
 def review_ready_task(repo: Path, logs: Path, state: dict, state_path: Path,
                       events: EventLog, task: dict, schema_path: Path,
                       execute: Callable, timeout: int, model_b: str | None, *,
@@ -915,6 +1041,11 @@ def review_ready_task(repo: Path, logs: Path, state: dict, state_path: Path,
     pending = state["pending_review"]
     ident, attempt = pending["task"], pending["attempt"]
     base = f"{ident}-{attempt:02d}"
+    verify_review_ready(repo, logs, state, task)
+    if "review_result" in pending:
+        return finish_review_verdict(repo, logs, state, state_path, events, task, production=unwrap(execute) is call)
+    if task_review_rounds(state, ident) >= MAX_TASK_REVIEW_ROUNDS:
+        return stop_review_rounds(logs, state, state_path, events, ident)
     if retry_review_once:
         verify_review_ready(repo, logs, state, task)
         if pending["review_invocations"] < pending.get("review_invocation_limit", MAX_REVIEW_PROCESS_ATTEMPTS):
@@ -1055,63 +1186,9 @@ def review_ready_task(repo: Path, logs: Path, state: dict, state_path: Path,
                 # A read-only reviewer is still an external process; inspect the
                 # worktree after it exits before accepting either verdict.
                 verify_review_ready(repo, logs, state, task)
-                verification = verdict.get("verification", {"status": "not_reported"})
-                if (verdict["decision"] == "APPROVED" and
-                        (verification["status"] in {"failed", "environment_blocked"}
-                         or (verification["status"] == "not_run" and task["test_commands"]))):
-                    pending["review_failure_kind"] = "verification_" + verification["status"]
-                    state["status"] = "stopped"
-                    save_json(state_path, state)
-                    events.emit("Codex B", "review_verification_blocked", verification["status"],
-                                task_id=ident, attempt=attempt, evidence={"verdict": verdict_name})
-                    return stop_review_retry(logs, state, state_path, events,
-                                             "Independent review testing " + verification["status"] + "; inspect evidence, then resume B only")
-                record["review"] = verdict
-                events.emit("Codex B", "review_finished", verdict["decision"].lower(),
-                            task_id=ident, attempt=attempt, evidence={"verdict": verdict_name},
-                            metadata={"execution_id": execution["seq"], "verification_status": verification["status"]})
-                if verdict["decision"] == "APPROVED" and not verdict["issues"]:
-                    record.update(base_head=head(repo), diff_sha256=pending["diff_sha256"], branch=state["branch"])
-                    state["pending_checkpoint"] = {"task": ident, "base_head": pending["base_head"],
-                                                    "diff_sha256": pending["diff_sha256"], "record": record,
-                                                    "branch": state["branch"]}
-                    state["pending_review"] = None
-                    state["status"] = "checkpointing"
-                    save_json(state_path, state)
-                    events.emit("Git", "checkpoint_started", "started", task_id=ident,
-                                attempt=attempt, evidence={"diff": f"{base}-diff.txt"})
-                    try:
-                        require_run_branch(repo, state["branch"])
-                        commit = local_commit(repo, ident)
-                        verify_approved_commit(repo, state["pending_checkpoint"], commit)
-                        require_run_branch(repo, state["branch"])
-                    except PilotError as exc:
-                        events.emit("Git", "stopped", "failed", task_id=ident, attempt=attempt,
-                                    evidence={"state": "state.json"},
-                                    metadata={"reason": "checkpoint pending reconciliation", "error_type": type(exc).__name__})
-                        print(f"STOPPED: local checkpoint failed: {exc}")
-                        return "stopped"
-                    events.emit("Git", "checkpoint_committed", "success", task_id=ident,
-                                attempt=attempt, metadata={"commit": commit})
-                    state["completed"].append(ident)
-                    state["history"].append(record | {"commit": commit})
-                    state["pending_checkpoint"] = None
-                    state["status"] = "stopped" if state.get("auto_push") else "running"
-                    save_json(state_path, state)
-                    events.emit("controller", "task_completed", "success", task_id=ident,
-                                attempt=attempt, metadata={"commit": commit})
-                    print(f"[{ident}] APPROVED — saved local checkpoint {commit[:8]}", flush=True)
-                    return "approved" if publish_approved(repo, state, state_path, events) else "stopped"
-                feedback = "Codex B rejected:\n" + "\n".join(verdict["issues"])
-                record["feedback"] = feedback
-                state["history"].append(record)
-                state["pending_review"] = None
-                state["status"] = "running"
+                pending["review_result"] = {"verdict": verdict, "execution_id": execution["seq"]}
                 save_json(state_path, state)
-                events.emit("controller", "correction_requested", "retry", task_id=ident,
-                            attempt=attempt, evidence={"verdict": verdict_name})
-                print(f"[{ident}] Rejected; returning Codex B feedback to Codex A", flush=True)
-                return "rejected"
+                return finish_review_verdict(repo, logs, state, state_path, events, task, production=production)
         pending["review_failure_kind"] = failure_kind
         retryable = failure_kind in {"process_failure", "timeout", "invalid_verdict"}
         delay = schedule_review_retry(pending) if retryable else 0
@@ -1555,6 +1632,7 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
         events = EventLog(logs / "events.jsonl", run_id)
         events.emit("controller", "resume_started", "started")
         try:
+            restore_legacy_review_rounds(state, events)
             plan_audit.verify_resume(sys.modules[__name__], state, manifest, repo, plan_sha, tasks)
             if state.get("pending_review") and state.get("pending_checkpoint"):
                 raise PilotError("Conflicting review and approved checkpoints")
@@ -1697,6 +1775,9 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
             prior = [h for h in state["history"] if h.get("task") == ident]
         start = len(prior) + 1
         for attempt in range(start, attempts + 1):
+            if task_review_rounds(state, ident) >= MAX_TASK_REVIEW_ROUNDS:
+                stop_review_rounds(logs, state, state_path, events, ident)
+                return 1
             assert_test_process_safe(repo)
             assert_process_safe(repo)
             require_run_branch(repo, state["branch"])
