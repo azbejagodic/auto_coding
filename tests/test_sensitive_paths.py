@@ -22,26 +22,33 @@ class SensitivePathTests(unittest.TestCase):
     def test_root_sensitive_filenames(self):
         for name in (".env", ".env.local", ".env.production", ".env.example", "credentials",
                      "credentials.json", "id_rsa", "id_ed25519", "private.pem", "cert.p12",
-                     "cert.pfx", "private.key", "safe:private.key", "nested/public:private.PEM"):
+                     "cert.pfx", "private.key", "safe:private.key", "nested/public:private.PEM",
+                     ".npmrc", ".netrc", ".pypirc", "secrets.json", "secret.json", "auth.json",
+                     "token.json", "credentials.toml", ".git-credentials", "pip.conf", "id_ecdsa",
+                     "service.p8", "signing.jks", "development.env"):
             with self.subTest(name=name):
                 self.assertTrue(is_sensitive_path(name))
 
     def test_nested_paths_mixed_separators_and_case(self):
         for name in (".aws/credentials", "src/.ssh/config", "src/.git/config", "nested/.env.production",
                      "nested/credentials.json", "src\\.AWS\\config", "src/.SSH\\config",
-                     "src/./nested//PRIVATE.KEY", "nested\\credentials"):
+                     "src/./nested//PRIVATE.KEY", "nested\\credentials", "nested\\.NPMRC",
+                     "nested/SECRETS.JSON", "src/.DOCKER/config.json", "src\\.KUBE\\config",
+                     "src/.config/gh/hosts.yml", "src\\.CONFIG\\GCLOUD\\application_default_credentials.json"):
             with self.subTest(name=name):
                 self.assertTrue(is_sensitive_path(name))
 
     def test_windows_filename_aliases_are_conservatively_blocked_on_both_hosts(self):
         for name in ("credentials.", "credentials ", "credentials:stream", "private.KEY:stream",
-                     "src/.aws. /config", "src\\.SSH.\\config"):
+                     "src/.aws. /config", "src\\.SSH.\\config", ".NPMRC:stream",
+                     "nested/SECRETS.JSON. ", "src\\.DOCKER.\\config.json"):
             with self.subTest(name=name):
                 self.assertTrue(is_sensitive_path(name))
 
     def test_ordinary_files_and_public_key_filenames_remain_allowed(self):
         for name in ("README.md", ".gitignore", "src/app.py", "src\\app.py", "package-lock.json",
-                     "docs/environment.md", "credentials-example.json", "id_rsa.pub", "public.key.txt"):
+                     "docs/environment.md", "credentials-example.json", "id_rsa.pub", "public.key.txt",
+                     "src/.environment.py", "docs/.envoy.md", "src/auth_helpers.py", "src/config.json"):
             with self.subTest(name=name):
                 self.assertFalse(is_sensitive_path(name))
 
@@ -126,7 +133,8 @@ class SensitiveChangeTests(unittest.TestCase):
         return json.loads((self.logs / "state.json").read_text())
 
     def test_sensitive_root_and_nested_changes_stop_before_tests_and_b(self):
-        for index, filename in enumerate((".env.production", "credentials", ".aws/credentials", "nested/private.KEY")):
+        for index, filename in enumerate((".env.production", "credentials", ".aws/credentials",
+                                          "nested/private.KEY", "nested/.npmrc", "secrets.json")):
             with self.subTest(filename=filename):
                 self.repo = self.make_repo(f"case-{index}")
                 self.logs = self.root / f"logs-{index}"
@@ -141,6 +149,7 @@ class SensitiveChangeTests(unittest.TestCase):
                 self.assertIn(filename, self.state()["history"][-1]["feedback"])
                 self.assertNotIn(DUMMY, self.state()["history"][-1]["feedback"])
                 self.assertFalse(list(self.logs.glob("*-b*-prompt.txt")))
+                self.assertFalse(list(self.logs.glob("*-diff.txt")))
                 self.assertEqual(self.state()["completed"], [])
 
     def test_ordinary_change_completes_a_tests_b_commit(self):

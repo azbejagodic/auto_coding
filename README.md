@@ -20,6 +20,17 @@ these focused checks unless `--controller-tests` is explicitly enabled. That mod
 is saved and cannot change during resume. Existing controller-tested checkpoints
 retain their original mode.
 
+Controller-run focused checks and final verification inherit only ordinary
+runtime settings (such as PATH, temporary directories and Windows system paths),
+plus a target-local PYTHONPATH. Tokens and Codex/Git authentication settings are
+not inherited by those test subprocesses. If a test needs a non-secret setting,
+set `AUTOCODING_TEST_ENV_JSON` to a JSON object with only `CI`, `NO_COLOR`,
+`PYTHONDONTWRITEBYTECODE`, `PYTHONUTF8`, `PYTHONIOENCODING`, `PYTHONHASHSEED`,
+`LANG`, `LC_ALL`, `LC_CTYPE`, `TZ`, `TERM` or `AUTOCODING_CONFIG_DIR`. Credential
+keys and PATH/PYTHONPATH overrides are rejected. Codex A/B and controller Git
+operations keep their existing environment. This filter is not a sandbox for
+untrusted test code.
+
 New runs require an explicitly designated full unittest suite and a minimum test
 count in the prepared JSON plan, for example:
 

@@ -16,6 +16,7 @@ from auto_coding.github_workspace import GitHubWorkspaceManager, WorkspaceError,
 from auto_coding.repository_activity import repository_busy
 from auto_coding.test_process_safety import (TestProcessGate, TestProcessSafetyError,
                                             assert_test_process_safe, test_gate_path)
+from auto_coding.python_environment import TEST_ENV_CONFIG
 
 
 class FakeExecutor:
@@ -92,6 +93,18 @@ class TestCleanupSafetyTests(unittest.TestCase):
         self.assertTrue(repository_busy(self.repo, self.root / "unrelated-run-storage"))
         self.assertFalse(any(event["event"] in {"correction_requested", "review_started", "checkpoint_started",
                                                "checkpoint_committed", "push_started"} for event in self.events()))
+
+    def test_invalid_explicit_test_environment_stops_before_process_and_gate(self):
+        fake = FakeExecutor()
+        with patch.dict(os.environ, {TEST_ENV_CONFIG: '{"GITHUB_TOKEN":"harmless-canary"}'}):
+            with self.assertRaises(ValueError) as caught:
+                self.run_fake(fake)
+        self.assertNotIn("harmless-canary", str(caught.exception))
+        self.assertEqual(fake.calls, ["A"])
+        self.assertFalse(test_gate_path(self.repo).exists())
+        self.assertEqual(self.state()["status"], "stopped")
+        self.assertEqual(self.state()["completed"], [])
+        self.assertNotIn("harmless-canary", (self.logs / "events.jsonl").read_text())
 
     def test_legacy_and_explicitly_confirmed_success_permit_normal_continuation(self):
         for position, results in enumerate(([], [runner._CallResult(0, "OK", False, True, True)])):

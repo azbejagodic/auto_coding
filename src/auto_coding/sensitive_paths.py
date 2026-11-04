@@ -43,8 +43,20 @@ def is_sensitive_path(path: str) -> bool:
     aliases = [part.split(":", 1)[0].rstrip(" .") for part in literal]
     # POSIX permits colons literally: normalization must not erase an existing
     # denial such as safe:private.key while also blocking private.key:stream.
-    return (any(part in {".git", ".ssh", ".aws"} for part in literal + aliases)
-            or any(name.startswith(".env")
-                   or name in {"credentials", "credentials.json", "id_rsa", "id_ed25519"}
-                   or name.endswith((".pem", ".p12", ".pfx", ".key"))
-                   for name in (literal[-1], aliases[-1])))
+    if any(part in {".git", ".ssh", ".aws", ".azure", ".docker", ".kube", ".gnupg"}
+           for part in literal + aliases):
+        return True
+    if any(tuple(aliases[index:index + 2]) in {(".config", "gh"), (".config", "gcloud")}
+           for index in range(len(aliases) - 1)):
+        return True
+    for name in (literal[-1], aliases[-1]):
+        if (name == ".env" or name.startswith(".env.") or name == ".envrc"
+                or name.endswith(".env")
+                or name in {".npmrc", ".netrc", ".pypirc", ".git-credentials", ".gitconfig",
+                            "credentials", "credentials.json", "credentials.toml", "secrets.json",
+                            "secret.json", "auth.json", "token.json", "pip.conf", "pip.ini",
+                            "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"}
+                or name.endswith((".secrets.json", ".pem", ".p8", ".p12", ".pfx",
+                                  ".key", ".jks", ".keystore"))):
+            return True
+    return False

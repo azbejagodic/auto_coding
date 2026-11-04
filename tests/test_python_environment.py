@@ -11,7 +11,9 @@ import unittest
 from unittest.mock import Mock, patch
 
 from auto_coding import simple_run as runner
-from auto_coding.python_environment import TARGET_PYTHONPATH, target_environment
+from auto_coding.python_environment import (TARGET_PYTHONPATH, TEST_ENV_CONFIG,
+                                            target_environment, test_environment)
+from auto_coding.reviewer_permissions import activated
 from auto_coding.run_launcher import LaunchState, launch_runner
 from backend_fixtures import approved_plan_fixture
 
@@ -119,6 +121,51 @@ class PythonEnvironmentTests(unittest.TestCase):
         expected = {key: value for key, value in before.items() if key not in {"PYTHONPATH", "PYTHONHOME"}}
         self.assertEqual(environment, expected)
 
+    def test_controller_test_child_has_runtime_settings_but_no_parent_credentials(self):
+        self.package(self.target / "src", "target checkout")
+        secrets = {"OPENAI_API_KEY": "harmless-openai-canary", "GITHUB_TOKEN": "harmless-github-canary",
+                   "AWS_SECRET_ACCESS_KEY": "harmless-aws-canary", "CODEX_HOME": "harmless-config-canary",
+                   "GIT_ASKPASS": "harmless-askpass-canary", "SSH_AUTH_SOCK": "harmless-socket-canary"}
+        with self.poisoned_environment(), patch.dict(os.environ, secrets):
+            before = os.environ.copy()
+            environment = test_environment(self.target)
+            self.assertEqual(dict(os.environ), before)
+            for name in secrets:
+                self.assertNotIn(name, environment)
+            for name in ("PATH", "TEMP", "TMP", "TMPDIR", "SystemRoot", "WINDIR", "ComSpec",
+                         "PATHEXT", "HOME", "USERPROFILE", "VIRTUAL_ENV"):
+                if name in before:
+                    self.assertEqual(environment[name], before[name])
+            self.assertEqual(environment["PYTHONPATH"], os.pathsep.join((str(self.target), str(self.target / "src"))))
+            with activated(environment):
+                result = runner.call([sys.executable, "-B", "-c",
+                                      "import os,sys,sample_app; print(sample_app.VALUE); "
+                                      "print(os.environ.get('OPENAI_API_KEY', 'absent')); sys.exit(7)"],
+                                     self.target, 15)
+            self.assertEqual(dict(os.environ), before)
+        self.assertEqual(result[0], 7, result[1])
+        self.assertIn("target checkout", result[1])
+        self.assertIn("absent", result[1])
+        self.assertFalse(any(value in result[1] for value in secrets.values()))
+
+    def test_explicit_test_settings_are_narrow_and_never_echo_invalid_values(self):
+        configured = test_environment(self.target, extra={"CI": "true", "TZ": "UTC"})
+        self.assertEqual((configured["CI"], configured["TZ"]), ("true", "UTC"))
+        for name in ("OPENAI_API_KEY", "GITHUB_TOKEN", "PATH", "PYTHONPATH", "CODEX_HOME"):
+            with self.subTest(name=name), self.assertRaises(ValueError) as caught:
+                test_environment(self.target, extra={name: "harmless-canary"})
+            self.assertNotIn("harmless-canary", str(caught.exception))
+        with patch.dict(os.environ, {TEST_ENV_CONFIG: json.dumps({"CI": "true",
+                "AUTOCODING_CONFIG_DIR": str(self.root / "test-config")})}):
+            child = test_environment(self.target)
+        self.assertEqual(child["CI"], "true")
+        self.assertEqual(child["AUTOCODING_CONFIG_DIR"], str(self.root / "test-config"))
+        self.assertNotIn(TEST_ENV_CONFIG, child)
+        with patch.dict(os.environ, {TEST_ENV_CONFIG: '{"GITHUB_TOKEN":"harmless-canary"}'}):
+            with self.assertRaises(ValueError) as caught:
+                test_environment(self.target)
+        self.assertNotIn("harmless-canary", str(caught.exception))
+
     def test_non_python_command_and_project_without_src_still_work(self):
         with self.poisoned_environment():
             result = runner.call(["git", "--version"], self.target, 15)
@@ -210,6 +257,7 @@ class PythonEnvironmentTests(unittest.TestCase):
         def execute(argv, cwd, timeout, *, prompt=None):
             nonlocal final_blocked
             if argv[0] == "codex":
+                self.assertEqual(runner.command_environment(cwd)["OPENAI_API_KEY"], "harmless-canary")
                 role = "B" if "--output-schema" in argv else "A"
                 if role == "B":
                     self.assertNotIn("--sandbox", argv)
@@ -223,12 +271,17 @@ class PythonEnvironmentTests(unittest.TestCase):
                                    cwd, timeout, prompt=prompt)
             state = json.loads((logs / "state.json").read_text())
             final = bool(state["completed"])
+            self.assertNotIn("OPENAI_API_KEY", runner.command_environment(cwd))
+            self.assertNotIn("GITHUB_TOKEN", runner.command_environment(cwd))
             calls.append("final" if final else "focused")
             if final and not final_blocked:
                 final_blocked = True
                 return runner._CallResult(127, "Simulated final launch failure", False, True, False)
             return runner.call(argv, cwd, timeout, prompt=prompt)
-        with approved_plan_fixture(), self.poisoned_environment(), contextlib.redirect_stdout(io.StringIO()):
+        with approved_plan_fixture(), self.poisoned_environment(), \
+                patch.dict(os.environ, {"OPENAI_API_KEY": "harmless-canary",
+                                     "GITHUB_TOKEN": "harmless-github-canary"}), \
+                contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(runner.run(plan, self.target, logs, execute=execute, controller_tests=True), 1)
             self.assertEqual(calls, ["A", "focused", "B", "final"])
             self.assertEqual(runner.run(plan, self.target, logs, execute=execute, resume=True), 0)

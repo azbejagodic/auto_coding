@@ -26,6 +26,7 @@ from auto_coding.github_workspace import (managed_job, WorkspaceError, cancel_re
 from auto_coding.process_runner import bounded_run, OutputLimitExceeded, MAX_CAPTURE_BYTES
 from auto_coding.reviewer_permissions import (activated, command_environment, prepare_review,
                                              check_cli, ReviewerEnvironmentError)
+from auto_coding.python_environment import test_environment
 from auto_coding.workflow_preflight import workflow_preflight, probe_review_storage
 from auto_coding.metrics import codex_usage, write_metrics
 from auto_coding.test_process_safety import TestProcessGate, assert_test_process_safe
@@ -1381,6 +1382,7 @@ def final_verification(repo, logs, state, state_path, events, execute, tasks):
         require_run_branch(repo, state["branch"])
         if head(repo) != snapshot or not git_clean(repo):
             return stop("snapshot_changed")
+        child_environment = test_environment(repo)
         execution = events.emit("tests", "test_started", "started", task_id=tasks[-1]["id"], attempt=ordinal,
                                 metadata={"index": index, "stage": "final_verification"})
         context = {"repo": str(repo), "logs": str(logs), "run_id": state["run_id"], "task": tasks[-1]["id"],
@@ -1390,7 +1392,8 @@ def final_verification(repo, logs, state, state_path, events, execute, tasks):
         save_json(state_path, state)
         started = _execution_clock()
         try:
-            result = execute(command, repo, policy["timeout_seconds"])
+            with activated(child_environment):
+                result = execute(command, repo, policy["timeout_seconds"])
         except BaseException as exc:
             cleanup = getattr(exc, "cleanup_confirmed", None)
             if cleanup is True or (cleanup is None and getattr(exc, "process_started", None) is False):
@@ -1736,6 +1739,7 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                 require_run_branch(repo, state["branch"])
                 if head(repo) != task_head:
                     raise PilotError("Git HEAD changed before controller verification")
+                child_environment = test_environment(repo)
                 execution = events.emit("tests", "test_started", "started", task_id=ident, attempt=attempt, metadata={"index": index})
                 print(f"[{ident}] Running test {index}/{len(commands)}", flush=True)
                 context = {"repo": str(repo), "logs": str(logs), "run_id": state["run_id"],
@@ -1743,7 +1747,8 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                 gate = TestProcessGate(repo, context)
                 test_started = _execution_clock()
                 try:
-                    result = execute(cmd, repo, state["final_verification"]["timeout_seconds"])
+                    with activated(child_environment):
+                        result = execute(cmd, repo, state["final_verification"]["timeout_seconds"])
                 except BaseException as exc:
                     cleanup = getattr(exc, "cleanup_confirmed", None)
                     if (cleanup is True or (cleanup is None and getattr(exc, "process_started", None) is False)):
