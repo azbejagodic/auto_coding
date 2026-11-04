@@ -48,14 +48,14 @@ MAX_VERDICT_BYTES = 128 * 1024
 MAX_REVIEW_ISSUE_CHARS = 2000
 MAX_REVIEW_ISSUES_TOTAL = 9000
 MAX_REVIEW_SUMMARY_CHARS = 4000
-MAX_CORRECTION_CONTEXT = 14000
+MAX_CORRECTION_CONTEXT = 22000
 MAX_TEST_FEEDBACK = 12000
 VERDICT_SCHEMA = {
     "type": "object",
     "properties": {
         "decision": {"type": "string", "enum": ["APPROVED", "REJECTED"]},
         "issues": {"type": "array", "items": {"type": "string", "minLength": 1,
-                                             "maxLength": MAX_REVIEW_ISSUE_CHARS}, "maxItems": 20},
+                                             "maxLength": MAX_REVIEW_ISSUE_CHARS}},
         "summary": {"type": "string", "minLength": 1, "maxLength": MAX_REVIEW_SUMMARY_CHARS},
         "verification": {"type": "object", "properties": {
             "status": {"type": "string", "enum": ["passed", "failed", "environment_blocked", "not_run"]},
@@ -401,7 +401,7 @@ def checked_review(verdict_path: Path, *, require_verification=False) -> dict:
         if (not isinstance(verdict, dict) or not {"decision", "issues", "summary"} <= set(verdict)
                 or not set(verdict) <= {"decision", "issues", "summary", "verification"}
                 or verdict["decision"] not in ("APPROVED", "REJECTED")
-                or not isinstance(verdict["issues"], list) or len(verdict["issues"]) > 20
+                or not isinstance(verdict["issues"], list)
                 or any(not isinstance(x, str) or not x.strip()
                        or len(x) > MAX_REVIEW_ISSUE_CHARS for x in verdict["issues"])
                 or sum(len(x) for x in verdict["issues"]) > MAX_REVIEW_ISSUES_TOTAL
@@ -661,34 +661,58 @@ def publish_approved(repo, state, state_path, events):
 
 
 def correction_context(prior: list[dict]) -> str:
-    """Keep the latest blockers complete and older review issues as a bounded checklist."""
+    """Keep the latest verdict complete and older review issues as a bounded checklist."""
     if not prior:
         return ""
     latest = prior[-1]
     review = latest.get("review")
     if isinstance(review, dict) and review.get("decision") == "REJECTED":
         issues = review["issues"]
-        current = "\n".join(f"{index}. {issue}" for index, issue in enumerate(issues, 1))
+        current = json.dumps(review, ensure_ascii=False, separators=(",", ":"))
         label = f"CURRENT CODEX B BLOCKERS (attempt {latest.get('attempt', '?')}):\n"
         seen = {issue.strip().casefold() for issue in issues}
     else:
         current = latest.get("feedback") or ""
         label = f"LATEST FAILURE (attempt {latest.get('attempt', '?')}):\n"
         seen = set()
+    recent_rejection = None
+    saved_verdict = ""
+    if not (isinstance(review, dict) and review.get("decision") == "REJECTED"):
+        recent_rejection = next((entry for entry in reversed(prior[:-1])
+                                 if isinstance(entry.get("review"), dict)
+                                 and entry["review"].get("decision") == "REJECTED"), None)
+        if recent_rejection:
+            saved_verdict = (f"\n\nMOST RECENT COMPLETE CODEX B VERDICT (attempt {recent_rejection.get('attempt', '?')}):\n"
+                             + json.dumps(recent_rejection["review"], ensure_ascii=False, separators=(",", ":")))
     if not current:
         current = "No detailed feedback was recorded for the latest attempt; recheck earlier issues."
-    guidance = ("Fix the reported problems in the current task. Preserve behavior that "
-                "already works and keep the change focused. Recheck earlier review issues "
+    verdict_guidance = ("Read the entire Codex B verdict, including every issue, its summary and verification details. "
+                        "Address every actionable blocking finding before requesting another review. "
+                        if saved_verdict or (isinstance(review, dict) and review.get("decision") == "REJECTED")
+                        else "Use the latest test or execution failure evidence. ")
+    guidance = (verdict_guidance + "Investigate shared "
+                "root causes and related edge cases; add regression tests for confirmed bugs where practical. "
+                "Re-run relevant tests and report what was corrected. Preserve all task requirements and safety "
+                "rules. Preserve behavior that already works and keep the change focused. Recheck earlier review issues "
                 "and fix any still present; do not rework an issue that is already fixed. "
                 "Omission from a later review is not proof that an earlier issue is resolved.\n\n")
     base = guidance + label
-    if len(base) + len(current) > MAX_CORRECTION_CONTEXT - 250:
+    room = MAX_CORRECTION_CONTEXT - 250 - len(base) - len(saved_verdict)
+    if room < 0 or (isinstance(review, dict) and review.get("decision") == "REJECTED"
+                    and len(current) > room):
+        raise PilotError("Complete Codex B verdict exceeds the bounded correction context; inspect run logs")
+    if len(current) > room:
         marker = "\n[Feedback shortened; full evidence remains in the run logs.]\n"
-        room = MAX_CORRECTION_CONTEXT - 250 - len(base) - len(marker)
-        current = current[:room // 2] + marker + current[-(room - room // 2):]
-    result = base + current
+        if room < len(marker):
+            raise PilotError("Latest failure and complete Codex B verdict exceed the bounded correction context")
+        available = room - len(marker)
+        tail = available - available // 2
+        current = current[:available // 2] + marker + (current[-tail:] if tail else "")
+    result = base + current + saved_verdict
     earlier = []
     for entry in reversed(prior[:-1]):
+        if entry is recent_rejection:
+            continue
         verdict = entry.get("review")
         if not isinstance(verdict, dict) or verdict.get("decision") != "REJECTED":
             continue
@@ -713,23 +737,43 @@ def correction_context(prior: list[dict]) -> str:
     return result
 
 
-def review_prompt_for(task: dict, stat: str, diff: str, tests: list[dict], implementer_tests="") -> str:
+def review_prompt_for(task: dict, stat: str, diff: str, tests: list[dict], implementer_tests="",
+                      previous_rejection=None) -> str:
+    previous = ""
+    if previous_rejection:
+        issues = previous_rejection["review"]["issues"]
+        previous = (f"\n\nPRECEDING CODEX B REJECTION (attempt {previous_rejection['attempt']}):\n"
+                    "Verify that EVERY finding below was addressed in the corrected code. Re-examine affected "
+                    "behavior for regressions introduced by the fixes. Report all remaining or newly discovered "
+                    "issues together. Do not automatically approve solely because these findings were fixed.\n"
+                    + "\n".join(f"- {issue}" for issue in issues))
     return ("You are Codex B, an independent READ-ONLY reviewer. Inspect the current "
-        "task's STAGED diff, all relevant project files, and tests. Previous tasks are locally "
+        "task's entire implementation: STAGED diff, affected behavior, relevant project files and tests, "
+        "error paths, and important state transitions. Stay within this task's scope; do not audit unrelated "
+        "repository code. Previous tasks are locally "
         "committed. Do not blindly trust implementer claims or test results. Reject only for "
-        "substantive, reproducible blockers in the CURRENT task/slice. List ALL such blockers "
-        "together in one verdict. For EACH rejected issue, state the affected path or behavior, "
+        "substantive, reproducible blockers in the CURRENT task/slice. Do not stop reviewing after the first "
+        "blocking bug; continue through the remaining affected functionality. Report EVERY distinct actionable "
+        "issue discovered together in one verdict, with no fixed finding count. Include correctness bugs, "
+        "regressions, authorization/security flaws, significant missing test coverage, and task-requirement "
+        "violations. Group findings with a shared root cause but never omit independent defects. Clearly distinguish "
+        "confirmed defects from speculative concerns; do not turn unsupported speculation into a blocker. "
+        "List ALL such blockers together in one verdict. For EACH rejected issue, state the code location, "
+        "impact, affected path or behavior, concrete evidence or "
         "a minimal reproduction, the observed and expected results, and a concrete check "
         "that would show it is fixed. Keep each issue self-contained and concise. "
-        f"Use at most {MAX_REVIEW_ISSUES_TOTAL} characters across all issues. "
+        f"Use at most {MAX_REVIEW_ISSUES_TOTAL} characters across all issues; stay concise without silently "
+        "omitting distinct blockers. If the bounded response cannot hold complete findings, return REJECTED "
+        "and explicitly say the review is incomplete; never approve on incomplete evidence. "
         "Independently recheck corrected code; report blockers still present or newly introduced. "
         "Do not block approval for "
         "optional polish, hypothetical risks, unrelated pre-existing issues or future slices. "
+        "Approve only if the current implementation meets the existing acceptance criteria. "
         "If no current blockers remain, return APPROVED with an empty issues list; put any "
         "optional polish in summary as non-blocking suggestions. Put every blocker in issues, "
         "not only in summary; the decision and issues must agree. Inspect Git/credential safety "
         "and data-loss risks carefully. Merge to Main and per-task model/reasoning selection "
-        "are deferred and are not approval blockers. Do not change files.\n\nTASK:\n" + task["prompt"] +
+        "are deferred and are not approval blockers. Do not change files." + previous + "\n\nTASK:\n" + task["prompt"] +
         "\n\nCURRENT TASK CHANGES:\n" + stat + "\n\nDIFF (truncated; inspect repository for full):\n" + diff[:35000] +
         "\n\nTEST RESULTS:\n" + json.dumps(tests) +
         "\n\nCONFIGURED FOCUSED CHECKS (argv):\n" + json.dumps(task["test_commands"]) +
@@ -817,7 +861,10 @@ def verify_review_ready(repo: Path, logs: Path, state: dict, task: dict) -> tupl
     if report:
         answer_path = logs / f"{task['id']}-{pending['attempt']:02d}-a-answer.txt"
         report = f"Saved answer: {answer_path}\n" + report
-    return record, review_prompt_for(task, stat, diff, tests, report)
+    preceding = next((entry for entry in reversed(state["history"])
+                      if entry.get("task") == task["id"] and isinstance(entry.get("review"), dict)
+                      and entry["review"].get("decision") == "REJECTED"), None)
+    return record, review_prompt_for(task, stat, diff, tests, report, preceding)
 
 
 def schedule_review_retry(pending: dict) -> float:

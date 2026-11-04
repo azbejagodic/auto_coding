@@ -371,6 +371,7 @@ class ReviewRecoveryTests(unittest.TestCase):
         self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (3, 3, 2))
         self.assertIn("Fix the implementation", fake.a_prompts[2])
         self.assertIn("correction broke reset verification", fake.a_prompts[2])
+        self.assertIn("Fix the implementation", fake.b_prompts[1])
 
     def test_all_failed_test_summaries_survive_large_output(self):
         self.plan.write_text(json.dumps({"tasks": [{"id": "one", "prompt": "Implement one",
@@ -396,6 +397,80 @@ class ReviewRecoveryTests(unittest.TestCase):
                      "Independently recheck corrected code", "Do not blindly trust"):
             self.assertIn(text, prompt)
         self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (1, 1, 1))
+
+    def test_reviewer_must_continue_past_first_blocker_and_cover_affected_paths(self):
+        fake = FakeExecutor()
+        self.assertEqual(self.run_fake(fake), 0)
+        prompt = fake.b_prompts[0]
+        for text in ("entire implementation", "error paths", "state transitions",
+                     "Do not stop reviewing after the first", "remaining affected functionality",
+                     "EVERY distinct actionable", "no fixed finding count", "authorization/security flaws",
+                     "significant missing test coverage", "task-requirement", "shared root cause",
+                     "never omit independent defects", "confirmed defects from speculative concerns",
+                     "code location", "impact", "Approve only if", "Stay within this task's scope"):
+            self.assertIn(text, prompt)
+
+    def test_complete_multi_issue_verdict_reaches_a_and_next_b_without_extra_calls(self):
+        issues = ["app.txt:12 reset returns stale data; reproduce with reset twice; clear state",
+                  "app.txt:31 save ignores errors; reproduce with unwritable file; propagate failure"]
+        rejected = {"decision": "REJECTED", "issues": issues,
+                    "summary": "Two independent blocking paths remain",
+                    "verification": {"status": "failed", "details": "python -m unittest test_app: two failures"}}
+        fake = FakeExecutor([rejected, APPROVED])
+        self.assertEqual(self.run_fake(fake), 0)
+        self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (2, 2, 2))
+        correction, rereview = fake.a_prompts[1], fake.b_prompts[1]
+        for issue in issues:
+            self.assertEqual(correction.count(issue), 1)
+            self.assertEqual(rereview.count(issue), 1)
+        self.assertIn(rejected["summary"], correction)
+        self.assertIn(rejected["verification"]["details"], correction)
+        self.assertIn("Read the entire Codex B verdict", correction)
+        self.assertIn("Address every actionable blocking finding", correction)
+        self.assertIn("shared root causes and related edge cases", correction)
+        self.assertIn("regression tests", correction)
+        self.assertIn("Re-run relevant tests", correction)
+        self.assertIn("Verify that EVERY finding below was addressed", rereview)
+        self.assertIn("regressions introduced by the fixes", rereview)
+        self.assertIn("Do not automatically approve", rereview)
+
+    def test_later_rejection_supplies_its_full_finding_set_to_following_review(self):
+        first = {"decision": "REJECTED", "issues": ["reset misses error path", "save omits rollback"],
+                 "summary": "First review"}
+        second = {"decision": "REJECTED", "issues": ["save still omits rollback", "reload now fails"],
+                  "summary": "Correction introduced reload regression"}
+        fake = FakeExecutor([first, second, APPROVED])
+        self.assertEqual(self.run_fake(fake), 0)
+        self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (3, 3, 3))
+        for issue in second["issues"]:
+            self.assertIn(issue, fake.a_prompts[2])
+            self.assertIn(issue, fake.b_prompts[2])
+        self.assertIn("reset misses error path", fake.a_prompts[2])
+        self.assertNotIn("reset misses error path", fake.b_prompts[2])
+        self.assertIn("Correction introduced reload regression", fake.a_prompts[2])
+
+    def test_restarted_review_keeps_preceding_rejection_context(self):
+        issues = ["reset still loses state", "save still hides write failures"]
+        rejected = {"decision": "REJECTED", "issues": issues, "summary": "Both paths need repair"}
+        initial = FakeExecutor([rejected])
+
+        class Interrupted(Exception):
+            cleanup_confirmed = True
+
+        def interrupted(argv, cwd, timeout, *, prompt=None):
+            if "--output-schema" in argv and initial.b_calls == 1:
+                raise Interrupted("review interrupted after confirmed cleanup")
+            return initial(argv, cwd, timeout, prompt=prompt)
+
+        with self.assertRaises(Interrupted):
+            run(self.plan, self.repo, self.logs, execute=interrupted)
+        self.assertEqual((initial.a_calls, initial.test_calls, initial.b_calls), (2, 2, 1))
+        resumed = FakeExecutor([APPROVED], review_only=True)
+        self.assertEqual(self.run_fake(resumed, resume=True), 0)
+        self.assertEqual((resumed.a_calls, resumed.test_calls, resumed.b_calls), (0, 0, 1))
+        for issue in issues:
+            self.assertIn(issue, resumed.b_prompts[0])
+        self.assertIn("Verify that EVERY finding below was addressed", resumed.b_prompts[0])
 
     def test_approval_with_issues_is_invalid_and_never_committed(self):
         ambiguous = {"decision": "APPROVED", "issues": ["A blocker remains"], "summary": "Unclear"}
@@ -577,10 +652,69 @@ class ReviewRecoveryTests(unittest.TestCase):
 
 
 class CorrectionContextTests(unittest.TestCase):
+    def test_verdict_accepts_more_than_twenty_concise_independent_findings(self):
+        verdict = {"decision": "REJECTED", "issues": [f"issue {n}: concrete path and fix" for n in range(21)],
+                   "summary": "Multiple independent failures"}
+        self.assertNotIn("maxItems", runner.VERDICT_SCHEMA["properties"]["issues"])
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "verdict.json"
+            path.write_text(json.dumps(verdict), encoding="utf-8")
+            self.assertEqual(checked_review(path), verdict)
+
+    def test_full_bounded_verdict_keeps_summary_and_verification_without_truncation(self):
+        issues = [f"issue {n}: " + "x" * 850 for n in range(10)]
+        review = {"decision": "REJECTED", "issues": issues,
+                  "summary": "summary:" + "s" * 3900,
+                  "verification": {"status": "failed", "details": "verification:" + "v" * 3900}}
+        context = correction_context([{"attempt": 1, "review": review}])
+        self.assertLessEqual(len(context), MAX_CORRECTION_CONTEXT)
+        self.assertNotIn("Feedback shortened", context)
+        for issue in issues:
+            self.assertIn(issue, context)
+        self.assertIn(review["summary"], context)
+        self.assertIn(review["verification"]["details"], context)
+
+    def test_oversized_complete_verdict_stops_instead_of_dropping_findings(self):
+        review = {"decision": "REJECTED", "issues": ["x"] * MAX_REVIEW_ISSUES_TOTAL,
+                  "summary": "s" * 3900,
+                  "verification": {"status": "failed", "details": "v" * 3900}}
+        with self.assertRaisesRegex(PilotError, "Complete Codex B verdict exceeds"):
+            correction_context([{"attempt": 1, "review": review}])
+
+    def test_failed_correction_keeps_complete_prior_verdict_and_current_test_failure(self):
+        review = {"decision": "REJECTED", "issues": ["reset misses edge case", "save loses failure"],
+                  "summary": "Two independent bugs",
+                  "verification": {"status": "failed", "details": "test_reset and test_save failed"}}
+        context = correction_context([{"attempt": 1, "review": review},
+                                      {"attempt": 2, "feedback": "controller test broke reload"}])
+        for text in (*review["issues"], review["summary"], review["verification"]["details"],
+                     "controller test broke reload"):
+            self.assertEqual(context.count(text), 1)
+        self.assertLessEqual(len(context), MAX_CORRECTION_CONTEXT)
+
+    def test_noisy_latest_test_failure_shortens_only_test_output(self):
+        review = {"decision": "REJECTED", "issues": ["reset: fix " + "x" * 8000],
+                  "summary": "s" * 3900,
+                  "verification": {"status": "failed", "details": "v" * 3900}}
+        context = correction_context([{"attempt": 1, "review": review},
+                                      {"attempt": 2, "feedback": "head" + "noise" * 5000 + "tail"}])
+        self.assertLessEqual(len(context), MAX_CORRECTION_CONTEXT)
+        self.assertIn(review["issues"][0], context)
+        self.assertIn(review["summary"], context)
+        self.assertIn(review["verification"]["details"], context)
+        for text in ("head", "tail", "Feedback shortened"):
+            self.assertIn(text, context)
+
     def test_missing_latest_feedback_does_not_erase_earlier_issues(self):
         prior = [{"attempt": 1, "review": {"decision": "REJECTED", "issues": ["Unresolved reset"]}},
                  {"attempt": 2, "feedback": ""}]
         self.assertIn("Unresolved reset", correction_context(prior))
+
+    def test_test_only_failure_does_not_claim_there_was_a_review_verdict(self):
+        context = correction_context([{"attempt": 1, "feedback": "test_reset failed"}])
+        self.assertIn("test_reset failed", context)
+        self.assertIn("latest test or execution failure evidence", context)
+        self.assertNotIn("Read the entire Codex B verdict", context)
 
     def test_context_is_bounded_with_complete_current_blockers_and_explicit_omissions(self):
         current = [f"current-{index}: " + "x" * 880 for index in range(10)]
