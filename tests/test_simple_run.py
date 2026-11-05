@@ -18,7 +18,7 @@ class SimpleRunnerTests(unittest.TestCase):
         self.repo.mkdir()
         subprocess.run(['git', 'init', '-b', 'feature/auto'], cwd=self.repo, check=True, capture_output=True)
         self.plan = self.root / 'tasks.json'
-        self.plan.write_text(json.dumps({'tasks':[{'id':'one', 'prompt':'First'}, {'id':'two', 'prompt':'Second'}]}))
+        self.plan.write_text(json.dumps({'tasks':[{'id':'one', 'prompt':'First', 'test_commands': [['fixture-focused-check']]}, {'id':'two', 'prompt':'Second', 'test_commands': [['fixture-focused-check']]}]}))
         calls = []
         def fake(argv, cwd, timeout, *, prompt=None):
             calls.append(argv)
@@ -325,8 +325,8 @@ class CheckpointAndRecoveryTests(unittest.TestCase):
         self.logs = self.root / "logs"
         self.plan = self.root / "plan.json"
         self.plan.write_text(json.dumps({"tasks": [
-            {"id": "first", "prompt": "Make first file"},
-            {"id": "second", "prompt": "Make second file"}
+            {"id": "first", "prompt": "Make first file", 'test_commands': [['fixture-focused-check']]},
+            {"id": "second", "prompt": "Make second file", 'test_commands': [['fixture-focused-check']]}
         ]}), encoding="utf-8")
 
     def make_executor(self, fail_second=False, write_second=True):
@@ -474,7 +474,7 @@ class CheckpointAndRecoveryTests(unittest.TestCase):
         import auto_coding.simple_run as mod
         fake, seen = self.make_executor()
         first_only = self.root/'first.json'
-        first_only.write_text(json.dumps({'tasks':[{'id':'first','prompt':'Make first file'}]}))
+        first_only.write_text(json.dumps({'tasks':[{'id':'first','prompt':'Make first file', 'test_commands': [['fixture-focused-check']]}]}))
         original = mod.local_commit
         calls = {'count':0}
         def commit_then_crash(repo,ident):
@@ -493,10 +493,11 @@ class CheckpointAndRecoveryTests(unittest.TestCase):
         # is one new controller invocation, not a replay of task verification.
         for key in metrics_before.keys() - {"tests"}:
             self.assertEqual(metrics_after[key], metrics_before[key])
-        self.assertEqual(metrics_after["tests"]["invocations"], 1)
-        self.assertEqual(metrics_after["tests"]["observed_calls"], 1)
-        self.assertEqual(metrics_after["tests"]["duration_observations"], 1)
-        self.assertEqual(metrics_after["tests"]["outcomes"], {"success": 1})
+        self.assertEqual(metrics_before["tests"]["invocations"], 1)
+        self.assertEqual(metrics_after["tests"]["invocations"], 2)  # Focused check and final suite; neither repeated.
+        self.assertEqual(metrics_after["tests"]["observed_calls"], 2)
+        self.assertEqual(metrics_after["tests"]["duration_observations"], 2)
+        self.assertEqual(metrics_after["tests"]["outcomes"], {"success": 2})
         self.assertEqual(metrics_after["tests"]["unconfirmed_invocations"], 0)
         self.assertIsNone(metrics_after["tests"]["usage"])
         state=json.loads((self.logs/'state.json').read_text())
@@ -513,7 +514,7 @@ class CheckpointAndRecoveryTests(unittest.TestCase):
         import auto_coding.simple_run as mod
         fake, _ = self.make_executor()
         only = self.root / 'only.json'
-        only.write_text(json.dumps({'tasks': [{'id': 'first', 'prompt': 'Make first file'}]}))
+        only.write_text(json.dumps({'tasks': [{'id': 'first', 'prompt': 'Make first file', 'test_commands': [['fixture-focused-check']]}]}))
         original = mod.local_commit
         def changed_commit(repo, ident):
             (repo / 'one.txt').write_text('tampered after review')
@@ -546,7 +547,7 @@ class CheckpointAndRecoveryTests(unittest.TestCase):
         import auto_coding.simple_run as mod
         fake, _ = self.make_executor()
         only = self.root / 'only.json'
-        only.write_text(json.dumps({'tasks': [{'id': 'first', 'prompt': 'Make first file'}]}))
+        only.write_text(json.dumps({'tasks': [{'id': 'first', 'prompt': 'Make first file', 'test_commands': [['fixture-focused-check']]}]}))
         with patch.object(mod, 'local_commit', side_effect=mod.PilotError('before commit')):
             self.assertEqual(run(only, self.repo, self.logs, create_repo=True, execute=fake), 1)
         original_state = json.loads((self.logs / 'state.json').read_text())
@@ -578,7 +579,7 @@ class CheckpointAndRecoveryTests(unittest.TestCase):
                        cwd=self.repo, stdout=subprocess.PIPE, check=True)
         base = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=self.repo, text=True).strip()
         only = self.root / 'only.json'
-        only.write_text(json.dumps({'tasks': [{'id': 'first', 'prompt': 'Make first file'}]}))
+        only.write_text(json.dumps({'tasks': [{'id': 'first', 'prompt': 'Make first file', 'test_commands': [['fixture-focused-check']]}]}))
         fake, _ = self.make_executor()
         with patch.object(mod, 'local_commit', side_effect=mod.PilotError('before commit')):
             self.assertEqual(run(only, self.repo, self.logs, execute=fake), 1)
@@ -609,7 +610,7 @@ class CheckpointAndRecoveryTests(unittest.TestCase):
         import auto_coding.simple_run as mod
         fake, _ = self.make_executor()
         only = self.root/'only.json'
-        only.write_text(json.dumps({'tasks':[{'id':'first','prompt':'Make first file'}]}))
+        only.write_text(json.dumps({'tasks':[{'id':'first','prompt':'Make first file', 'test_commands': [['fixture-focused-check']]}]}))
         original = mod.local_commit
         with patch.object(mod, 'local_commit', side_effect=mod.PilotError('before commit')):
             self.assertEqual(run(only, self.repo, self.logs, create_repo=True, execute=fake), 1)
@@ -647,7 +648,7 @@ class EventLogRecoveryTests(unittest.TestCase):
             root = Path(directory)
             repo, logs = root / 'repo', root / 'logs'
             plan = root / 'plan.json'
-            plan.write_text(json.dumps({'tasks': [{'id': 'one', 'prompt': 'Build'}]}))
+            plan.write_text(json.dumps({'tasks': [{'id': 'one', 'prompt': 'Build', 'test_commands': [['fixture-focused-check']]}]}))
             def fail(argv, cwd, timeout, *, prompt=None):
                 return 1, 'failure', False
             self.assertEqual(run(plan, repo, logs, create_repo=True, execute=fail), 1)
@@ -689,7 +690,7 @@ class EventLogRecoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             plan = root / 'plan.json'; plan.write_text(json.dumps({'tasks': [
-                {'id': 'first', 'prompt': 'First'}, {'id': 'second', 'prompt': 'Second'}]}))
+                {'id': 'first', 'prompt': 'First', 'test_commands': [['fixture-focused-check']]}, {'id': 'second', 'prompt': 'Second', 'test_commands': [['fixture-focused-check']]}]}))
             repo = root / 'repo'; logs = root / 'logs'
             calls = {'a': 0}
             def fails(argv, cwd, timeout, *, prompt=None):

@@ -171,6 +171,7 @@ def audit(engine, plan, repo, logs, *, model, execute, timeout=300, goal="", fin
     if plan.suffix.lower() != ".json":
         raise engine.PilotError("New workflow audits require a JSON plan")
     tasks, plan_sha = engine.load_tasks(plan)
+    controller_tests = engine.new_workflow_test_mode(plan, tasks, controller_tests)
     policy = engine.requested_verification(plan, plan_sha, final_verification_config)
     if policy is None:
         raise engine.PilotError("Plan audit requires designated final verification")

@@ -34,6 +34,9 @@ def run_with_verification(plan, repo, logs, **kwargs):
     kwargs.setdefault("final_verification_config", FINAL_POLICY)
     kwargs.setdefault("controller_tests", True)
     def with_final(argv, cwd, timeout, **options):
+        if argv == ["fixture-focused-check"]:
+            # Explicit harmless focused command for checkpoint-only fixtures.
+            return runner._CallResult(0, "focused fixture passed", False, True, True)
         if argv == ["fixture-final-suite"]:
             # Fail the test if final verification is ever scheduled after an
             # uncertain process or before all independent approvals/commits.

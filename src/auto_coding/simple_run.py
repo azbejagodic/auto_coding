@@ -152,6 +152,17 @@ def controller_commands(task, state):
     return task["test_commands"] if state.get("controller_tests", True) else []
 
 
+def new_workflow_test_mode(plan, tasks, controller_tests):
+    """Require approved focused checks for new JSON runs, not saved workflows."""
+    if plan.suffix.lower() == ".json":
+        if controller_tests is False:
+            raise PilotError("New JSON workflows require controller-managed focused tests")
+        if any(not task["test_commands"] for task in tasks):
+            raise PilotError("Every task in a new JSON workflow requires at least one focused test_commands entry")
+        return True
+    return controller_tests if controller_tests is not None else False
+
+
 def save_json(path: Path, value: dict) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     with temporary.open("w", encoding="utf-8") as stream:
@@ -1918,9 +1929,19 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
     else:
         if resume:
             raise PilotError("No existing state to resume")
+        manifest_path = logs / "run-manifest.json"
+        if manifest_path.exists():
+            # Initialization can crash before state.json. Keep its saved mode;
+            # the existing manifest reconciliation below validates its identity.
+            saved_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(saved_manifest, dict):
+                raise PilotError("Run manifest must be an object")
+            if controller_tests is None:
+                controller_tests = saved_manifest.get("controller_tests", False)
+        else:
+            controller_tests = new_workflow_test_mode(plan, tasks, controller_tests)
         audit_binding = plan_audit.authorize(sys.modules[__name__], approved_audit, repo,
                                             plan_sha, tasks, requested_policy, controller_tests)
-        manifest_path = logs / "run-manifest.json"
         timeline_path = logs / "events.jsonl"
         created = datetime.datetime.now(datetime.timezone.utc).isoformat()
         run_id = str(uuid.uuid4())
@@ -2312,7 +2333,7 @@ def main(argv=None):
     parser.add_argument("--max-observed-tokens", type=int,
                         help="Stop new A/B calls once observed input plus output tokens reach this limit; missing usage also stops calls")
     parser.add_argument("--controller-tests", action="store_true", default=None,
-                        help="Opt in to controller-managed per-task focused checks; fixed across resume")
+                        help="Controller-managed focused checks (required for new JSON workflows; resume preserves saved mode)")
     parser.add_argument("--final-verification-config", type=Path,
                         help="JSON verification policy for TXT/MD or legacy plans; saved for subsequent resume")
     parser.add_argument("--model-a")

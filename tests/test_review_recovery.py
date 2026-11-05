@@ -522,7 +522,9 @@ class ReviewRecoveryTests(unittest.TestCase):
 
     def test_implementer_prompt_limits_scope_and_requires_focused_verification_and_diff_review(self):
         fake = FakeExecutor()
-        self.assertEqual(self.run_fake(fake, controller_tests=False), 0)
+        # Historical implementer-tested workflow; new JSON runs cannot select it.
+        with patch.object(runner, "new_workflow_test_mode", return_value=False):
+            self.assertEqual(self.run_fake(fake, controller_tests=False), 0)
         prompt = fake.a_prompts[0]
         for text in ("only this task and necessary related changes", "focused tests relevant to modified behavior",
                      "Avoid the full test suite during individual tasks", "unless explicitly required or justified",

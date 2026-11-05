@@ -20,9 +20,10 @@ POLICY = {"test_commands": [["fake-final"]], "minimum_tests": 2, "timeout_second
 
 
 class Executor:
-    def __init__(self, final=(), reviews=(), hook=None, implementation=None):
+    def __init__(self, final=(), reviews=(), hook=None, implementation=None, focused=()):
         self.final = list(final)
         self.reviews = list(reviews)
+        self.focused = list(focused)
         self.hook, self.implementation = hook, implementation
         self.calls, self.timeouts, self.a_prompts, self.b_prompts = [], [], [], []
 
@@ -31,7 +32,8 @@ class Executor:
             role = "final"
             result = self.final.pop(0) if self.final else runner._CallResult(0, PASSED, False, True, True)
         elif argv == ["fake-focused"]:
-            role, result = "focused", runner._CallResult(0, "focused check passed", False, True, True)
+            role = "focused"
+            result = self.focused.pop(0) if self.focused else runner._CallResult(0, "focused check passed", False, True, True)
         else:
             answer = Path(argv[argv.index("--output-last-message") + 1])
             if "--output-schema" in argv:
@@ -124,12 +126,19 @@ class FinalVerificationTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             return runner.run(self.plan, self.repo, self.logs, execute=fake, **kwargs)
 
-    def test_ordinary_task_uses_a_report_b_commit_then_one_final_suite(self):
+    def start_legacy(self, fake):
+        # Construct pre-B13a2 saved state; resume itself uses production binding.
+        with patch.object(runner, "new_workflow_test_mode", return_value=False):
+            return self.run_fake(fake)
+
+    def test_ordinary_task_uses_controller_checks_b_commit_then_one_final_suite(self):
         fake = Executor()
         self.assertEqual(self.run_fake(fake, timeout=45), 0)
-        self.assertEqual(fake.calls, ["A", "B", "final"])
-        self.assertEqual(fake.timeouts, [("A", 45), ("B", 45), ("final", 2400)])
-        self.assertIn("fake-focused", fake.a_prompts[0])
+        self.assertEqual(fake.calls, ["A", "focused", "B", "final"])
+        self.assertEqual(fake.timeouts, [("A", 45), ("focused", 2400), ("B", 45), ("final", 2400)])
+        self.assertNotIn("fake-focused", fake.a_prompts[0])
+        self.assertIn("Do not execute tests", fake.a_prompts[0])
+        self.assertIn("Do not execute tests", fake.b_prompts[0])
         self.assertIn("IMPLEMENTER TEST REPORT", fake.b_prompts[0])
         self.assertIn("CONFIGURED FOCUSED CHECKS", fake.b_prompts[0])
         self.assertIn("fake-focused", fake.b_prompts[0])
@@ -142,11 +151,25 @@ class FinalVerificationTests(unittest.TestCase):
         names = [event["event"] for event in self.events()]
         self.assertLess(names.index("checkpoint_committed"), names.index("final_verification_started"))
 
-    def test_controller_focused_checks_remain_an_explicit_opt_in(self):
+    def test_controller_focused_checks_are_the_json_default(self):
         fake = Executor()
-        self.assertEqual(self.run_fake(fake, controller_tests=True, timeout=30), 0)
+        self.assertEqual(self.run_fake(fake, timeout=30), 0)
         self.assertEqual(fake.calls, ["A", "focused", "B", "final"])
         self.assertEqual(dict(fake.timeouts)["focused"], 2400)
+
+    def test_failed_focused_checks_return_to_a_before_any_b_review(self):
+        fake = Executor(focused=[runner._CallResult(1, "focused regression failed", False, True, True)])
+        self.assertEqual(self.run_fake(fake), 0)
+        self.assertEqual(fake.calls, ["A", "focused", "A", "focused", "B", "final"])
+        self.assertIn("focused regression failed", fake.a_prompts[1])
+        self.assertEqual(len(self.state()["completed"]), 1)
+
+    def test_failed_focused_checks_cannot_commit_or_launch_b_at_attempt_limit(self):
+        fake = Executor(focused=[runner._CallResult(1, "failed", False, True, True)])
+        self.assertEqual(self.run_fake(fake, attempts=1), 1)
+        self.assertEqual(fake.calls, ["A", "focused"])
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.initial)
+        self.assertEqual(self.state()["completed"], [])
 
     def test_missing_final_designation_blocks_before_a(self):
         del self.document["final_verification"]
@@ -190,7 +213,7 @@ class FinalVerificationTests(unittest.TestCase):
         self.assertEqual(self.run_fake(fake), 1)
         state = self.state()
         self.assertEqual(state["final_verification_result"]["outcome"], "test_failure")
-        self.assertEqual(fake.calls, ["A", "B", "final"])
+        self.assertEqual(fake.calls, ["A", "focused", "B", "final"])
         self.assertEqual(state["completed"], ["one"])
         self.assertEqual(self.git("rev-parse", "HEAD"), state["history"][0]["commit"])
         self.assertEqual((self.logs / "final-verification-0001-test-1.txt").read_text(), FAILED)
@@ -201,7 +224,7 @@ class FinalVerificationTests(unittest.TestCase):
         self.assertEqual(self.state()["final_verification_result"]["outcome"], "infrastructure_timeout")
         self.assertFalse(execution_lock(self.repo, ".job.lock").exists())
         self.assertEqual(self.run_fake(fake, resume=True, timeout=90), 0)
-        self.assertEqual(fake.calls, ["A", "B", "final", "final"])
+        self.assertEqual(fake.calls, ["A", "focused", "B", "final", "final"])
         self.assertEqual(fake.timeouts[-1], ("final", 2400))
         self.assertEqual(self.state()["final_verification_invocations"], 2)
 
@@ -209,14 +232,14 @@ class FinalVerificationTests(unittest.TestCase):
         fake = Executor(final=[runner._CallResult(127, "unavailable", False, True, False)])
         self.assertEqual(self.run_fake(fake), 1)
         self.assertEqual(self.state()["final_verification_result"]["outcome"], "infrastructure_process_failure")
-        self.assertEqual(fake.calls, ["A", "B", "final"])
+        self.assertEqual(fake.calls, ["A", "focused", "B", "final"])
 
     def test_cleanup_uncertainty_blocks_resume_new_runs_and_later_commands(self):
         self.document["final_verification"] = POLICY | {"test_commands": [["fake-final"], ["fake-final"]]}
         self.write_plan()
         fake = Executor(final=[runner._CallResult(0, PASSED, False, False, True)])
         self.assertEqual(self.run_fake(fake), 1)
-        self.assertEqual(fake.calls, ["A", "B", "final"])
+        self.assertEqual(fake.calls, ["A", "focused", "B", "final"])
         self.assertIn("uncertain_test", self.state())
         self.assertTrue(execution_lock(self.repo, ".process-uncertain.json").exists())
         execute = Mock()
@@ -234,7 +257,7 @@ class FinalVerificationTests(unittest.TestCase):
             self.run_fake(fake)
         self.assertFalse(execution_lock(self.repo, ".job.lock").exists())
         self.assertEqual(self.run_fake(fake, resume=True), 0)
-        self.assertEqual(fake.calls, ["A", "B", "final", "final"])
+        self.assertEqual(fake.calls, ["A", "focused", "B", "final", "final"])
 
     def test_unverified_exception_keeps_workspace_protection(self):
         error = OSError("child cleanup unavailable")
@@ -288,7 +311,7 @@ class FinalVerificationTests(unittest.TestCase):
         self.assertEqual(self.run_fake(fake), 0)
         (self.logs / "final-verification-0001-test-1.txt").unlink()
         self.assertEqual(self.run_fake(fake, resume=True), 0)
-        self.assertEqual(fake.calls, ["A", "B", "final", "final"])
+        self.assertEqual(fake.calls, ["A", "focused", "B", "final", "final"])
         self.assertTrue((self.logs / "final-verification-0002-test-1.txt").is_file())
 
     def test_orphan_final_artifact_blocks_execution_without_overwrite(self):
@@ -317,14 +340,14 @@ class FinalVerificationTests(unittest.TestCase):
         with self.assertRaises(runner.PilotError):
             self.run_fake(execute, resume=True, final_verification_config=POLICY | {"timeout_seconds": 3600})
         with self.assertRaisesRegex(runner.PilotError, "fixed"):
-            self.run_fake(execute, resume=True, controller_tests=True)
+            self.run_fake(execute, resume=True, controller_tests=False)
         execute.assert_not_called()
         self.assertEqual(self.state()["final_verification"]["timeout_seconds"], 2400)
 
     def test_b_rejection_requires_fresh_a_report_and_independent_review(self):
         fake = Executor(reviews=[{"decision": "REJECTED", "issues": ["Fix app.py version behavior"], "summary": "Incorrect"}])
         self.assertEqual(self.run_fake(fake), 0)
-        self.assertEqual(fake.calls, ["A", "B", "A", "B", "final"])
+        self.assertEqual(fake.calls, ["A", "focused", "B", "A", "focused", "B", "final"])
         self.assertIn("version behavior", fake.a_prompts[1])
         self.assertIn("implementation 2", fake.b_prompts[1])
         self.assertNotEqual(self.state()["history"][0]["a_report"], self.state()["history"][1]["a_report"])
@@ -332,13 +355,13 @@ class FinalVerificationTests(unittest.TestCase):
     def test_invalid_b_verdict_cannot_reach_final_testing_or_commit(self):
         fake = Executor(reviews=["bad", "bad", "bad"])
         self.assertEqual(self.run_fake(fake), 1)
-        self.assertEqual(fake.calls, ["A", "B", "B", "B"])
+        self.assertEqual(fake.calls, ["A", "focused", "B", "B", "B"])
         self.assertEqual(self.git("rev-parse", "HEAD"), self.initial)
         self.assertNotEqual(self.state()["status"], "completed")
 
     def test_review_only_recovery_preserves_mode_timeout_and_implementation(self):
         fake = Executor(reviews=[runner._CallResult(127, "connection unavailable", False, True, False)])
-        self.assertEqual(self.run_fake(fake), 1)
+        self.assertEqual(self.start_legacy(fake), 1)
         self.assertTrue(self.state()["pending_review"])
         self.assertEqual(self.run_fake(fake, resume=True), 0)
         self.assertEqual(fake.calls, ["A", "B", "B", "final"])
@@ -346,7 +369,7 @@ class FinalVerificationTests(unittest.TestCase):
 
     def test_review_ready_requires_saved_implementer_report_identity(self):
         fake = Executor(reviews=[runner._CallResult(127, "unavailable", False, True, False)])
-        self.assertEqual(self.run_fake(fake), 1)
+        self.assertEqual(self.start_legacy(fake), 1)
         state = self.state()
         state["pending_review"]["record"].pop("a_report")
         runner.save_json(self.logs / "state.json", state)
@@ -364,7 +387,7 @@ class FinalVerificationTests(unittest.TestCase):
                 (self.logs / "one-01-a-answer.txt").write_text("altered test claim")
         fake = Executor(hook=hook)
         with self.assertRaisesRegex(runner.PilotError, "report"):
-            self.run_fake(fake)
+            self.start_legacy(fake)
         self.assertEqual(fake.calls, ["A", "B"])
         self.assertEqual(self.git("rev-parse", "HEAD"), self.initial)
 
@@ -373,7 +396,7 @@ class FinalVerificationTests(unittest.TestCase):
             if role == "A":
                 (self.logs / "one-01-a-answer.txt").unlink()
         fake = Executor(hook=hook)
-        self.assertEqual(self.run_fake(fake), 1)
+        self.assertEqual(self.start_legacy(fake), 1)
         self.assertEqual(fake.calls, ["A"])
         execute = Mock()
         with self.assertRaises(runner.PilotError):
@@ -386,12 +409,13 @@ class FinalVerificationTests(unittest.TestCase):
         self.assertEqual(self.run_fake(fake), 1)
         previous_logs, previous_head = self.logs, self.git("rev-parse", "HEAD")
         # This is an externally prepared correction, never generated by the controller.
-        self.document["tasks"] = [{"id": "repair", "prompt": "Correct only app.py for the reported failing assertion"}]
+        self.document["tasks"] = [{"id": "repair", "prompt": "Correct only app.py for the reported failing assertion",
+                                   "test_commands": [["fake-focused"]]}]
         self.write_plan()
         self.logs = self.root / "authorized-correction"
         correction = Executor(implementation="VERSION = 99\n")
         self.assertEqual(self.run_fake(correction), 0)
-        self.assertEqual(correction.calls, ["A", "B", "final"])
+        self.assertEqual(correction.calls, ["A", "focused", "B", "final"])
         self.assertNotEqual(self.git("rev-parse", "HEAD"), previous_head)
         self.assertEqual(json.loads((previous_logs / "state.json").read_text())["status"], "stopped")
         self.assertEqual(self.state()["final_verification_result"]["head"], self.git("rev-parse", "HEAD"))

@@ -31,8 +31,9 @@ class PlanAuditTests(unittest.TestCase):
         self.git("add", "-A")
         self.git("commit", "-m", "seed")
         self.plan = self.root / "plan.json"
-        self.document = {"tasks": [{"id": "one", "prompt": "Implement app.py"},
-                                   {"id": "two", "prompt": "Complete app.py"}], "final_verification": POLICY}
+        self.document = {"tasks": [{"id": "one", "prompt": "Implement app.py", "test_commands": [["fake-focused"]]},
+                                   {"id": "two", "prompt": "Complete app.py", "test_commands": [["fake-focused"]]}],
+                         "final_verification": POLICY}
         self.plan.write_text(json.dumps(self.document))
         self.logs, self.run_logs = self.root / "audit", self.root / "run"
         self.calls = []
@@ -91,6 +92,8 @@ class PlanAuditTests(unittest.TestCase):
         evidence, report = audit.load_evidence(runner, self.logs, self.repo,
                                               runner.load_tasks(self.plan)[1], ["one", "two"])
         self.assertEqual(evidence["configuration"]["reasoning"], "high")
+        self.assertIs(evidence["configuration"]["controller_tests"], True)
+        self.assertIn("Controller-managed focused tests: enabled", self.calls[0][3])
         self.assertEqual(report["decision"], "APPROVE")
         self.assertFalse((self.logs / "state.json").exists())
         self.assertFalse(list(self.logs.glob("review-scratch-*")))
@@ -115,10 +118,12 @@ class PlanAuditTests(unittest.TestCase):
         self.do_audit()
         fake = Executor()
         self.assertEqual(self.start(fake, approved_audit=self.logs), 0)
-        self.assertEqual(fake.calls, ["A", "B", "A", "B", "final"])
+        self.assertEqual(fake.calls, ["A", "focused", "B", "A", "focused", "B", "final"])
+        self.assertTrue(audit.read_json(self.run_logs / "state.json")["controller_tests"])
+        self.assertTrue(audit.read_json(self.run_logs / "run-manifest.json")["controller_tests"])
         self.assertEqual(self.start(fake, resume=True), 0)
         self.assertEqual(len(self.calls), 1)
-        self.assertEqual(len(fake.calls), 5)
+        self.assertEqual(len(fake.calls), 7)
 
     def test_review_only_resume_preserves_binding_and_does_not_audit(self):
         self.do_audit()
@@ -126,10 +131,10 @@ class PlanAuditTests(unittest.TestCase):
             "message": "unexpected status 503 Service Unavailable: upstream unavailable"}}), False)] * 3)
         with patch.object(runner, "_review_sleep"), patch.object(runner, "_review_clock", side_effect=range(1000, 1200, 20)):
             self.assertEqual(self.start(first, approved_audit=self.logs), 1)
-        self.assertEqual(first.calls, ["A", "B", "B", "B"])
+        self.assertEqual(first.calls, ["A", "focused", "B", "B", "B"])
         second = Executor(implementation="VERSION = 'second task'\n")
         self.assertEqual(self.start(second, resume=True, retry_review_once=True), 0)
-        self.assertEqual(second.calls, ["B", "A", "B", "final"])
+        self.assertEqual(second.calls, ["B", "A", "focused", "B", "final"])
         self.assertEqual(len(self.calls), 1)
 
     def test_revise_blocks_start(self):
@@ -293,17 +298,92 @@ class PlanAuditTests(unittest.TestCase):
             self.start(approved_audit=self.logs)
 
     def test_changed_controller_testing_mode_invalidates_approval(self):
-        self.do_audit()
+        # Historical approval: production now rejects creating this mode.
+        with patch.object(runner, "new_workflow_test_mode", return_value=False):
+            self.do_audit()
         fake = Executor()
         with self.assertRaisesRegex(runner.PilotError, "configuration"):
             self.start(fake, approved_audit=self.logs, controller_tests=True)
         self.assertEqual(fake.calls, [])
+        with self.assertRaisesRegex(runner.PilotError, "different settings"):
+            self.do_audit()
+        self.assertEqual(len(self.calls), 1)
 
     def test_matching_controller_testing_mode_starts(self):
         self.assertEqual(self.do_audit(controller_tests=True), 0)
         fake = Executor()
         self.assertEqual(self.start(fake, approved_audit=self.logs, controller_tests=True), 0)
-        self.assertEqual(fake.calls, ["A", "B", "A", "B", "final"])
+        self.assertEqual(fake.calls, ["A", "focused", "B", "A", "focused", "B", "final"])
+
+    def test_missing_or_invalid_task_checks_rejected_before_audit_invocation(self):
+        for index in range(2):
+            for commands in (None, [], ["python -m unittest"], [[]], [[""]], [["python", True]]):
+                document = copy.deepcopy(self.document)
+                if commands is None:
+                    document["tasks"][index].pop("test_commands")
+                else:
+                    document["tasks"][index]["test_commands"] = commands
+                self.plan.write_text(json.dumps(document))
+                with self.subTest(index=index, commands=commands), self.assertRaises(runner.PilotError):
+                    self.do_audit()
+                self.assertEqual(self.calls, [])
+                self.assertFalse(self.logs.exists())
+
+    def test_new_json_cannot_disable_controller_tests_before_audit_or_a(self):
+        with self.assertRaisesRegex(runner.PilotError, "require controller-managed"):
+            self.do_audit(controller_tests=False)
+        fake = Executor()
+        with self.assertRaisesRegex(runner.PilotError, "require controller-managed"):
+            self.start(fake, controller_tests=False)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(fake.calls, [])
+
+    def test_missing_task_checks_rejected_before_a_even_with_supplied_approval(self):
+        self.do_audit()
+        self.document["tasks"][1].pop("test_commands")
+        self.plan.write_text(json.dumps(self.document))
+        fake = Executor()
+        with self.assertRaisesRegex(runner.PilotError, "requires at least one focused"):
+            self.start(fake, approved_audit=self.logs)
+        self.assertEqual(fake.calls, [])
+
+    def test_legacy_review_only_resume_preserves_disabled_mode_and_audit(self):
+        fake = Executor(reviews=[runner._CallResult(127, "unavailable", False, True, False)])
+        with patch.object(runner, "new_workflow_test_mode", return_value=False):
+            self.do_audit()
+            self.assertEqual(self.start(fake, approved_audit=self.logs), 1)
+        before = (self.logs / "audit-evidence.json").read_bytes()
+        self.assertEqual(fake.calls, ["A", "B"])
+        resumed = Executor(implementation="VERSION = 'legacy second task'\n")
+        self.assertEqual(self.start(resumed, resume=True), 0)
+        self.assertEqual(resumed.calls, ["B", "A", "B", "final"])
+        self.assertFalse(audit.read_json(self.run_logs / "state.json")["controller_tests"])
+        self.assertEqual((self.logs / "audit-evidence.json").read_bytes(), before)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_interrupted_legacy_initialization_keeps_saved_mode_without_new_audit(self):
+        for task in self.document["tasks"]:
+            task.pop("test_commands")
+        self.plan.write_text(json.dumps(self.document))
+        original = runner.save_json
+        def fail_state(path, value):
+            if path == self.run_logs / "state.json":
+                raise OSError("interrupted before state persistence")
+            return original(path, value)
+        first = Executor()
+        with patch.object(runner, "new_workflow_test_mode", return_value=False):
+            self.do_audit()
+            with patch.object(runner, "save_json", side_effect=fail_state):
+                with self.assertRaisesRegex(OSError, "interrupted"):
+                    self.start(first, approved_audit=self.logs)
+        self.assertEqual(first.calls, [])
+        self.assertFalse((self.run_logs / "state.json").exists())
+        self.assertFalse(audit.read_json(self.run_logs / "run-manifest.json")["controller_tests"])
+        resumed = Executor()
+        self.assertEqual(self.start(resumed, approved_audit=self.logs), 0)
+        self.assertEqual(resumed.calls, ["A", "B", "A", "B", "final"])
+        self.assertFalse(audit.read_json(self.run_logs / "state.json")["controller_tests"])
+        self.assertEqual(len(self.calls), 1)
 
     def test_change_during_preflight_is_rechecked_before_first_a(self):
         self.do_audit()
