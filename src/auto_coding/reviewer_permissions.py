@@ -72,6 +72,7 @@ config = value["config"]
 result = {"legacy": {key:config.get(key) for key in ("sandbox_mode","sandbox_workspace_write")},
           "default":config.get("default_permissions"),
           "profile":config.get("permissions",{}).get(profile),
+          "windows_sandbox":(config.get("windows") or {}).get("sandbox"),
           "layers":[], "requirements":requirements.get("requirements")}
 for layer in value["layers"]:
     result["layers"].append({"source":layer["name"], "legacy":{
@@ -81,7 +82,7 @@ print(json.dumps(result))
 '''
 
 
-def validate_configuration(value, name, repo, scratch):
+def validate_configuration(value, name, repo, scratch, *, filesystem=None, backend=None):
     try:
         if not isinstance(value["layers"], list) or not value["layers"]:
             raise ReviewerEnvironmentError("Loaded configuration layers were not reported")
@@ -95,23 +96,25 @@ def validate_configuration(value, name, repo, scratch):
         if value["requirements"] is not None:
             raise ReviewerEnvironmentError("Managed reviewer permissions require separate validation; no reviewer launched")
         profile = value["profile"]
-        filesystem = {key:item for key,item in profile["filesystem"].items() if item is not None}
+        loaded_filesystem = {key:item for key,item in profile["filesystem"].items() if item is not None}
         network = {key:item for key,item in profile["network"].items() if item is not None}
         if (value["default"] != name or profile["extends"] != ":read-only"
                 or profile.get("workspace_roots") not in (None, {})
-                or filesystem != {repo.as_posix(): "read", scratch.as_posix(): "write"}
+                or loaded_filesystem != (filesystem if filesystem is not None else {
+                    repo.as_posix(): "read", scratch.as_posix(): "write"})
+                or (backend is not None and value.get("windows_sandbox") != backend)
                 or network != {"enabled": False}):
             raise ReviewerEnvironmentError("Effective reviewer profile differs from the required read-only target / writable scratch policy")
     except (KeyError, TypeError, AttributeError) as exc:
         raise ReviewerEnvironmentError("Cannot verify effective reviewer configuration") from exc
 
 
-def check_cli(settings, name, repo, scratch):
+def check_cli(settings, name, repo, scratch, *, environment=None, filesystem=None, backend=None):
     executable = shutil.which("codex")
     if not executable:
         raise ReviewerEnvironmentError("Codex CLI is unavailable")
     trusted = Path(__file__).resolve().parents[1]
-    environment = os.environ.copy()
+    environment = dict(os.environ if environment is None else environment)
     environment.pop("PYTHONHOME", None)
     environment["PYTHONPATH"] = str(trusted)
     version = bounded_run([executable, "--version"], cwd=str(trusted), env=environment,
@@ -130,7 +133,7 @@ def check_cli(settings, name, repo, scratch):
         value = json.loads(result.stdout)
     except ValueError as exc:
         raise ReviewerEnvironmentError("Invalid Codex effective-configuration response") from exc
-    validate_configuration(value, name, repo, scratch)
+    validate_configuration(value, name, repo, scratch, filesystem=filesystem, backend=backend)
     return executable
 
 

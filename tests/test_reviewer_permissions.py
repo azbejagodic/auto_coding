@@ -271,6 +271,8 @@ class ReviewerFlowTests(unittest.TestCase):
         execute.__wrapped__ = runner.call
         with approved_plan_fixture(), patch.object(runner, "check_cli", return_value="codex") as checker, \
                 patch.object(runner, "probe_review_storage") as storage, \
+                patch.object(runner.controller_test_sandbox, "run", side_effect=lambda command, repo, logs, timeout, **kw:
+                             kw["launch"](command, repo, timeout)) as test_sandbox, \
                 contextlib.redirect_stdout(io.StringIO()):
             result = runner.run(self.fixture.plan, self.fixture.repo, self.fixture.logs, execute=execute,
                                 controller_tests=True, final_verification_config={
@@ -278,6 +280,7 @@ class ReviewerFlowTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertEqual(checker.call_count, 4)  # Workflow preflight, then three review attempts.
         storage.assert_called_once()
+        test_sandbox.assert_called_once()
         self.assertEqual((execute.a_calls, execute.test_calls, execute.b_calls), (1, 1, 3))
         self.assertEqual(self.fixture.state()["completed"], [])
 

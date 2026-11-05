@@ -106,6 +106,25 @@ class TestCleanupSafetyTests(unittest.TestCase):
         self.assertEqual(self.state()["completed"], [])
         self.assertNotIn("harmless-canary", (self.logs / "events.jsonl").read_text())
 
+    def test_sandbox_startup_failure_resumes_tests_without_replaying_a(self):
+        from auto_coding.controller_test_sandbox import ControllerTestEnvironmentError
+        fake = FakeExecutor([ControllerTestEnvironmentError("MXC startup failed")])
+        with self.assertRaises(ControllerTestEnvironmentError): self.run_fake(fake)
+        self.assertEqual(fake.calls, ["A", "test"])
+        self.assertFalse(test_gate_path(self.repo).exists())
+        self.assertEqual(self.state()["completed"], [])
+        resumed = FakeExecutor()
+        self.assertEqual(self.run_fake(resumed, resume=True), 0)
+        self.assertEqual(resumed.calls, ["test", "test", "B"])
+
+    def test_sandbox_uncertain_cleanup_blocks_recovery(self):
+        from auto_coding.controller_test_sandbox import ControllerTestEnvironmentError
+        error = ControllerTestEnvironmentError("MXC cleanup uncertain", cleanup_confirmed=False, process_started=True)
+        fake = FakeExecutor([error])
+        with self.assertRaises(ControllerTestEnvironmentError): self.run_fake(fake)
+        self.assert_stopped_uncertain(fake)
+        with self.assertRaises(TestProcessSafetyError): self.run_fake(FakeExecutor(), resume=True)
+
     def test_legacy_and_explicitly_confirmed_success_permit_normal_continuation(self):
         for position, results in enumerate(([], [runner._CallResult(0, "OK", False, True, True)])):
             with self.subTest(results=results):

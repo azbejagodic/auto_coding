@@ -35,6 +35,7 @@ from auto_coding.launch_preflight import validate_feature_branch, configured_pro
 from auto_coding.sensitive_paths import is_sensitive_path, changed_paths, CHANGE_PATH_OPTIONS
 from auto_coding.final_verification import verification_policy, policy_sha256, unittest_evidence
 from auto_coding import plan_audit
+from auto_coding import controller_test_sandbox
 
 
 MAX_PLAN = 512 * 1024
@@ -203,6 +204,14 @@ def execution_metadata(result, execution_id: int, started: float, *, codex=True,
             "duration_seconds": duration,
             "process_started": getattr(result, "process_started", result[0] != 127),
             "usage": usage}
+
+
+def execute_controller_test(execute, command, repo, logs, timeout, environment):
+    if unwrap(execute) is call:
+        return controller_test_sandbox.run(command, repo, logs, timeout, git=git, launch=execute)
+    # Injected deterministic executors retain their existing cross-platform path.
+    with activated(environment):
+        return execute(command, repo, timeout)
 
 
 def cleanup_unverified(result):
@@ -1670,8 +1679,7 @@ def final_verification(repo, logs, state, state_path, events, execute, tasks):
         save_json(state_path, state)
         started = _execution_clock()
         try:
-            with activated(child_environment):
-                result = execute(command, repo, policy["timeout_seconds"])
+            result = execute_controller_test(execute, command, repo, logs, policy["timeout_seconds"], child_environment)
         except BaseException as exc:
             cleanup = getattr(exc, "cleanup_confirmed", None)
             if cleanup is True or (cleanup is None and getattr(exc, "process_started", None) is False):
@@ -2045,8 +2053,8 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                 gate = TestProcessGate(repo, context)
                 test_started = _execution_clock()
                 try:
-                    with activated(child_environment):
-                        result = execute(cmd, repo, state["final_verification"]["timeout_seconds"])
+                    result = execute_controller_test(execute, cmd, repo, logs,
+                        state["final_verification"]["timeout_seconds"], child_environment)
                 except BaseException as exc:
                     cleanup = getattr(exc, "cleanup_confirmed", None)
                     if (cleanup is True or (cleanup is None and getattr(exc, "process_started", None) is False)):
