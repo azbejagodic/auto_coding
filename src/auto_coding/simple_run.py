@@ -672,7 +672,7 @@ def publish_approved(repo, state, state_path, events):
     return True
 
 
-def correction_context(prior: list[dict]) -> str:
+def correction_context(prior: list[dict], *, controller_tests=False) -> str:
     """Keep the latest verdict complete and older review issues as a bounded checklist."""
     if not prior:
         return ""
@@ -704,7 +704,8 @@ def correction_context(prior: list[dict]) -> str:
                         else "Use the latest test or execution failure evidence. ")
     guidance = (verdict_guidance + "Investigate shared "
                 "root causes and related edge cases; add regression tests for confirmed bugs where practical. "
-                "Re-run relevant tests and report what was corrected. Preserve all task requirements and safety "
+                + ("The controller will run relevant tests; report what was corrected. " if controller_tests else
+                   "Re-run relevant tests and report what was corrected. ") + "Preserve all task requirements and safety "
                 "rules. Preserve behavior that already works and keep the change focused. Recheck earlier review issues "
                 "and fix any still present; do not rework an issue that is already fixed. "
                 "Omission from a later review is not proof that an earlier issue is resolved.\n\n")
@@ -750,7 +751,7 @@ def correction_context(prior: list[dict]) -> str:
 
 
 def review_prompt_for(task: dict, stat: str, diff: str, tests: list[dict], implementer_tests="",
-                      previous_rejection=None) -> str:
+                      previous_rejection=None, *, controller_tests=False) -> str:
     previous = ""
     if previous_rejection:
         issues = previous_rejection["review"]["issues"]
@@ -759,6 +760,15 @@ def review_prompt_for(task: dict, stat: str, diff: str, tests: list[dict], imple
                     "behavior for regressions introduced by the fixes. Report all remaining or newly discovered "
                     "issues together. Do not automatically approve solely because these findings were fixed.\n"
                     + "\n".join(f"- {issue}" for issue in issues))
+    verification = (
+        "The controller runs verification. Use actual controller TEST RESULTS as verification evidence. "
+        "Do not execute tests, linting, builds or verification suites, or duplicate controller verification. "
+        "If verification is missing or insufficient, report the specific concern; never claim unrun tests passed. "
+        "Still independently review code behavior and relevant edge cases; passing tests do not prove correctness. "
+        if controller_tests else
+        "Avoid rerunning passing tests without a concrete reason; do not run the full test suite by "
+        "default. If test evidence is insufficient or suspicious, independently investigate with minimal "
+        "relevant checks where feasible. ")
     return ("You are Codex B, an independent READ-ONLY reviewer. Start with the complete "
         "current-task Git diff and TASK requirements below. Inspect all staged changes in the repository "
         "even if the embedded DIFF is truncated. Inspect the current "
@@ -768,9 +778,7 @@ def review_prompt_for(task: dict, stat: str, diff: str, tests: list[dict], imple
         "Stay within this task's scope; do not investigate unrelated "
         "repository code. Previous tasks are locally "
         "committed. Do not blindly trust implementer claims or test results; never approve solely on those "
-        "claims. Avoid rerunning passing tests without a concrete reason; do not run the full test suite by "
-        "default. If test evidence is insufficient or suspicious, independently investigate with minimal "
-        "relevant checks where feasible. Reject only for "
+        "claims. " + verification + "Reject only for "
         "substantive, reproducible blockers in the CURRENT task/slice. Do not stop reviewing after the first "
         "blocking bug; continue through the remaining affected functionality. Report EVERY distinct actionable "
         "issue discovered together in one verdict, with no fixed finding count. Include correctness bugs, "
@@ -883,7 +891,8 @@ def verify_review_ready(repo: Path, logs: Path, state: dict, task: dict) -> tupl
     preceding = next((entry for entry in reversed(state["history"])
                       if entry.get("task") == task["id"] and isinstance(entry.get("review"), dict)
                       and entry["review"].get("decision") == "REJECTED"), None)
-    return record, review_prompt_for(task, stat, diff, tests, report, preceding)
+    return record, review_prompt_for(task, stat, diff, tests, report, preceding,
+                                     controller_tests=state.get("controller_tests", True))
 
 
 def _review_error_message_category(message) -> str:
@@ -1169,7 +1178,16 @@ def review_ready_task(repo: Path, logs: Path, state: dict, state_path: Path,
                 raise
             return stop_review_retry(logs, state, state_path, events,
                                      f"Reviewer environment validation failed: {exc}; no reviewer launched")
-        review_prompt += spec.instructions
+        review_prompt += (
+            f"\n\nREVIEW ENVIRONMENT: target cwd is {repo}; writable scratch is {spec.scratch}. "
+            f"Controller test evidence is in {logs}; read the saved outputs referenced in TEST RESULTS. "
+            "Do not modify source or Git metadata. Do not execute tests or duplicate controller verification. "
+            "Report verification={status,details}: passed only when actual controller results support it; "
+            "failed for implementation failures; environment_blocked for permission/tooling setup failures; "
+            "not_run for unexecuted checks. State specific missing or insufficient verification evidence. "
+            "Blocked or unexecuted testing cannot authorize a commit. Put genuine code blockers in issues; "
+            "if none are established, use APPROVED with empty issues and truthful verification status."
+            if state.get("controller_tests", True) else spec.instructions)
         try:
             pending["review_invocations"] = ordinal
             pending.pop("review_retry_after", None)
@@ -1346,16 +1364,24 @@ def implementation_attempt(repo, logs, state, state_path, events, task, attempt,
         state["pending_execution"] = pending
         state["status"] = "stopped"
         save_json(state_path, state)
-    developer_msg = ("Implement this task in the current Git repository. You may create the normal "
-        "source files you need INSIDE this repository. Do not change Git history, push, "
-        "read secrets, or modify files outside it. Implement only this task and necessary related changes. "
+    implementation_checks = (
+        "The controller runs focused tests. Do not execute tests, linting, builds or full verification suites. "
+        "Do not perform an extended self-review. Report changed files and any known limitations. "
+        "For corrections, address all supplied controller failures and Codex B findings. "
+        "The controller owns verification in this mode, including checks requested by the task or correction feedback."
+        if state.get("controller_tests", True) else
         "Run focused tests relevant to modified behavior. Avoid the full test suite during individual tasks "
         "unless explicitly required or justified, and do not rerun unchanged passing tests unnecessarily. "
         "Before finishing, inspect the complete current-task Git diff, including staged and unstaged changes, "
         "and any untracked new files for mistakes, regressions, unintended changes and unmet requirements. "
         "Fix confirmed problems and rerun affected tests where needed. Report actual test commands, results "
-        "and remaining limitations.\n\nTASK:\n" + task["prompt"])
-    feedback = correction_context([h for h in state["history"] if h.get("task") == ident])
+        "and remaining limitations.")
+    developer_msg = ("Implement this task in the current Git repository. You may create the normal "
+        "source files you need INSIDE this repository. Do not change Git history, push, "
+        "read secrets, or modify files outside it. Implement only this task and necessary related changes. "
+        + implementation_checks + "\n\nTASK:\n" + task["prompt"])
+    feedback = correction_context([h for h in state["history"] if h.get("task") == ident],
+                                  controller_tests=state.get("controller_tests", True))
     if feedback:
         developer_msg += "\n\nPREVIOUS FAILURE OR REVIEW FEEDBACK:\n" + feedback
     if not state.get("controller_tests", True):

@@ -522,7 +522,7 @@ class ReviewRecoveryTests(unittest.TestCase):
 
     def test_implementer_prompt_limits_scope_and_requires_focused_verification_and_diff_review(self):
         fake = FakeExecutor()
-        self.assertEqual(self.run_fake(fake), 0)
+        self.assertEqual(self.run_fake(fake, controller_tests=False), 0)
         prompt = fake.a_prompts[0]
         for text in ("only this task and necessary related changes", "focused tests relevant to modified behavior",
                      "Avoid the full test suite during individual tasks", "unless explicitly required or justified",
@@ -533,6 +533,36 @@ class ReviewRecoveryTests(unittest.TestCase):
             self.assertIn(text, prompt)
         for text in ("Do not change Git history, push", "read secrets, or modify files outside it"):
             self.assertIn(text, prompt)
+        self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (1, 0, 1))
+        self.assertIn("Run the configured focused checks below as argv commands", prompt)
+        self.assertIn("minimal relevant checks where feasible", fake.b_prompts[0])
+        self.assertIn("Run configured tests against the actual target", fake.b_prompts[0])
+        self.assertNotIn("Do not execute tests", fake.b_prompts[0])
+
+    def test_controller_mode_assigns_verification_to_controller_and_supplies_evidence(self):
+        fake = FakeExecutor()
+        self.assertEqual(self.run_fake(fake), 0)
+        implementer, reviewer = fake.a_prompts[0], fake.b_prompts[0]
+        for text in ("only this task and necessary related changes", "Do not execute tests, linting, builds",
+                     "Do not perform an extended self-review", "Report changed files and any known limitations",
+                     "address all supplied controller failures and Codex B findings",
+                     "Do not change Git history, push", "read secrets, or modify files outside it"):
+            self.assertIn(text, implementer)
+        for text in ("Run focused tests relevant", "complete current-task Git diff", "Run the configured focused checks"):
+            self.assertNotIn(text, implementer)
+        for text in ("Use actual controller TEST RESULTS", "Do not execute tests, linting, builds",
+                     "report the specific concern", "passing tests do not prove correctness",
+                     "independently review code behavior and relevant edge cases",
+                     "verification={status,details}"):
+            self.assertIn(text, reviewer)
+        for text in ("Run configured tests against the actual target", "minimal relevant checks where feasible"):
+            self.assertNotIn(text, reviewer)
+        evidence = json.loads(reviewer.split("\n\nTEST RESULTS:\n")[1].split("\n\n")[0])
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0]["exit_code"], 0)
+        self.assertEqual((self.logs / evidence[0]["output"]).read_text(), "tests passed")
+        self.assertIn(f"Controller test evidence is in {self.logs}", reviewer)
+        self.assertIn("read the saved outputs referenced in TEST RESULTS", reviewer)
         self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (1, 1, 1))
 
     def test_reviewer_must_continue_past_first_blocker_and_cover_affected_paths(self):
@@ -549,10 +579,15 @@ class ReviewRecoveryTests(unittest.TestCase):
         for text in ("Start with the complete current-task Git diff and TASK requirements",
                      "Inspect all staged changes in the repository", "surrounding code, dependencies and relevant tests",
                      "Review all significant changes and affected behavior", "do not investigate unrelated",
-                     "Avoid rerunning passing tests without a concrete reason", "do not run the full test suite by default",
-                     "test evidence is insufficient or suspicious", "minimal relevant checks where feasible",
                      "never approve solely on those claims"):
             self.assertIn(text, prompt)
+
+    def test_legacy_review_prompt_preserves_independent_testing_instructions(self):
+        prompt = runner.review_prompt_for({"prompt": "Implement one", "test_commands": []}, "", "", [])
+        for text in ("Avoid rerunning passing tests without a concrete reason", "do not run the full test suite by default",
+                     "test evidence is insufficient or suspicious", "minimal relevant checks where feasible"):
+            self.assertIn(text, prompt)
+        self.assertNotIn("Do not execute tests", prompt)
 
     def test_reviewer_prompt_keeps_full_staged_diff_access_when_excerpt_is_truncated(self):
         prompt = runner.review_prompt_for({"prompt": "Implement one", "test_commands": []}, "", "x" * 35001, [])
@@ -579,7 +614,8 @@ class ReviewRecoveryTests(unittest.TestCase):
         self.assertIn("Address every actionable blocking finding", correction)
         self.assertIn("shared root causes and related edge cases", correction)
         self.assertIn("regression tests", correction)
-        self.assertIn("Re-run relevant tests", correction)
+        self.assertNotIn("Re-run relevant tests", correction)
+        self.assertIn("The controller will run relevant tests", correction)
         self.assertIn("Verify that EVERY finding below was addressed", rereview)
         self.assertIn("regressions introduced by the fixes", rereview)
         self.assertIn("Do not automatically approve", rereview)
