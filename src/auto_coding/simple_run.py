@@ -28,7 +28,7 @@ from auto_coding.reviewer_permissions import (activated, command_environment, pr
                                              check_cli, ReviewerEnvironmentError)
 from auto_coding.python_environment import test_environment
 from auto_coding.workflow_preflight import workflow_preflight, probe_review_storage
-from auto_coding.metrics import codex_usage, write_metrics
+from auto_coding.metrics import codex_usage, summarize_events, write_metrics
 from auto_coding.test_process_safety import TestProcessGate, assert_test_process_safe
 from auto_coding.repository_ownership import assert_process_safe
 from auto_coding.launch_preflight import validate_feature_branch, configured_protected_branches
@@ -1109,7 +1109,8 @@ def review_ready_task(repo: Path, logs: Path, state: dict, state_path: Path,
         limit = pending.get("review_invocation_limit", MAX_REVIEW_PROCESS_ATTEMPTS)
         if used >= limit:
             return stop_review_retry(logs, state, state_path, events, "Codex B review retry budget exhausted")
-        if not agent_call_available(state, state_path, events, ident, attempt):
+        if (not agent_call_available(state, state_path, events, ident, attempt)
+                or not observed_tokens_available(state, state_path, events, ident, attempt)):
             return "stopped"
         if used and pending.get("review_failure_kind") not in {"launch_failure", "output_limit"}:
             if "review_retry_after" not in pending:
@@ -1362,7 +1363,8 @@ def implementation_attempt(repo, logs, state, state_path, events, task, attempt,
     else:
         raise PilotError("Codex A answer already exists for an unstarted execution; inspect before launch")
     argv = codex_argv(readonly=False, last_message=answer_path, schema=None, model=model_a)
-    if not agent_call_available(state, state_path, events, ident, attempt):
+    if (not agent_call_available(state, state_path, events, ident, attempt)
+            or not observed_tokens_available(state, state_path, events, ident, attempt)):
         return None
     execution = events.emit("Codex A", "process_started", "started", task_id=ident, attempt=attempt,
         evidence={"prompt": f"{base}-a-prompt.txt", "stream": f"{base}-a-events.jsonl", "answer": answer_path.name},
@@ -1440,7 +1442,7 @@ def implementation_attempt(repo, logs, state, state_path, events, task, attempt,
     return record, digest, failed
 
 
-def agent_call_budget_evidence(events):
+def agent_call_budget_evidence(events, *, key="max_agent_calls", policy_event="agent_call_budget_set"):
     """The existing durable start events are reservations, not usage estimates."""
     limits, used, seq = [], 0, 0
     lines = events.path.read_text(encoding="utf-8").splitlines() if events.path.exists() else []
@@ -1452,40 +1454,50 @@ def agent_call_budget_evidence(events):
         if (event.get("actor"), event.get("event")) in {
                 ("Codex A", "process_started"), ("Codex B", "review_started")}:
             used += 1
-        if event.get("actor") == "controller" and event.get("event") in {"run_started", "agent_call_budget_set"}:
+        if event.get("actor") == "controller" and event.get("event") in {"run_started", policy_event}:
             metadata = event.get("metadata")
-            if event["event"] == "run_started" and (not isinstance(metadata, dict) or "max_agent_calls" not in metadata):
-                continue  # Legacy run metadata did not declare a call budget.
-            if not isinstance(metadata, dict) or "max_agent_calls" not in metadata:
+            if event["event"] == "run_started" and (not isinstance(metadata, dict) or key not in metadata):
+                continue  # Legacy run metadata did not declare this budget.
+            if not isinstance(metadata, dict) or key not in metadata:
                 raise PilotError("Invalid saved agent call budget event")
-            limits.append(metadata["max_agent_calls"])
+            limits.append(metadata[key])
     if seq != events.seq or len(limits) > 1:
         raise PilotError("Agent call budget timeline changed or has conflicting limits")
     return limits, used
 
 
-def bind_agent_call_budget(state, manifest, requested, events, *, resume):
-    limits, used = agent_call_budget_evidence(events)
-    for value in [requested, state.get("max_agent_calls"), manifest.get("max_agent_calls"), *limits]:
-        if value is not None and (type(value) is not int or not 1 <= value <= MAX_AGENT_CALL_LIMIT):
-            raise PilotError(f"Agent call budget must be an integer from 1 to {MAX_AGENT_CALL_LIMIT}")
+def _bind_agent_budget(state, manifest, requested, events, *, resume, key, policy_event, maximum, label):
+    limits, used = agent_call_budget_evidence(events, key=key, policy_event=policy_event)
+    for value in [requested, state.get(key), manifest.get(key), *limits]:
+        if value is not None and (type(value) is not int or value < 1 or (maximum is not None and value > maximum)):
+            raise PilotError(f"{label} must be a positive integer" + (f" no greater than {maximum}" if maximum else ""))
     if resume:
-        limit = state.get("max_agent_calls")
-        if (limit != manifest.get("max_agent_calls")
+        limit = state.get(key)
+        if (limit != manifest.get(key)
                 or (requested is not None and requested != limit)):
-            raise PilotError("Agent call budget is fixed for this run; saved settings or override differ")
+            raise PilotError(f"{label} is fixed for this run; saved settings or override differ")
     else:
         if used:
             raise PilotError("Existing agent call reservations require saved run state; inspect before initialization")
         limit = limits[0] if limits and requested is None else requested
     if limits and limits != [limit]:
-        raise PilotError("Saved agent call budget differs from its durable policy event")
+        raise PilotError(f"Saved {label.lower()} differs from its durable policy event")
     if not limits and limit is not None and used:
-        raise PilotError("Saved agent call budget lacks its durable policy event")
-    if not resume or "max_agent_calls" in state:
-        state["max_agent_calls"] = manifest["max_agent_calls"] = limit
+        raise PilotError(f"Saved {label.lower()} lacks its durable policy event")
+    if not resume or key in state:
+        state[key] = manifest[key] = limit
     if not limits and (not resume or limit is not None):
-        events.emit("controller", "agent_call_budget_set", "observed", metadata={"max_agent_calls": limit})
+        events.emit("controller", policy_event, "observed", metadata={key: limit})
+
+
+def bind_agent_call_budget(state, manifest, requested, events, *, resume):
+    _bind_agent_budget(state, manifest, requested, events, resume=resume, key="max_agent_calls",
+                       policy_event="agent_call_budget_set", maximum=MAX_AGENT_CALL_LIMIT, label="Agent call budget")
+
+
+def bind_observed_token_budget(state, manifest, requested, events, *, resume):
+    _bind_agent_budget(state, manifest, requested, events, resume=resume, key="max_observed_tokens",
+                       policy_event="observed_token_budget_set", maximum=None, label="Observed token budget")
 
 
 def agent_call_available(state, state_path, events, ident, attempt):
@@ -1503,6 +1515,56 @@ def agent_call_available(state, state_path, events, ident, attempt):
                 metadata={"reason": "agent call budget exhausted", "agent_calls_reserved": used,
                           "max_agent_calls": limit})
     print(f"STOPPED: agent call budget exhausted ({used}/{limit}); checkpoints retained in {state_path.parent}.")
+    return False
+
+
+def observed_token_usage(events):
+    """Fold durable execution identities, never the derived metrics.json snapshot."""
+    try:
+        records = [json.loads(line) for line in events.path.read_text(encoding="utf-8").splitlines()]
+        for event in records:
+            identity = (event.get("actor"), event.get("event"))
+            if identity in {("Codex A", "process_started"), ("Codex B", "review_started"),
+                            ("Codex A", "process_finished"), ("Codex B", "review_process_finished")}:
+                if (not isinstance(event.get("task_id"), str) or not event["task_id"]
+                        or type(event.get("attempt")) is not int or event["attempt"] < 1):
+                    raise ValueError("Usage requires an explicit task and attempt")
+            if identity in {
+                    ("Codex A", "process_finished"), ("Codex B", "review_process_finished")}:
+                metadata = event.get("metadata") or {}
+                if type(metadata.get("execution_id")) is not int or "process_started" not in metadata:
+                    raise ValueError("Usage requires an explicit execution identity and launch observation")
+                if metadata["process_started"] is False and metadata.get("usage") is not None:
+                    raise ValueError("Usage contradicts the launch observation")
+        summary = summarize_events(records)
+        if summary["source_last_seq"] != events.seq or summary["run_id"] != events.run_id:
+            raise ValueError("Usage source timeline changed")
+    except (ValueError, TypeError, AttributeError, RecursionError) as exc:
+        raise PilotError("Observed token accounting has untrustworthy execution evidence; inspect run logs") from exc
+    buckets = [summary["run"][role] for role in ("codex_a", "codex_b")]
+    observed = sum(bucket["usage"]["input_tokens"] + bucket["usage"]["output_tokens"]
+                   for bucket in buckets if bucket["usage"] is not None)
+    complete = all(not bucket["unconfirmed_invocations"]
+                   and bucket["usage_observations"] == bucket["invocations"] for bucket in buckets)
+    return observed, complete
+
+
+def observed_tokens_available(state, state_path, events, ident, attempt):
+    limit = state.get("max_observed_tokens")
+    if limit is None:
+        return True
+    limits, _ = agent_call_budget_evidence(events, key="max_observed_tokens", policy_event="observed_token_budget_set")
+    if limits != [limit]:
+        raise PilotError("Observed token budget differs from its durable policy event")
+    observed, complete = observed_token_usage(events)
+    if complete and observed < limit:
+        return True
+    reason = "observed token budget exhausted" if complete else "observed token usage incomplete"
+    state["status"] = "stopped"
+    save_json(state_path, state)
+    events.emit("controller", "stopped", "failed", task_id=ident, attempt=attempt,
+                metadata={"reason": reason, "observed_tokens": observed, "max_observed_tokens": limit})
+    print(f"STOPPED: {reason}; observed {observed}, limit {limit}. Checkpoints retained in {state_path.parent}.")
     return False
 
 
@@ -1675,10 +1737,12 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
         auto_push=None, retry_review_once=False,
         final_verification_config=None, controller_tests=None,
         model_a=None, model_b=None, timeout=1800, review_timeout=None,
-        execute: Callable = call, approved_audit=None, max_agent_calls=None) -> int:
+        execute: Callable = call, approved_audit=None, max_agent_calls=None, max_observed_tokens=None) -> int:
     review_timeout = timeout if review_timeout is None else review_timeout
     if max_agent_calls is not None and (type(max_agent_calls) is not int or not 1 <= max_agent_calls <= MAX_AGENT_CALL_LIMIT):
         raise PilotError(f"Agent call budget must be an integer from 1 to {MAX_AGENT_CALL_LIMIT}")
+    if max_observed_tokens is not None and (type(max_observed_tokens) is not int or max_observed_tokens < 1):
+        raise PilotError("Observed token budget must be a positive integer")
     if retry_review_once and not resume:
         raise PilotError("One extra review call requires --resume and an exhausted review-ready checkpoint")
     if controller_tests is not None and type(controller_tests) is not bool:
@@ -1763,6 +1827,7 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
         events.emit("controller", "resume_started", "started")
         try:
             bind_agent_call_budget(state, manifest, max_agent_calls, events, resume=True)
+            bind_observed_token_budget(state, manifest, max_observed_tokens, events, resume=True)
             restore_legacy_review_rounds(state, events)
             plan_audit.verify_resume(sys.modules[__name__], state, manifest, repo, plan_sha, tasks)
             if state.get("pending_review") and state.get("pending_checkpoint"):
@@ -1846,6 +1911,9 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
             if max_agent_calls is not None and max_agent_calls != manifest.get("max_agent_calls"):
                 raise PilotError("Initialization agent call budget differs from the saved manifest")
             max_agent_calls = manifest.get("max_agent_calls")
+            if max_observed_tokens is not None and max_observed_tokens != manifest.get("max_observed_tokens"):
+                raise PilotError("Initialization observed token budget differs from the saved manifest")
+            max_observed_tokens = manifest.get("max_observed_tokens")
         elif timeline_path.exists():
             # EventLog validates every complete record and preserves any torn tail.
             data = timeline_path.read_bytes()
@@ -1881,8 +1949,9 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
         events = EventLog(timeline_path, run_id)
         if not events.seq:
             events.emit("controller", "run_started", "started", evidence={"manifest": "run-manifest.json"},
-                        metadata={"max_agent_calls": max_agent_calls})
+                        metadata={"max_agent_calls": max_agent_calls, "max_observed_tokens": max_observed_tokens})
         bind_agent_call_budget(state, manifest, max_agent_calls, events, resume=False)
+        bind_observed_token_budget(state, manifest, max_observed_tokens, events, resume=False)
         save_json(manifest_path, manifest)
         state["status"] = "running"
         save_json(state_path, state)
@@ -2103,14 +2172,15 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
 def run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False, attempts=3,
         model_a=None, model_b=None, timeout=1800, review_timeout=None, execute: Callable = call, auto_push=None,
         retry_review_once=False, final_verification_config=None, controller_tests=None, approved_audit=None,
-        max_agent_calls=None) -> int:
+        max_agent_calls=None, max_observed_tokens=None) -> int:
     """Run while ensuring controlled exceptions after log creation are recorded."""
     try:
         return _run(plan, repo, logs, create_repo=create_repo, resume=resume,
                     attempts=attempts, model_a=model_a, model_b=model_b,
                     timeout=timeout, review_timeout=review_timeout, execute=execute, auto_push=auto_push,
                     retry_review_once=retry_review_once, final_verification_config=final_verification_config,
-                    controller_tests=controller_tests, approved_audit=approved_audit, max_agent_calls=max_agent_calls)
+                    controller_tests=controller_tests, approved_audit=approved_audit, max_agent_calls=max_agent_calls,
+                    max_observed_tokens=max_observed_tokens)
     except Exception as exc:
         log_dir = logs.resolve(strict=False)
         state_path = log_dir / "state.json"
@@ -2205,6 +2275,8 @@ def main(argv=None):
                         help="Codex B process timeout in seconds (defaults to --timeout)")
     parser.add_argument("--max-agent-calls", type=int,
                         help=f"Maximum reserved A/B invocations per workflow (1..{MAX_AGENT_CALL_LIMIT}; default unlimited)")
+    parser.add_argument("--max-observed-tokens", type=int,
+                        help="Stop new A/B calls once observed input plus output tokens reach this limit; missing usage also stops calls")
     parser.add_argument("--controller-tests", action="store_true", default=None,
                         help="Opt in to controller-managed per-task focused checks; fixed across resume")
     parser.add_argument("--final-verification-config", type=Path,
@@ -2219,7 +2291,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if action == "audit" and (not args.audit_model or args.resume or args.create_repo or args.approved_audit
                               or args.retry_review_once or args.auto_push_repository or args.auto_push_branch
-                              or args.model_a or args.model_b or args.max_agent_calls is not None):
+                              or args.model_a or args.model_b or args.max_agent_calls is not None
+                              or args.max_observed_tokens is not None):
         cancel_reservation(args.repo, os.environ.get("AUTOCODING_JOB_RESERVATION"))
         parser.error("audit requires --audit-model and excludes run, resume, publication and A/B model options")
     if action != "audit" and (args.audit_model or args.audit_goal):
@@ -2238,6 +2311,9 @@ def main(argv=None):
     if args.max_agent_calls is not None and not 1 <= args.max_agent_calls <= MAX_AGENT_CALL_LIMIT:
         cancel_reservation(args.repo, os.environ.get("AUTOCODING_JOB_RESERVATION"))
         parser.error(f"--max-agent-calls must be from 1 to {MAX_AGENT_CALL_LIMIT}")
+    if args.max_observed_tokens is not None and args.max_observed_tokens < 1:
+        cancel_reservation(args.repo, os.environ.get("AUTOCODING_JOB_RESERVATION"))
+        parser.error("--max-observed-tokens must be a positive integer")
     if shutil.which("codex") is None:
         cancel_reservation(args.repo, os.environ.get("AUTOCODING_JOB_RESERVATION"))
         parser.error("codex command not found in PATH")
@@ -2256,6 +2332,7 @@ def main(argv=None):
         return run(args.plan, args.repo, args.logs, create_repo=args.create_repo,
                    resume=args.resume, attempts=args.attempts, timeout=args.timeout, review_timeout=args.review_timeout,
                    max_agent_calls=args.max_agent_calls,
+                   max_observed_tokens=args.max_observed_tokens,
                     retry_review_once=args.retry_review_once,
                    final_verification_config=final_config, controller_tests=args.controller_tests,
                    model_a=args.model_a, model_b=args.model_b, approved_audit=args.approved_audit,

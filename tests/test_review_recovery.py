@@ -954,6 +954,281 @@ class CorrectionContextTests(unittest.TestCase):
             self.assertEqual(checked_review(verdict_path), APPROVED)
 
 
+class ObservedTokenAccountingTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.events = runner.EventLog(Path(temporary.name) / "events.jsonl", "token-tests")
+        self.events.emit("controller", "run_started", "started")
+        self.usage = {"input_tokens": 10, "cached_input_tokens": 8, "output_tokens": 2}
+
+    def observe(self, actor="Codex A", usage=None, *, started=True):
+        names = ("process_started", "process_finished") if actor == "Codex A" else ("review_started", "review_process_finished")
+        start = self.events.emit(actor, names[0], "started", task_id="one", attempt=1)
+        metadata = {"execution_id": start["seq"], "process_started": started, "usage": usage, "exit_code": 0}
+        self.events.emit(actor, names[1], "success", task_id="one", attempt=1, metadata=metadata)
+        return names[1], metadata
+
+    def test_aggregates_a_b_without_adding_cached_input_or_non_agent_usage(self):
+        self.observe(usage=self.usage)
+        self.observe("Codex B", {"input_tokens": 20, "cached_input_tokens": 15, "output_tokens": 3})
+        test = self.events.emit("tests", "test_started", "started", task_id="one", attempt=1)
+        self.events.emit("tests", "test_finished", "success", task_id="one", attempt=1,
+                         metadata={"execution_id": test["seq"], "process_started": True, "usage": self.usage})
+        self.events.emit("controller", "plan_audit_started", "started", metadata={"usage": self.usage})
+        self.events.emit("Git", "checkpoint_committed", "success", metadata={"usage": self.usage})
+        self.assertEqual(runner.observed_token_usage(self.events), (35, True))
+
+    def test_repeated_observations_count_once_and_conflicts_fail_closed(self):
+        name, metadata = self.observe(usage=self.usage)
+        self.events.emit("Codex A", name, "success", task_id="one", attempt=1, metadata=metadata)
+        self.assertEqual(runner.observed_token_usage(self.events), (12, True))
+        self.events.emit("Codex A", name, "success", task_id="one", attempt=1,
+                         metadata=metadata | {"usage": self.usage | {"output_tokens": 3}})
+        with self.assertRaisesRegex(PilotError, "untrustworthy execution evidence"):
+            runner.observed_token_usage(self.events)
+
+    def test_launched_without_usage_is_incomplete_even_with_other_known_usage(self):
+        self.observe()
+        self.assertEqual(runner.observed_token_usage(self.events), (0, False))
+        zero = {key: 0 for key in self.usage}
+        self.observe("Codex B", zero)
+        self.assertEqual(runner.observed_token_usage(self.events), (0, False))
+
+    def test_trustworthy_zero_usage_is_complete(self):
+        self.observe(usage={key: 0 for key in self.usage})
+        self.assertEqual(runner.observed_token_usage(self.events), (0, True))
+
+    def test_unconfirmed_launch_status_is_incomplete_even_with_usage(self):
+        self.observe(usage=self.usage, started=None)
+        self.assertEqual(runner.observed_token_usage(self.events), (0, False))
+
+    def test_unconfirmed_reservation_is_not_assumed_free(self):
+        self.events.emit("Codex A", "process_started", "started", task_id="one", attempt=1)
+        self.assertEqual(runner.observed_token_usage(self.events), (0, False))
+
+    def test_confirmed_launch_failure_needs_no_usage(self):
+        self.observe(started=False)
+        self.assertEqual(runner.observed_token_usage(self.events), (0, True))
+
+    def test_usage_requires_explicit_execution_identity(self):
+        self.events.emit("Codex A", "process_started", "started", task_id="one", attempt=1)
+        self.events.emit("Codex A", "process_finished", "success", task_id="one", attempt=1,
+                         metadata={"process_started": True, "usage": self.usage, "exit_code": 0})
+        with self.assertRaisesRegex(PilotError, "untrustworthy execution evidence"):
+            runner.observed_token_usage(self.events)
+
+    def test_missing_or_contradictory_launch_and_task_evidence_cannot_look_free(self):
+        cases = (
+                (None, 1, {"process_started": True}),
+                ("one", None, {"process_started": True}),
+                ("one", 1, {}),
+                ("one", 1, {"process_started": False}))
+        for index, (task, attempt, observation) in enumerate(cases):
+            path = self.events.path.with_name(f"case-{index}.jsonl")
+            trace = runner.EventLog(path, "invalid-evidence")
+            start = trace.emit("Codex A", "process_started", "started", task_id=task, attempt=attempt)
+            trace.emit("Codex A", "process_finished", "success", task_id=task, attempt=attempt,
+                       metadata={"execution_id": start["seq"], "exit_code": 0, "usage": self.usage} | observation)
+            with self.subTest(task=task, attempt=attempt, observation=observation), \
+                    self.assertRaisesRegex(PilotError, "untrustworthy execution evidence"):
+                runner.observed_token_usage(trace)
+
+
+class ObservedTokenBudgetTests(unittest.TestCase):
+    def setUp(self):
+        self.fixture = ReviewRecoveryTests("test_successful_a_tests_b_commit")
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        self.repo, self.logs, self.plan = self.fixture.repo, self.fixture.logs, self.fixture.plan
+        self.usage = {"input_tokens": 10, "cached_input_tokens": 8, "output_tokens": 2}
+
+    def state(self):
+        return self.fixture.state()
+
+    def run_fake(self, execute, **kwargs):
+        return self.fixture.run_fake(execute, **kwargs)
+
+    def observed(self):
+        events = runner.EventLog(self.logs / "events.jsonl", self.state()["run_id"])
+        return runner.observed_token_usage(events)
+
+    def measured(self, fake, usages=None):
+        usages = {"A": self.usage, "B": self.usage} if usages is None else usages
+        def execute(argv, cwd, timeout, *, prompt=None):
+            result = fake(argv, cwd, timeout, prompt=prompt)
+            if argv[0] == "fake-test" or result[0] != 0 or result[2]:
+                return result
+            usage = usages["B" if "--output-schema" in argv else "A"]
+            if usage is None:
+                return result
+            output = "\n".join(json.dumps(event) for event in [
+                {"type": "thread.started", "thread_id": "fixture"}, {"type": "turn.started"},
+                {"type": "turn.completed", "usage": usage}])
+            return result[0], output, result[2]
+        return execute
+
+    def test_cached_input_is_not_added_twice_and_last_call_can_overshoot(self):
+        fake = FakeExecutor()
+        self.assertEqual(self.run_fake(self.measured(fake), max_observed_tokens=13), 0)
+        self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (1, 1, 1))
+        self.assertEqual(self.observed(), (24, True))
+        self.assertEqual(self.state()["completed"], ["one"])
+
+    def test_exhaustion_stops_pending_review_and_resume_inherits_saved_limit(self):
+        self.logs.mkdir()
+        (self.logs / "metrics.json").write_text('{"observed_tokens":0}', encoding="utf-8")
+        fake = FakeExecutor()
+        self.assertEqual(self.run_fake(self.measured(fake), max_observed_tokens=12, max_agent_calls=10), 1)
+        self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (1, 1, 0))
+        self.assertEqual(self.observed(), (12, True))
+        self.assertEqual(self.state()["pending_review"]["review_invocations"], 0)
+        resumed = FakeExecutor(review_only=True)
+        self.assertEqual(self.run_fake(resumed, resume=True), 1)
+        self.assertEqual((resumed.a_calls, resumed.test_calls, resumed.b_calls), (0, 0, 0))
+        self.assertEqual(self.state()["max_observed_tokens"], 12)
+        self.assertEqual(self.fixture.events()[-1]["metadata"]["reason"], "observed token budget exhausted")
+
+    def test_missing_a_usage_prevents_further_calls_even_after_restart(self):
+        fake = FakeExecutor()
+        self.assertEqual(self.run_fake(fake, max_observed_tokens=1000), 1)
+        self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (1, 1, 0))
+        self.assertEqual(self.observed(), (0, False))
+        self.assertEqual(self.state()["completed"], [])
+        self.assertIsNone(self.state()["pending_checkpoint"])
+        self.assertEqual(self.fixture.events()[-1]["metadata"]["reason"], "observed token usage incomplete")
+        resumed = FakeExecutor(review_only=True)
+        self.assertEqual(self.run_fake(resumed, resume=True), 1)
+        self.assertEqual(resumed.b_calls, 0)
+
+    def test_missing_b_usage_prevents_automatic_retry(self):
+        fake = FakeExecutor(["invalid", APPROVED])
+        self.assertEqual(self.run_fake(self.measured(fake, {"A": self.usage, "B": None}),
+                                       max_observed_tokens=1000), 1)
+        self.assertEqual((fake.a_calls, fake.b_calls), (1, 1))
+        self.assertEqual(self.observed(), (12, False))
+        self.assertEqual(self.state()["pending_review"]["review_invocations"], 1)
+        self.assertEqual(runner.task_review_rounds(self.state(), "one"), 0)
+
+    def test_saved_review_result_finishes_without_new_call_at_both_limits(self):
+        fake = FakeExecutor()
+        with patch.object(runner, "finish_review_verdict", side_effect=RuntimeError("saved verdict interruption")):
+            with self.assertRaisesRegex(RuntimeError, "saved verdict interruption"):
+                self.run_fake(self.measured(fake), max_observed_tokens=20, max_agent_calls=2)
+        self.assertEqual(self.observed(), (24, True))
+        resumed = FakeExecutor(review_only=True)
+        self.assertEqual(self.run_fake(resumed, resume=True), 0)
+        self.assertEqual((resumed.a_calls, resumed.test_calls, resumed.b_calls), (0, 0, 0))
+        self.assertEqual(self.state()["completed"], ["one"])
+        self.assertEqual(self.observed(), (24, True))
+
+    def test_exhaustion_retains_previously_approved_commit(self):
+        self.plan.write_text(json.dumps({"tasks": [
+            {"id": "one", "prompt": "First", "test_commands": [["fake-test"]]},
+            {"id": "two", "prompt": "Second", "test_commands": [["fake-test"]]}]}), encoding="utf-8")
+        fake = FakeExecutor()
+        self.assertEqual(self.run_fake(self.measured(fake), max_observed_tokens=24), 1)
+        self.assertEqual((fake.a_calls, fake.b_calls), (1, 1))
+        state = self.state()
+        self.assertEqual(state["completed"], ["one"])
+        self.assertEqual(runner.head(self.repo), state["history"][0]["commit"])
+        self.assertEqual(state["pending_execution"]["phase"], "unstarted")
+        self.assertEqual(self.observed(), (24, True))
+
+    def test_invocation_limit_can_stop_before_token_limit(self):
+        fake = FakeExecutor()
+        self.assertEqual(self.run_fake(self.measured(fake), max_observed_tokens=1000, max_agent_calls=1), 1)
+        self.assertEqual((fake.a_calls, fake.b_calls), (1, 0))
+        self.assertEqual(self.observed(), (12, True))
+        self.assertEqual(self.fixture.events()[-1]["metadata"]["reason"], "agent call budget exhausted")
+
+    def test_confirmed_unlaunched_process_does_not_require_tokens_but_spends_call(self):
+        fake = FakeExecutor([runner._CallResult(127, "launch failed", False, True, False)])
+        self.assertEqual(self.run_fake(self.measured(fake), max_observed_tokens=1000, max_agent_calls=3), 1)
+        self.assertEqual(self.observed(), (12, True))
+        resumed = FakeExecutor(review_only=True)
+        self.assertEqual(self.run_fake(self.measured(resumed), resume=True), 0)
+        self.assertEqual((resumed.a_calls, resumed.test_calls, resumed.b_calls), (0, 0, 1))
+        self.assertEqual(self.observed(), (24, True))
+        starts = [event for event in self.fixture.events() if (event["actor"], event["event"]) in {
+            ("Codex A", "process_started"), ("Codex B", "review_started")}]
+        self.assertEqual(len(starts), 3)
+
+    def test_changed_invalid_or_removed_saved_token_limits_are_rejected(self):
+        self.assertEqual(self.run_fake(self.measured(FakeExecutor()), max_observed_tokens=12), 1)
+        state = self.state()
+        manifest_path = self.logs / "run-manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for value in (0, True, "12", 13, None, "removed"):
+            changed_state, changed_manifest = dict(state), dict(manifest)
+            for target in (changed_state, changed_manifest):
+                if value == "removed":
+                    target.pop("max_observed_tokens")
+                else:
+                    target["max_observed_tokens"] = value
+            (self.logs / "state.json").write_text(json.dumps(changed_state), encoding="utf-8")
+            manifest_path.write_text(json.dumps(changed_manifest), encoding="utf-8")
+            resumed = FakeExecutor(review_only=True)
+            with self.subTest(value=value), self.assertRaises(PilotError):
+                self.run_fake(resumed, resume=True)
+            self.assertEqual(resumed.b_calls, 0)
+        (self.logs / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        with self.assertRaisesRegex(PilotError, "Observed token budget is fixed"):
+            self.run_fake(FakeExecutor(review_only=True), resume=True, max_observed_tokens=13)
+
+    def test_initialization_interruption_retains_token_limit(self):
+        save = runner.save_json
+        def interrupted(path, value):
+            if path.name == "run-manifest.json":
+                raise OSError("manifest initialization interruption")
+            return save(path, value)
+        with patch.object(runner, "save_json", side_effect=interrupted):
+            with self.assertRaisesRegex(OSError, "manifest initialization interruption"):
+                self.run_fake(FakeExecutor(), max_observed_tokens=12)
+        fake = FakeExecutor()
+        self.assertEqual(self.run_fake(self.measured(fake)), 1)
+        self.assertEqual(self.state()["max_observed_tokens"], 12)
+        self.assertEqual((fake.a_calls, fake.b_calls), (1, 0))
+
+    def test_legacy_runs_without_token_budget_allow_missing_usage(self):
+        first = FakeExecutor([failed_review("Quota exceeded. Check your plan and billing details.")])
+        with patch.object(runner, "bind_observed_token_budget"):
+            self.assertEqual(self.run_fake(first), 1)
+        events = self.fixture.events()
+        for event in events:
+            if event["event"] == "run_started":
+                event.get("metadata", {}).pop("max_observed_tokens", None)
+        (self.logs / "events.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+        self.assertNotIn("max_observed_tokens", self.state())
+        with self.assertRaisesRegex(PilotError, "Observed token budget is fixed"):
+            self.run_fake(FakeExecutor(review_only=True), resume=True, max_observed_tokens=1000)
+        resumed = FakeExecutor(review_only=True)
+        self.assertEqual(self.run_fake(resumed, resume=True), 0)
+        self.assertEqual(resumed.b_calls, 1)
+        self.assertNotIn("max_observed_tokens", self.state())
+
+
+class ObservedTokenBudgetCliTests(unittest.TestCase):
+    def test_positive_limits_and_omission_reach_runner(self):
+        argv = ["tasks.json", "--repo", "project", "--logs", "logs"]
+        with patch.object(runner, "run", return_value=0) as execute, \
+                patch.object(runner.shutil, "which", return_value="codex"):
+            for limit in (None, 1, 1000000000):
+                options = [] if limit is None else ["--max-observed-tokens", str(limit)]
+                self.assertEqual(runner.main(argv + options), 0)
+                self.assertEqual(execute.call_args.kwargs["max_observed_tokens"], limit)
+
+    def test_invalid_limits_never_execute_agents(self):
+        argv = ["tasks.json", "--repo", "project", "--logs", "logs", "--max-observed-tokens"]
+        with patch.object(runner, "run") as execute, patch.object(runner, "cancel_reservation"), redirect_stderr(io.StringIO()):
+            for value in ("0", "-1", "1.5", "invalid"):
+                with self.subTest(value=value), self.assertRaises(SystemExit) as invalid:
+                    runner.main(argv + [value])
+                self.assertEqual(invalid.exception.code, 2)
+            execute.assert_not_called()
+
+
 class AgentCallBudgetTests(unittest.TestCase):
     def setUp(self):
         self.fixture = ReviewRecoveryTests("test_successful_a_tests_b_commit")
