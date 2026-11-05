@@ -122,7 +122,8 @@ class PlanAuditTests(unittest.TestCase):
 
     def test_review_only_resume_preserves_binding_and_does_not_audit(self):
         self.do_audit()
-        first = Executor(reviews=[(1, "connection failed", False)] * 3)
+        first = Executor(reviews=[(1, json.dumps({"type": "turn.failed", "error": {
+            "message": "unexpected status 503 Service Unavailable: upstream unavailable"}}), False)] * 3)
         with patch.object(runner, "_review_sleep"), patch.object(runner, "_review_clock", side_effect=range(1000, 1200, 20)):
             self.assertEqual(self.start(first, approved_audit=self.logs), 1)
         self.assertEqual(first.calls, ["A", "B", "B", "B"])
