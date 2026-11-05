@@ -128,8 +128,8 @@ class WorkspaceTests(unittest.TestCase):
         self.manager.create_branch("owner/repo", "feature/auto")
         plan, logs = self.root / "plan.json", self.root / "logs"
         plan.write_text(json.dumps({"tasks": [
-            {"id": "first", "prompt": "Make first file"},
-            {"id": "second", "prompt": "Make second file"}]}))
+            {"id": "first", "prompt": "Make first file", "test_commands": [["fixture-focused-check"]]},
+            {"id": "second", "prompt": "Make second file", "test_commands": [["fixture-focused-check"]]}]}))
         config = {"repository": "owner/repo", "branch": "feature/auto"}
         repairing = False
         calls = []

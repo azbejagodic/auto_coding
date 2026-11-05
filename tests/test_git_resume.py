@@ -124,7 +124,9 @@ class GitResumeTests(unittest.TestCase):
 
     def test_same_sha_branch_switch_on_resume_is_rejected(self):
         fake = FakeExecutor(fail_second=True)
-        self.write_plan([{"id": "one", "prompt": "FIRST"}, {"id": "two", "prompt": "SECOND"}])
+        self.write_plan([
+            {"id": "one", "prompt": "FIRST", "test_commands": [["fixture-focused-check"]]},
+            {"id": "two", "prompt": "SECOND", "test_commands": [["fixture-focused-check"]]}])
         self.assertEqual(self.run_fake(fake), 1)
         saved_head = self.git("rev-parse", "HEAD")
         self.git("switch", "-c", "feature/other")
@@ -160,7 +162,9 @@ class GitResumeTests(unittest.TestCase):
         self.assertEqual(self.state()["completed"], [])
 
     def test_clean_reset_cannot_skip_a_completed_task(self):
-        self.write_plan([{"id": "one", "prompt": "FIRST"}, {"id": "two", "prompt": "SECOND"}])
+        self.write_plan([
+            {"id": "one", "prompt": "FIRST", "test_commands": [["fixture-focused-check"]]},
+            {"id": "two", "prompt": "SECOND", "test_commands": [["fixture-focused-check"]]}])
         self.assertEqual(self.run_fake(FakeExecutor(fail_second=True)), 1)
         self.assertEqual(self.state()["completed"], ["one"])
         self.git("reset", "--hard", self.initial_head)  # This disposable fixture only.
@@ -298,7 +302,9 @@ class GitResumeTests(unittest.TestCase):
         self.assertEqual(self.git("rev-parse", "HEAD"), self.initial_head)
 
     def test_pending_approval_cannot_be_reassigned_to_a_later_task(self):
-        self.write_plan([{"id": "one", "prompt": "FIRST"}, {"id": "two", "prompt": "SECOND"}])
+        self.write_plan([
+            {"id": "one", "prompt": "FIRST", "test_commands": [["fixture-focused-check"]]},
+            {"id": "two", "prompt": "SECOND", "test_commands": [["fixture-focused-check"]]}])
         with patch.object(runner, "local_commit", side_effect=runner.PilotError("before commit")):
             self.assertEqual(self.run_fake(FakeExecutor()), 1)
         state = self.state()
