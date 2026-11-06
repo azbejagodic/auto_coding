@@ -540,6 +540,7 @@ class ReviewRecoveryTests(unittest.TestCase):
         self.assertIn("minimal relevant checks where feasible", fake.b_prompts[0])
         self.assertIn("Run configured tests against the actual target", fake.b_prompts[0])
         self.assertNotIn("Do not execute tests", fake.b_prompts[0])
+        self.assertNotIn("The controller already selected the Git branch", prompt)
 
     def test_controller_mode_assigns_verification_to_controller_and_supplies_evidence(self):
         fake = FakeExecutor()
@@ -548,6 +549,11 @@ class ReviewRecoveryTests(unittest.TestCase):
         for text in ("only this task and necessary related changes", "Do not execute tests, linting, builds",
                      "Do not perform an extended self-review", "Report changed files and any known limitations",
                      "address all supplied controller failures and Codex B findings",
+                     "The controller already selected the Git branch", "Use the existing branch and current checkout",
+                     "Do not create or switch branches, commit, reset, or write .git",
+                     "'new feature branch' is setup context", "Branch creation is unnecessary and prohibited",
+                     "rather than stop because Git metadata is protected",
+                     "implementation files and test files actually exist", "genuine implementation blocker concisely",
                      "Do not change Git history, push", "read secrets, or modify files outside it"):
             self.assertIn(text, implementer)
         for text in ("Run focused tests relevant", "complete current-task Git diff", "Run the configured focused checks"):
@@ -566,6 +572,58 @@ class ReviewRecoveryTests(unittest.TestCase):
         self.assertIn(f"Controller test evidence is in {self.logs}", reviewer)
         self.assertIn("read the saved outputs referenced in TEST RESULTS", reviewer)
         self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (1, 1, 1))
+
+    def test_previous_a_branch_blocker_survives_controller_failure_handoff(self):
+        fake = FakeExecutor()
+        blocker = "Blocked: branch creation failed because .git is read-only; no required implementation or test files were created."
+        def execute(argv, cwd, timeout, *, prompt=None):
+            result = fake(argv, cwd, timeout, prompt=prompt)
+            if "--output-last-message" in argv and "--output-schema" not in argv and fake.a_calls == 1:
+                (cwd / "app.txt").unlink()  # Simulate an A invocation that made no changes.
+                Path(argv[argv.index("--output-last-message") + 1]).write_text(blocker)
+            if argv[0] == "fake-test" and fake.test_calls == 1:
+                return 1, "No tests discovered: required test file is missing", False
+            return result
+        self.assertEqual(self.run_fake(execute), 0)
+        self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (2, 2, 1))
+        correction = fake.a_prompts[1]
+        self.assertEqual(correction.count(blocker), 1)
+        for text in ("No changed or created project files", "No tests discovered: required test file is missing",
+                     "PREVIOUS CODEX A RESPONSE (unverified claims, not controller test evidence)",
+                     "Controller test results and Codex B findings remain authoritative",
+                     "Branch creation is unnecessary and prohibited", "Saved answer: one-01-a-answer.txt"):
+            self.assertIn(text, correction)
+
+    def test_changed_previous_a_answer_is_not_trusted_or_required_for_correction(self):
+        fake = FakeExecutor()
+        def execute(argv, cwd, timeout, *, prompt=None):
+            result = fake(argv, cwd, timeout, prompt=prompt)
+            if argv[0] == "fake-test" and fake.test_calls == 1:
+                (self.logs / "one-01-a-answer.txt").write_text("UNTRUSTED ALTERED RESPONSE")
+                return 1, "controller assertion failed", False
+            return result
+        self.assertEqual(self.run_fake(execute), 0)
+        self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (2, 2, 1))
+        self.assertIn("controller assertion failed", fake.a_prompts[1])
+        self.assertIn("unavailable or failed integrity validation", fake.a_prompts[1])
+        self.assertNotIn("UNTRUSTED ALTERED RESPONSE", fake.a_prompts[1])
+
+    def test_failed_a_process_response_reaches_resumed_correction(self):
+        fake = FakeExecutor()
+        blocker = "Blocked: required implementation prerequisite is unavailable."
+        def execute(argv, cwd, timeout, *, prompt=None):
+            result = fake(argv, cwd, timeout, prompt=prompt)
+            if "--output-last-message" in argv and "--output-schema" not in argv and fake.a_calls == 1:
+                Path(argv[argv.index("--output-last-message") + 1]).write_text(blocker)
+                return runner._CallResult(1, "process stopped", False, True, True)
+            return result
+        self.assertEqual(self.run_fake(execute), 1)
+        self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (1, 0, 0))
+        self.assertEqual(self.run_fake(execute, resume=True), 0)
+        self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (2, 1, 1))
+        self.assertIn(blocker, fake.a_prompts[1])
+        self.assertIn("Codex A process failed or timed out", fake.a_prompts[1])
+        self.assertIn("unverified claims, not controller test evidence", fake.a_prompts[1])
 
     def test_reviewer_must_continue_past_first_blocker_and_cover_affected_paths(self):
         fake = FakeExecutor()
@@ -881,6 +939,34 @@ class ReviewRecoveryTests(unittest.TestCase):
 
 
 class CorrectionContextTests(unittest.TestCase):
+    def test_bounded_a_response_preserves_controller_failure_and_complete_b_findings(self):
+        review = {"decision": "REJECTED", "issues": ["reset misses edge case", "save loses failure"],
+                  "summary": "Two defects", "verification": {"status": "failed", "details": "B evidence"}}
+        prior = [{"attempt": 1, "review": review},
+                 {"attempt": 2, "feedback": "controller failure: expected 2, got 1"}]
+        response = "BLOCKER_START: missing prerequisite\n" + "agent-log-noise" * 20000 + "\nBLOCKER_END: tests were not run"
+        context = correction_context(prior, controller_tests=True, implementer_response=response)
+        self.assertLessEqual(len(context), MAX_CORRECTION_CONTEXT)
+        for text in (*review["issues"], review["summary"], review["verification"]["details"],
+                     prior[-1]["feedback"], "BLOCKER_START", "BLOCKER_END", "Response shortened",
+                     "unverified claims, not controller test evidence", "remain authoritative"):
+            self.assertEqual(context.count(text), 1)
+        supplement = context.split("PREVIOUS CODEX A RESPONSE", 1)[1]
+        self.assertLess(len(supplement), runner.MAX_A_RESPONSE_FEEDBACK + 400)
+
+    def test_a_response_cannot_displace_a_near_limit_complete_verdict(self):
+        review = {"decision": "REJECTED", "issues": ["critical finding " + "x" * 20700]}
+        context = correction_context([{"attempt": 1, "review": review}], controller_tests=True,
+                                     implementer_response="BLOCKER: " + "a" * 10000)
+        self.assertIn(review["issues"][0], context)
+        self.assertLessEqual(len(context), MAX_CORRECTION_CONTEXT)
+        self.assertTrue("Response shortened" in context or "Previous A response omitted" in context)
+
+    def test_legacy_correction_context_ignores_new_optional_a_response(self):
+        prior = [{"attempt": 1, "feedback": "legacy test failed"}]
+        self.assertEqual(correction_context(prior), correction_context(prior, implementer_response="new response"))
+        self.assertNotIn("PREVIOUS CODEX A RESPONSE", correction_context(prior))
+
     def test_verdict_accepts_more_than_twenty_concise_independent_findings(self):
         verdict = {"decision": "REJECTED", "issues": [f"issue {n}: concrete path and fix" for n in range(21)],
                    "summary": "Multiple independent failures"}
