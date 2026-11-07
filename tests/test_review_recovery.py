@@ -554,6 +554,9 @@ class ReviewRecoveryTests(unittest.TestCase):
                      "'new feature branch' is setup context", "Branch creation is unnecessary and prohibited",
                      "rather than stop because Git metadata is protected",
                      "implementation files and test files actually exist", "genuine implementation blocker concisely",
+                     "acceptance criteria are addressed",
+                     "current JSON task's supported scope", "Prefer existing backend helpers",
+                     "Do not expand support for excluded configurations", "refusal safe and explicit where required",
                      "Do not change Git history, push", "read secrets, or modify files outside it"):
             self.assertIn(text, implementer)
         for text in ("Run focused tests relevant", "complete current-task Git diff", "Run the configured focused checks"):
@@ -649,11 +652,71 @@ class ReviewRecoveryTests(unittest.TestCase):
             self.assertIn(text, prompt)
         self.assertNotIn("Do not execute tests", prompt)
 
+    def test_controller_corrections_address_mechanisms_within_supported_scope(self):
+        failures = [{"attempt": 1, "feedback": "controller assertion: unsafe path accepted"},
+                    {"attempt": 1, "review": {"decision": "REJECTED",
+                     "issues": ["paths.py: alias bypass", "paths.py: collision overwrites logs"],
+                     "summary": "Preserve source and prior logs"}}]
+        for failure in failures:
+            with self.subTest(failure=failure):
+                prompt = correction_context([failure], controller_tests=True)
+                for text in ("underlying failure mechanism, not just the triggering example",
+                             "correct every supplied actionable finding",
+                             "directly related cases sharing that mechanism",
+                             "Preserve behavior that already works",
+                             "The controller will run relevant tests"):
+                    self.assertIn(text, prompt)
+                self.assertNotIn("Re-run relevant tests", prompt)
+                if "review" in failure:
+                    self.assertIn(json.dumps(failure["review"], ensure_ascii=False, separators=(",", ":")), prompt)
+                else:
+                    self.assertIn(failure["feedback"], prompt)
+                self.assertLessEqual(len(prompt), MAX_CORRECTION_CONTEXT)
+                legacy = correction_context([failure])
+                self.assertIn("Re-run relevant tests", legacy)
+                self.assertNotIn("underlying failure mechanism", legacy)
+
+    def test_acceptance_review_uses_materiality_and_explicit_evidence_strength(self):
+        task = {"prompt": "Allocate external logs; exclude unsupported Git configurations",
+                "test_commands": [["python", "-m", "unittest", "test_paths"]]}
+        tests = [{"index": 1, "exit_code": 0, "output": "saved-test.txt", "output_sha256": "saved-hash"}]
+        for controller in (True, False):
+            with self.subTest(controller_tests=controller):
+                prompt = runner.review_prompt_for(task, "paths.py | 2 +", "complete diff", tests,
+                                                  controller_tests=controller)
+                for text in ("task's explicit exclusions", "adjacent code only when needed",
+                             "missing functionality", "meaningful correctness bugs", "broken required tests",
+                             "authorization failures", "data-loss risks", "credible safety violations",
+                             "required safe refusal of unsupported configurations",
+                             "Do not reject solely for coding style, optional refactoring, minor performance improvements",
+                             "alternative implementation preferences or unsupported features that are safely refused",
+                             "affected requirement or safety boundary", "code location", "concrete triggering conditions",
+                             "actual or source-derived failure mechanism", "minimal correction needed",
+                             "Label evidence as executed reproduction",
+                             "source-derived defect with a concrete failure path, or unconfirmed concern",
+                             "may block without an executed reproduction", "unconfirmed speculation alone must not block",
+                             "Review related mechanisms together", "first verdict where possible",
+                             "do not investigate unrelated", "never approve solely on those claims"):
+                    self.assertIn(text, prompt)
+                self.assertIn(task["prompt"], prompt)
+                self.assertIn("DIFF (truncated; inspect repository for full):\ncomplete diff", prompt)
+                self.assertIn("TEST RESULTS:\n" + json.dumps(tests), prompt)
+                self.assertIn("CONFIGURED FOCUSED CHECKS (argv):\n" + json.dumps(task["test_commands"]), prompt)
+                if controller:
+                    self.assertIn("Approval requires passed focused controller verification", prompt)
+                    self.assertIn("Do not execute tests, linting, builds", prompt)
+                else:
+                    self.assertNotIn("Approval requires passed focused controller verification", prompt)
+                    self.assertIn("minimal relevant checks where feasible", prompt)
+
     def test_reviewer_prompt_keeps_full_staged_diff_access_when_excerpt_is_truncated(self):
-        prompt = runner.review_prompt_for({"prompt": "Implement one", "test_commands": []}, "", "x" * 35001, [])
-        self.assertIn("Inspect all staged changes in the repository even if the embedded DIFF is truncated", prompt)
-        self.assertIn("DIFF (truncated; inspect repository for full):", prompt)
-        self.assertNotIn("x" * 35001, prompt)
+        for controller in (True, False):
+            with self.subTest(controller_tests=controller):
+                prompt = runner.review_prompt_for({"prompt": "Implement one", "test_commands": []}, "", "x" * 35001, [],
+                                                  controller_tests=controller)
+                self.assertIn("Inspect all staged changes in the repository even if the embedded DIFF is truncated", prompt)
+                self.assertIn("DIFF (truncated; inspect repository for full):", prompt)
+                self.assertNotIn("x" * 35001, prompt)
 
     def test_complete_multi_issue_verdict_reaches_a_and_next_b_without_extra_calls(self):
         issues = ["app.txt:12 reset returns stale data; reproduce with reset twice; clear state",
