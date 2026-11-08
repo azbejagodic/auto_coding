@@ -134,7 +134,9 @@ class SimpleRunnerTests(unittest.TestCase):
         self.assertTrue(any('extends=":read-only"' in value and 'network={enabled=false}' in value
                             and f'{json.dumps(self.repo.resolve().as_posix())}= "read"' in value
                             and '= "write"' in value for value in settings))
-        for policy in ('substantive, reproducible blockers', 'CURRENT task/slice',
+        for policy in ('substantive blockers with a concrete failure mechanism',
+                       'A credible source-derived safety defect may block without an executed reproduction',
+                       'unconfirmed speculation alone must not block', 'CURRENT task/slice',
                        'List ALL such blockers', 'optional polish', 'non-blocking suggestions'):
             self.assertIn(policy, calls[1][1])
         self.assertNotIn('--model', calls[0][0])
