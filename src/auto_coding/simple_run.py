@@ -308,6 +308,19 @@ def codex_argv(*, readonly: bool, last_message: Path, schema: Path | None, model
     return [*cmd, "-"]
 
 
+def model_request_metadata(model: str | None) -> dict:
+    """Describe the controller request, never claim an effective CLI setting."""
+    recorded = isinstance(model, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}", model) is not None
+    metadata = {"requested_model": model if recorded else None,
+                "model_source": "controller_override" if model else "cli_inherited_unverified",
+                "reasoning_effort": "unknown"}
+    if model and not recorded:
+        # Log only bounded identifier spellings, not arbitrary configuration or
+        # command text. This does not validate or change the execution argument.
+        metadata["requested_model_omitted"] = True
+    return metadata
+
+
 def files_overview(repo: Path) -> str:
     result = call(["git", "status", "--short", "--untracked-files=all"], repo, 15)
     if result[0] != 0:
@@ -1257,7 +1270,8 @@ def review_ready_task(repo: Path, logs: Path, state: dict, state_path: Path,
             execution = events.emit("Codex B", "review_started", "started", task_id=ident, attempt=attempt,
                         evidence={"prompt": prompt_name, "diff": f"{base}-diff.txt",
                                   "stream": stream_name, "verdict": verdict_name},
-                        metadata={"review_try": ordinal, "review_invocation": ordinal, "scratch": spec.scratch.name})
+                        metadata={"review_try": ordinal, "review_invocation": ordinal, "scratch": spec.scratch.name}
+                                 | model_request_metadata(model_b))
         except BaseException:
             cleanup_review_scratch(spec, events, ident, attempt)  # No reviewer was launched.
             raise
@@ -1482,7 +1496,7 @@ def implementation_attempt(repo, logs, state, state_path, events, task, attempt,
         return None
     execution = events.emit("Codex A", "process_started", "started", task_id=ident, attempt=attempt,
         evidence={"prompt": f"{base}-a-prompt.txt", "stream": f"{base}-a-events.jsonl", "answer": answer_path.name},
-        metadata={"attempt_id": pending["id"]})
+        metadata={"attempt_id": pending["id"]} | model_request_metadata(model_a))
     pending.update(phase="running", execution_id=execution["seq"])
     state["status"] = "running"
     save_json(state_path, state)

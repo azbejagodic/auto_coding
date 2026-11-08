@@ -69,6 +69,11 @@ class MetricsTests(unittest.TestCase):
         self.assertEqual(summary["tasks"]["one"]["codex_a"]["invocations"], 1)
         self.assertEqual(summary["tasks"]["two"]["codex_a"]["invocations"], 1)
         self.assertEqual(summary, summarize_events(events))
+        for item in events:
+            if item["event"] in {"process_started", "review_started"}:
+                item["metadata"].update(requested_model="fixture-model", model_source="controller_override",
+                                        reasoning_effort="unknown")
+        self.assertEqual(summary, summarize_events(events))
 
     def test_legacy_and_incomplete_records_do_not_invent_duration_usage_or_launches(self):
         events = [event(1, "Codex A", "process_started"),

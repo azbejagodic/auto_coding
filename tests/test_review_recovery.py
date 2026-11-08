@@ -20,6 +20,7 @@ from auto_coding.simple_run import (PilotError, checked_review, correction_conte
 
 APPROVED = {"decision": "APPROVED", "issues": [], "summary": "OK"}
 REJECTED = {"decision": "REJECTED", "issues": ["Fix the implementation"], "summary": "Incomplete"}
+AGENT_START_EVENTS = {("Codex A", "process_started"), ("Codex B", "review_started")}
 
 
 def failed_review(message, code=1):
@@ -138,6 +139,100 @@ class ReviewRecoveryTests(unittest.TestCase):
             self.assertIsNone(metrics[role]["usage"])
         self.assertEqual(metrics["correction_attempts"], 0)
         self.assertEqual(metrics["review_retries"], 0)
+        for event in self.events():
+            if (event["actor"], event["event"]) in AGENT_START_EVENTS:
+                self.assertIsNone(event["metadata"]["requested_model"])
+                self.assertEqual(event["metadata"]["model_source"], "cli_inherited_unverified")
+                self.assertEqual(event["metadata"]["reasoning_effort"], "unknown")
+
+    def test_explicit_models_are_durable_before_launch_and_paired_with_retries(self):
+        fake = FakeExecutor([1, APPROVED])
+        starts = []
+        usage = {"input_tokens": 100, "cached_input_tokens": 30, "output_tokens": 7}
+        stream = "\n".join(json.dumps(event) for event in (
+            {"type": "thread.started"}, {"type": "turn.started"}, {"type": "turn.completed", "usage": usage}))
+        def execute(argv, cwd, timeout, *, prompt=None):
+            if "--output-last-message" in argv:
+                # Read the durable artifact inside the executor, before the
+                # simulated process runs; no manifest/config lookup is needed.
+                event = self.events()[-1]
+                reviewer = "--output-schema" in argv
+                expected = "fixture-reviewer" if reviewer else "fixture-developer"
+                self.assertEqual(event["actor"], "Codex B" if reviewer else "Codex A")
+                self.assertEqual((event["task_id"], event["attempt"]), ("one", 1))
+                self.assertEqual(event["metadata"]["requested_model"], expected)
+                self.assertEqual(event["metadata"]["model_source"], "controller_override")
+                self.assertEqual(event["metadata"]["reasoning_effort"], "unknown")
+                self.assertEqual(argv[argv.index("--model") + 1], expected)
+                starts.append(event)
+            result = fake(argv, cwd, timeout, prompt=prompt)
+            return (result[0], stream, result[2]) if result[0] == 0 and "--output-last-message" in argv else result
+        secret = "PRIVATE-CONFIG-ENV-FIXTURE"
+        with patch.dict("os.environ", {"MODEL_LOGGING_TEST_SECRET": secret}):
+            self.assertEqual(self.run_fake(execute, model_a="fixture-developer", model_b="fixture-reviewer"), 0)
+        self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (1, 1, 2))
+        self.assertEqual([event["metadata"]["review_invocation"] for event in starts[1:]], [1, 2])
+        finishes = [event for event in self.events() if event["event"] in {"process_finished", "review_process_finished"}]
+        self.assertEqual([event["metadata"]["execution_id"] for event in finishes], [event["seq"] for event in starts])
+        self.assertEqual(len({event["seq"] for event in starts}), 3)
+        self.assertEqual(self.metrics()["codex_a"]["usage"], usage)
+        self.assertEqual(self.metrics()["codex_b"]["usage"], usage)
+        timeline = (self.logs / "events.jsonl").read_text(encoding="utf-8")
+        for excluded in (secret, "MODEL_LOGGING_TEST_SECRET", "--output-last-message", "--ask-for-approval"):
+            self.assertNotIn(excluded, timeline)
+
+    def assert_model_history_on_resume(self, *, legacy):
+        first = FakeExecutor([failed_review("unexpected status 401 Unauthorized: expired credential")])
+        self.assertEqual(self.run_fake(first, model_a="original-a", model_b="original-b"), 1)
+        if legacy:
+            events = self.events()
+            for event in events:
+                for key in ("requested_model", "model_source", "reasoning_effort"):
+                    event.get("metadata", {}).pop(key, None)
+            (self.logs / "events.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+        original = (self.logs / "events.jsonl").read_bytes()
+        old_starts = [event for event in self.events() if (event["actor"], event["event"]) in AGENT_START_EVENTS]
+        resumed = FakeExecutor(review_only=True)
+        self.assertEqual(self.run_fake(resumed, resume=True, model_a="unused-resume-a", model_b="resumed-b"), 0)
+        self.assertEqual((resumed.a_calls, resumed.test_calls, resumed.b_calls), (0, 0, 1))
+        self.assertTrue((self.logs / "events.jsonl").read_bytes().startswith(original))
+        starts = [event for event in self.events() if (event["actor"], event["event"]) in AGENT_START_EVENTS]
+        self.assertEqual(starts[:-1], old_starts)
+        self.assertEqual(starts[-1]["metadata"]["requested_model"], "resumed-b")
+        self.assertEqual(starts[-1]["metadata"]["model_source"], "controller_override")
+        self.assertEqual(starts[-1]["metadata"]["reasoning_effort"], "unknown")
+        self.assertNotEqual(starts[-1]["seq"], old_starts[-1]["seq"])
+        if legacy:
+            self.assertTrue(all("requested_model" not in event["metadata"] for event in old_starts))
+        else:
+            self.assertEqual([event["metadata"]["requested_model"] for event in old_starts], ["original-a", "original-b"])
+
+    def test_resume_preserves_prior_model_requests_and_records_only_new_request(self):
+        self.assert_model_history_on_resume(legacy=False)
+
+    def test_legacy_logs_resume_without_inventing_historical_model_requests(self):
+        self.assert_model_history_on_resume(legacy=True)
+
+    def test_model_metadata_is_bounded_without_validating_or_changing_arguments(self):
+        for model in (None, "", "namespace/model:v1", "m" * 128, "m" * 129,
+                      'model=x\nsecret="PRIVATE-CONFIG-FIXTURE"'):
+            with self.subTest(model=model):
+                argv = runner.codex_argv(readonly=False, last_message=Path("answer"), schema=None, model=model)
+                with patch("builtins.open", side_effect=AssertionError("Do not inspect CLI configuration")):
+                    metadata = runner.model_request_metadata(model)
+                self.assertLess(len(json.dumps(metadata)), 512)
+                self.assertEqual(metadata["reasoning_effort"], "unknown")
+                self.assertEqual(metadata["model_source"], "controller_override" if model else "cli_inherited_unverified")
+                if model and (len(model) > 128 or "\n" in model):
+                    self.assertIsNone(metadata["requested_model"])
+                    self.assertTrue(metadata["requested_model_omitted"])
+                    self.assertNotIn("PRIVATE-CONFIG-FIXTURE", json.dumps(metadata))
+                else:
+                    self.assertEqual(metadata["requested_model"], model or None)
+                if model:
+                    self.assertEqual(argv[argv.index("--model") + 1], model)
+                else:
+                    self.assertNotIn("--model", argv)
 
     def assert_partial_failure_artifact(self, actor):
         from auto_coding.process_runner import OutputLimitExceeded, MAX_FAILURE_OUTPUT_BYTES
