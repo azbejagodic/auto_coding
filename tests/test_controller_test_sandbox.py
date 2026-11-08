@@ -123,9 +123,37 @@ class ControllerTestSandboxTests(unittest.TestCase):
                 self.assertEqual(self.scratch(), [])
         def permission_failure(argv, *args):
             marker = json.loads(argv[-1])[1]
-            return runner._CallResult(0, '\n' + marker + '{"kind":"environment","errno":13}', False)
-        with self.assertRaises(sandbox.ControllerTestEnvironmentError): self.run_test(permission_failure)
+            return runner._CallResult(0, '\n' + marker + json.dumps({"kind":"environment",
+                "error_type":"PermissionError", "error_text":"denied", "errno":13,
+                "winerror":5, "executable":"compiler"}), False)
+        with self.assertRaises(sandbox.ControllerTestEnvironmentError) as caught:
+            self.run_test(permission_failure)
+        self.assertEqual(caught.exception.classification, "confirmed_environment_blocker")
+        self.assertEqual(caught.exception.details["executable"], "compiler")
+        self.assertEqual(caught.exception.details["errno"], 13)
+        self.assertFalse(caught.exception.process_started)
+        self.assertTrue(caught.exception.cleanup_confirmed)
         self.assertTrue(list(self.logs.glob("controller-test-sandbox-*.txt")))
+
+    def test_missing_executable_is_a_structured_launch_blocker(self):
+        marker = "RESULT:"
+        environment = os.environ.copy()
+        missing = str(self.root / "missing-test-tool")
+        result = subprocess.run([sys.executable, "-I", "-B", "-c", sandbox._BOOTSTRAP,
+                                 json.dumps([[missing], marker, environment])],
+                               capture_output=True, text=True, timeout=10)
+        evidence = json.loads(result.stdout.split(marker, 1)[1])
+        self.assertEqual(evidence["kind"], "environment")
+        self.assertEqual(evidence["error_type"], "FileNotFoundError")
+        self.assertEqual(evidence["errno"], 2)
+        self.assertEqual(evidence["executable"], missing)
+
+    def test_ambiguous_sandbox_output_is_not_called_a_permission_failure(self):
+        with self.assertRaises(sandbox.ControllerTestEnvironmentError) as caught:
+            self.run_test(Mock(return_value=runner._CallResult(1, "browser crashed", False, True, True)))
+        self.assertEqual(caught.exception.classification, "unclassified_execution_problem")
+        self.assertNotIn("permission", caught.exception.classification)
+        self.assertTrue(caught.exception.output_artifact)
 
     def test_timeout_cleanup_proof_and_uncertainty_are_preserved(self):
         for confirmed in (True, False):

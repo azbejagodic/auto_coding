@@ -106,24 +106,60 @@ class TestCleanupSafetyTests(unittest.TestCase):
         self.assertEqual(self.state()["completed"], [])
         self.assertNotIn("harmless-canary", (self.logs / "events.jsonl").read_text())
 
-    def test_sandbox_startup_failure_resumes_tests_without_replaying_a(self):
+    def test_environment_blocker_stops_immediately_and_latches_resume(self):
         from auto_coding.controller_test_sandbox import ControllerTestEnvironmentError
-        fake = FakeExecutor([ControllerTestEnvironmentError("MXC startup failed")])
-        with self.assertRaises(ControllerTestEnvironmentError): self.run_fake(fake)
+        error = ControllerTestEnvironmentError("missing compiler", process_started=False,
+            classification="confirmed_environment_blocker",
+            details={"stage": "command_launch", "executable": "compiler", "error_type": "FileNotFoundError",
+                     "error_text": "compiler was not found", "errno": 2})
+        fake = FakeExecutor([error])
+        self.assertEqual(self.run_fake(fake), 1)
         self.assertEqual(fake.calls, ["A", "test"])
         self.assertFalse(test_gate_path(self.repo).exists())
         self.assertEqual(self.state()["completed"], [])
+        latch = self.state()["test_environment_blocker"]
+        diagnostic_path = self.logs / latch["diagnostic"]
+        diagnostic = json.loads(diagnostic_path.read_text())
+        self.assertEqual(diagnostic["classification"], "confirmed_environment_blocker")
+        self.assertEqual(diagnostic["task_id"], "one")
+        self.assertEqual(diagnostic["a_attempt"], 1)
+        self.assertEqual(diagnostic["test_index"], 1)
+        self.assertEqual(diagnostic["executable"], "compiler")
+        self.assertEqual(diagnostic["errno"], 2)
+        self.assertEqual(diagnostic["supporting_evidence"]["error_text"], "compiler was not found")
+        self.assertEqual(diagnostic["process_started"], False)
+        self.assertEqual(diagnostic["cleanup_confirmed"], True)
+        self.assertEqual(diagnostic["output_artifacts"], [])
+        self.assertFalse(any(event["event"] in {"review_started", "checkpoint_started", "checkpoint_committed"}
+                             for event in self.events()))
         resumed = FakeExecutor()
-        self.assertEqual(self.run_fake(resumed, resume=True), 0)
-        self.assertEqual(resumed.calls, ["test", "test", "B"])
+        with self.assertRaisesRegex(runner.PilotError, "requires inspection before resume"):
+            self.run_fake(resumed, resume=True)
+        self.assertEqual(resumed.calls, [])
+
+    def test_ambiguous_execution_problem_stops_without_claiming_permission_failure(self):
+        error = RuntimeError("browser process crashed")
+        error.cleanup_confirmed = True
+        error.process_started = True
+        fake = FakeExecutor([error])
+        self.assertEqual(self.run_fake(fake), 1)
+        self.assertEqual(fake.calls, ["A", "test"])
+        diagnostic = json.loads((self.logs / self.state()["test_environment_blocker"]["diagnostic"]).read_text())
+        self.assertEqual(diagnostic["classification"], "unclassified_execution_problem")
+        self.assertIn("does not establish why execution failed", diagnostic["unknown"])
+        self.assertNotIn("permission", diagnostic["classification"])
+        with self.assertRaisesRegex(runner.PilotError, "requires inspection before resume"):
+            self.run_fake(FakeExecutor(), resume=True)
 
     def test_sandbox_uncertain_cleanup_blocks_recovery(self):
         from auto_coding.controller_test_sandbox import ControllerTestEnvironmentError
         error = ControllerTestEnvironmentError("MXC cleanup uncertain", cleanup_confirmed=False, process_started=True)
         fake = FakeExecutor([error])
-        with self.assertRaises(ControllerTestEnvironmentError): self.run_fake(fake)
+        self.assertEqual(self.run_fake(fake), 1)
         self.assert_stopped_uncertain(fake)
         with self.assertRaises(TestProcessSafetyError): self.run_fake(FakeExecutor(), resume=True)
+        diagnostic = json.loads((self.logs / self.state()["test_environment_blocker"]["diagnostic"]).read_text())
+        self.assertFalse(diagnostic["cleanup_confirmed"])
 
     def test_legacy_and_explicitly_confirmed_success_permit_normal_continuation(self):
         for position, results in enumerate(([], [runner._CallResult(0, "OK", False, True, True)])):
@@ -363,17 +399,21 @@ else:
                 self.logs = self.root / f"exception-logs-{position}"
                 error.cleanup_confirmed = False
                 fake = FakeExecutor([error])
-                with self.assertRaises(type(error)):
-                    self.run_fake(fake)
+                if isinstance(error, KeyboardInterrupt):
+                    with self.assertRaises(KeyboardInterrupt):
+                        self.run_fake(fake)
+                else:
+                    self.assertEqual(self.run_fake(fake), 1)
                 self.assert_stopped_uncertain(fake)
 
     def test_confirmed_exception_and_timeout_do_not_leave_false_uncertainty(self):
         error = OSError("test interrupted after confirmed cleanup")
         error.cleanup_confirmed = True
-        with self.assertRaises(OSError):
-            self.run_fake(FakeExecutor([error]))
+        self.assertEqual(self.run_fake(FakeExecutor([error])), 1)
         assert_test_process_safe(self.repo)
         self.assertNotIn("uncertain_test", self.state())
+        self.assertEqual(self.state()["test_environment_blocker"]["classification"],
+                         "unclassified_execution_problem")
         self.repo = self.make_repo("confirmed-timeout")
         self.logs = self.root / "confirmed-timeout-logs"
         fake = FakeExecutor([runner._CallResult(124, "timeout", True, True, True)])

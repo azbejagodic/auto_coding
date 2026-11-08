@@ -15,10 +15,16 @@ from auto_coding.reviewer_permissions import (
 
 
 class ControllerTestEnvironmentError(ValueError):
-    def __init__(self, message, *, cleanup_confirmed=True, process_started=False):
+    def __init__(self, message, *, cleanup_confirmed=True, process_started=False,
+                 classification="unclassified_execution_problem", details=None, output="",
+                 output_artifact=None):
         super().__init__(message)
         self.cleanup_confirmed = cleanup_confirmed
         self.process_started = process_started
+        self.classification = classification
+        self.details = details if isinstance(details, dict) else {}
+        self.output = output if isinstance(output, str) else str(output)
+        self.output_artifact = output_artifact
 
 
 # Trusted stdlib bootstrap ignores target imports (-I). The child receives the
@@ -32,7 +38,8 @@ try:
     result = {"exit_code": subprocess.call(command), "kind": "test"}
 except OSError as error:
     result = {"kind": "environment", "error_type": type(error).__name__,
-              "errno": error.errno, "winerror": getattr(error, "winerror", None)}
+              "error_text": str(error), "errno": error.errno,
+              "winerror": getattr(error, "winerror", None), "executable": command[0]}
 print("\n" + marker + json.dumps(result), flush=True)
 '''
 
@@ -93,7 +100,12 @@ def prepare(command, repo, logs, git):
             spec.cleanup()
         raise ControllerTestEnvironmentError(
             f"Controller test sandbox preflight failed ({type(exc).__name__}); scratch: {spec.scratch}",
-            cleanup_confirmed=clean, process_started=not clean) from exc
+            cleanup_confirmed=clean, process_started=not clean,
+            classification=("confirmed_environment_blocker" if isinstance(
+                exc, (ReviewerEnvironmentError, OSError, KeyError))
+                else "unclassified_execution_problem"),
+            details={"stage": "sandbox_preflight", "error_type": type(exc).__name__,
+                     "error_text": str(exc)[:2048]}) from exc
 
 
 def run(command, repo, logs, timeout, *, git, launch):
@@ -114,12 +126,26 @@ def run(command, repo, logs, timeout, *, git, launch):
             evidence = json.loads(footer) if separator and code == 0 else None
         except ValueError:
             evidence = None
+        if isinstance(evidence, dict) and evidence.get("kind") == "environment":
+            diagnostic = Path(logs) / ("controller-test-sandbox-" + uuid.uuid4().hex + ".txt")
+            diagnostic.write_text(prefix or output, encoding="utf-8")
+            details = {key: evidence.get(key) for key in
+                       ("executable", "error_type", "error_text", "errno", "winerror")
+                       if evidence.get(key) is not None}
+            details["stage"] = "command_launch"
+            raise ControllerTestEnvironmentError(
+                "Configured test command could not be launched; "
+                f"diagnostics: {diagnostic.name}", cleanup_confirmed=True, process_started=False,
+                classification="confirmed_environment_blocker", details=details,
+                output=prefix, output_artifact=diagnostic.name)
         if (not isinstance(evidence, dict) or evidence.get("kind") != "test"
                 or type(evidence.get("exit_code")) is not int):
             diagnostic = Path(logs) / ("controller-test-sandbox-" + uuid.uuid4().hex + ".txt")
             diagnostic.write_text(output, encoding="utf-8")
             raise ControllerTestEnvironmentError(
-                f"Sandbox startup/command environment failed; see {diagnostic}", process_started=True)
+                f"Sandbox execution result was incomplete; see {diagnostic}", process_started=True,
+                classification="unclassified_execution_problem", output=output,
+                output_artifact=diagnostic.name)
         return _TestResult(evidence["exit_code"], prefix)
     except BaseException as exc:
         if not isinstance(exc, ControllerTestEnvironmentError):

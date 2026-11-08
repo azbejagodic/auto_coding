@@ -275,6 +275,101 @@ def record_test_uncertainty(state, state_path, gate):
         save_json(state_path, state)
 
 
+def _diagnostic_command(command):
+    """Keep the configured argv recognizable without copying obvious secrets."""
+    result, hide_next = [], False
+    for value in command[:32]:
+        value = str(value)[:4096]
+        if hide_next:
+            result.append("[redacted]")
+            hide_next = False
+            continue
+        if re.search(r"(?i)(token|password|secret|credential|api[-_]?key)", value):
+            if "=" in value:
+                result.append(value.split("=", 1)[0] + "=[redacted]")
+            else:
+                result.append(value)
+                hide_next = True
+        else:
+            result.append(value)
+    bounded, total = [], 0
+    for value in result:
+        room = max(0, 4096 - total)
+        if not room:
+            break
+        bounded.append(value[:room])
+        total += min(len(value), room) + 1
+    return bounded
+
+
+def _test_environment_stop(logs, state, state_path, events, *, task, attempt, index,
+                           command, execution, exception, output=None, timed=False,
+                           exit_code=None, cleanup_confirmed=None):
+    """Persist a bounded diagnostic and latch execution until explicit inspection."""
+    classification = getattr(exception, "classification", "unclassified_execution_problem")
+    if classification not in {"confirmed_environment_blocker", "unclassified_execution_problem"}:
+        classification = "unclassified_execution_problem"
+    existing_artifact = getattr(exception, "output_artifact", None)
+    captured = output if output is not None else getattr(exception, "output", "")
+    if isinstance(captured, bytes):
+        captured = captured.decode("utf-8", errors="replace")
+    captured = captured if isinstance(captured, str) else str(captured or "")
+    output_artifacts = []
+    if isinstance(existing_artifact, str) and Path(existing_artifact).name == existing_artifact:
+        if (logs / existing_artifact).is_file():
+            output_artifacts.append(existing_artifact)
+    if captured and not output_artifacts:
+        output_name = f"{task}-{attempt:02d}-test-{index}-output.txt"
+        write_attempt_evidence(logs / output_name, captured[:MAX_OUTPUT])
+        output_artifacts.append(output_name)
+    details = getattr(exception, "details", {})
+    if not isinstance(details, dict):
+        details = {}
+    details = {str(key)[:80]: value for key, value in details.items()
+               if isinstance(value, (str, int, float, bool)) or value is None}
+    for key in ("error_text",):
+        if isinstance(details.get(key), str):
+            details[key] = details[key][:2048]
+    diagnostic = {
+        "task_id": task, "a_attempt": attempt, "test_index": index,
+        "configured_command": _diagnostic_command(command),
+        "executable": details.get("executable") or (command[0] if command else None),
+        "error_text": str(exception)[:2048], "error_type": type(exception).__name__,
+        "errno": details.get("errno", getattr(exception, "errno", None)),
+        "winerror": details.get("winerror", getattr(exception, "winerror", None)),
+        "exit_code": exit_code if exit_code is not None else getattr(exception, "exit_code", None),
+        "timed_out": bool(timed),
+        "process_started": getattr(exception, "process_started", None),
+        "cleanup_confirmed": (cleanup_confirmed if cleanup_confirmed is not None
+                              else getattr(exception, "cleanup_confirmed", None)),
+        "classification": classification,
+        "supporting_evidence": details,
+        "unknown": ("The available evidence does not establish why execution failed."
+                    if classification == "unclassified_execution_problem" else None),
+        "output_artifacts": output_artifacts,
+        "execution_id": execution.get("seq"),
+    }
+    diagnostic_path = logs / f"test-environment-{task}-{attempt:02d}-{index}.json"
+    save_json(diagnostic_path, diagnostic)
+    latch = {"classification": classification, "diagnostic": diagnostic_path.name,
+             "task_id": task, "attempt": attempt, "test_index": index}
+    state["test_environment_blocker"] = latch
+    state["status"] = "stopped"
+    save_json(state_path, state)
+    events.emit("tests", "test_finished", "environment_blocked", task_id=task, attempt=attempt,
+                evidence={"diagnostic": diagnostic_path.name, **({"output": output_artifacts[0]}
+                         if output_artifacts else {})},
+                metadata={"index": index, "execution_id": execution.get("seq"),
+                          "classification": classification,
+                          "process_started": diagnostic["process_started"],
+                          "cleanup_confirmed": diagnostic["cleanup_confirmed"]})
+    events.emit("controller", "stopped", "failed", task_id=task, attempt=attempt,
+                evidence={"diagnostic": diagnostic_path.name},
+                metadata={"reason": "controller test environment blocked", "index": index,
+                          "classification": classification})
+    print(f"STOPPED: controller test {index} could not be verified; inspect {diagnostic_path}", flush=True)
+
+
 def safe_repo(repo: Path, create: bool) -> Path:
     if not repo.exists():
         if not create:
@@ -1900,6 +1995,10 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
         state = json.loads(state_path.read_text(encoding="utf-8"))
         if not isinstance(state, dict):
             raise PilotError("Saved run state must be an object; inspect before resume")
+        if isinstance(state.get("test_environment_blocker"), dict):
+            blocker = state["test_environment_blocker"]
+            raise PilotError("Saved controller test environment stop requires inspection before resume; "
+                             f"diagnostic: {blocker.get('diagnostic', 'unknown')}")
         if not isinstance(state.get("completed"), list):
             raise PilotError("Saved completed tasks are ambiguous; inspect before resume")
         committed_records(state)
@@ -2190,10 +2289,14 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                         gate.finish_confirmed()
                     else:
                         record_test_uncertainty(state, state_path, gate)
-                        events.emit("controller", "stopped", "failed", task_id=ident, attempt=attempt,
-                                    metadata={"reason": "test process cleanup unverified", "index": index,
-                                              "execution_id": execution["seq"], "cleanup_confirmed": False})
-                    raise
+                    if not isinstance(exc, Exception):
+                        raise
+                    _test_environment_stop(logs, state, state_path, events, task=ident, attempt=attempt,
+                                           index=index, command=cmd, execution=execution,
+                                           exception=exc, output=getattr(exc, "output", None),
+                                           timed=bool(getattr(exc, "timed_out", False)),
+                                           cleanup_confirmed=cleanup)
+                    return 1
                 code, output, timed = result
                 test_finished = _execution_clock()
                 cleanup = getattr(result, "cleanup_confirmed", None)
