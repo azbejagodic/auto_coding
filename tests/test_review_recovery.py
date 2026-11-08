@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 import io
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import auto_coding.simple_run as runner
@@ -138,6 +138,57 @@ class ReviewRecoveryTests(unittest.TestCase):
             self.assertIsNone(metrics[role]["usage"])
         self.assertEqual(metrics["correction_attempts"], 0)
         self.assertEqual(metrics["review_retries"], 0)
+
+    def assert_partial_failure_artifact(self, actor):
+        from auto_coding.process_runner import OutputLimitExceeded, MAX_FAILURE_OUTPUT_BYTES
+        subprocess.run(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                        "commit", "--allow-empty", "-m", "Verified fixture baseline"], cwd=self.repo,
+                       check=True, capture_output=True)
+        private_output = "PRIVATE_DIAGNOSTIC_FIXTURE: useful output before failure"
+        exc = OutputLimitExceeded("fixture limit") if actor == "B" else OSError("fixture read error")
+        exc.output, exc.stderr = private_output, None
+        exc.output_incomplete, exc.output_truncated = True, actor == "B"
+        exc.cleanup_confirmed, exc.process_started = True, True
+        fake = FakeExecutor()
+        def execute(argv, cwd, timeout, *, prompt=None):
+            result = fake(argv, cwd, timeout, prompt=prompt)
+            current = "tests" if argv[0] == "fake-test" else "B" if "--output-schema" in argv else "A"
+            if current == actor:
+                with patch.object(runner, "bounded_run", side_effect=exc):
+                    return runner.call(["fixture"], cwd, timeout)
+            return result
+        console = io.StringIO()
+        with redirect_stdout(console), redirect_stderr(console):
+            self.assertEqual(self.run_fake(execute, attempts=1), 1)
+        self.assertNotIn(private_output, console.getvalue())
+        artifact = "one-01-test-1.txt" if actor == "tests" else f"one-01-{actor.lower()}-events.jsonl"
+        output = (self.logs / artifact).read_text(encoding="utf-8")
+        self.assertLessEqual(len(output.encode("utf-8")), MAX_FAILURE_OUTPUT_BYTES)
+        diagnostic = json.loads(output.split("\n", 1)[1])
+        self.assertEqual(diagnostic["stdout"], private_output)
+        self.assertTrue(diagnostic["incomplete"])
+        self.assertIs(diagnostic["truncated"], actor == "B")
+        state = self.state()
+        self.assertEqual(state["completed"], [])
+        self.assertEqual(subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo,
+                                       check=True, capture_output=True, text=True).stdout.strip(),
+                         state["initial_git_head"])
+        if actor == "B":
+            self.assertEqual(state["pending_review"]["review_failure_kind"], "output_limit")
+            self.assertEqual(runner.task_review_rounds(state, "one"), 0)
+        elif actor == "A":
+            self.assertNotIn(private_output, state["history"][0]["feedback"])
+        self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls),
+                         (1, 0, 0) if actor == "A" else (1, 1, 0) if actor == "tests" else (1, 1, 1))
+
+    def test_a_failure_saves_incomplete_output_without_printing_or_approving(self):
+        self.assert_partial_failure_artifact("A")
+
+    def test_b_failure_saves_incomplete_output_without_using_saved_approval(self):
+        self.assert_partial_failure_artifact("B")
+
+    def test_controller_test_failure_saves_incomplete_output_without_review(self):
+        self.assert_partial_failure_artifact("tests")
 
     def test_omitted_review_timeout_inherits_custom_implementation_timeout(self):
         fake = FakeExecutor()

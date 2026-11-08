@@ -23,7 +23,8 @@ from auto_coding.event_log import EventLog, EventLogError
 from auto_coding.github_workspace import (managed_job, WorkspaceError, cancel_reservation,
                                          mark_process_uncertain, GitHubWorkspaceManager,
                                          normalize_repository)
-from auto_coding.process_runner import bounded_run, OutputLimitExceeded, MAX_CAPTURE_BYTES
+from auto_coding.process_runner import (bounded_run, OutputLimitExceeded, MAX_CAPTURE_BYTES,
+                                       MAX_FAILURE_OUTPUT_BYTES)
 from auto_coding.reviewer_permissions import (activated, command_environment, prepare_review,
                                              check_cli, ReviewerEnvironmentError)
 from auto_coding.python_environment import test_environment
@@ -173,6 +174,23 @@ def save_json(path: Path, value: dict) -> None:
     temporary.replace(path)
 
 
+def _failure_diagnostic(message, exc):
+    if not getattr(exc, "output_incomplete", False):
+        return message
+    # Quote process text so partial CLI events cannot become verdict/usage
+    # evidence. The existing stream artifact remains the only output sink.
+    diagnostic = {"type": "process.output_incomplete", "incomplete": True,
+                  "truncated": exc.output_truncated, "stdout": exc.output, "stderr": exc.stderr}
+    while True:
+        result = message + "\n" + json.dumps(diagnostic, ensure_ascii=False)
+        if len(result.encode("utf-8")) <= MAX_FAILURE_OUTPUT_BYTES:
+            return result
+        diagnostic["truncated"] = True
+        for stream in ("stdout", "stderr"):
+            if diagnostic[stream]:
+                diagnostic[stream] = diagnostic[stream][:len(diagnostic[stream]) // 2]
+
+
 def call(argv: list[str], cwd: Path, timeout: int, *, prompt: str | None = None) -> tuple[int, str, bool]:
     """Capture complete bounded tool output; no shell execution."""
     try:
@@ -185,17 +203,17 @@ def call(argv: list[str], cwd: Path, timeout: int, *, prompt: str | None = None)
         confirmed = getattr(exc, "cleanup_confirmed", False) is True
         if not confirmed:
             mark_process_uncertain()
-        return _CallResult(124, "PROCESS TIMED OUT", True, confirmed, True)
+        return _CallResult(124, _failure_diagnostic("PROCESS TIMED OUT", exc), True, confirmed, True)
     except OutputLimitExceeded as exc:
         confirmed = getattr(exc, "cleanup_confirmed", False) is True
         if not confirmed:
             mark_process_uncertain()
-        return _CallResult(125, "PROCESS OUTPUT EXCEEDED SAFE LIMIT", False, confirmed, True)
+        return _CallResult(125, _failure_diagnostic("PROCESS OUTPUT EXCEEDED SAFE LIMIT", exc), False, confirmed, True)
     except OSError as exc:
         confirmed = getattr(exc, "cleanup_confirmed", None)
         if confirmed is False:
             mark_process_uncertain()
-        return _CallResult(127, f"Process could not start: {type(exc).__name__}", False, confirmed,
+        return _CallResult(127, _failure_diagnostic(f"Process could not start: {type(exc).__name__}", exc), False, confirmed,
                            getattr(exc, "process_started", None))
     except BaseException as exc:
         if getattr(exc, "cleanup_confirmed", False) is not True:

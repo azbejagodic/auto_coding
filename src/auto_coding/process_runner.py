@@ -11,6 +11,7 @@ import time
 
 
 MAX_CAPTURE_BYTES = 16 * 1024 * 1024
+MAX_FAILURE_OUTPUT_BYTES = 16 * 1024
 
 
 class OutputLimitExceeded(OSError):
@@ -119,6 +120,8 @@ def bounded_run(argv, *, cwd=None, input=None, text=True, encoding="utf-8",
                     break
                 with capture_lock:
                     if len(output) + len(error_output) + len(chunk) > MAX_CAPTURE_BYTES:
+                        remaining = max(0, MAX_CAPTURE_BYTES - len(output) - len(error_output))
+                        target.extend(chunk[:remaining])
                         excessive.set()
                         break
                     target.extend(chunk)
@@ -163,6 +166,21 @@ def bounded_run(argv, *, cwd=None, input=None, text=True, encoding="utf-8",
             from auto_coding.github_workspace import mark_process_uncertain
             mark_process_uncertain()
         exc.process_started = True
+        # Snapshot only bounded prefixes, even if a reader remains alive. These
+        # are incomplete diagnostics, never a successful CompletedProcess.
+        with capture_lock:
+            buffers = [output] if combined else [output, error_output]
+            budget = MAX_FAILURE_OUTPUT_BYTES // len(buffers)
+            excerpts = []
+            truncated = excessive.is_set()
+            for buffer in buffers:
+                encoded = bytes(buffer[:budget]).decode(encoding, errors="replace").encode("utf-8")
+                truncated |= len(buffer) > budget or len(encoded) > budget
+                excerpts.append(encoded[:budget].decode("utf-8", errors="ignore"))
+        exc.output = excerpts[0]
+        exc.stderr = None if combined else excerpts[1]
+        exc.output_incomplete = True
+        exc.output_truncated = truncated
         raise
     finally:
         if stdin_file is not None:
