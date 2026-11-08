@@ -1,437 +1,160 @@
-# Auto-Coding Simple Backend V2.1 — generated-file staging fix
+﻿# Auto-Coding
 
-The existing simple runner saves approved local checkpoints by default. The dashboard supports one-shot publication and optional, explicitly confirmed automatic publication of approved feature checkpoints.
+## 1. What Auto-Coding does
 
-## What changed
+Auto-Coding runs an approved JSON plan against a separate Git checkout:
 
-- Before staging, append narrowly scoped generated-artifact patterns to the Git repository's local `.git/info/exclude` file. This does **not** modify the project's `.gitignore`.
-- If a previous stopped run left an untracked build artifact already staged, unstage **only** that generated artifact (keep the local file). Never silently unstage a generated file that is already tracked in a previous commit.
-- Continue rejecting `.env`, credentials, private keys, and unexpected unsafe file changes.
-- Keep task-specific Codex B review diffs, local commits, logs, and `--resume` behavior intact.
+1. A one-shot Codex audit checks the exact plan and target.
+2. A person inspects the report and explicitly authorizes the start.
+3. Codex A implements one task at a time.
+4. The controller runs the task's focused test commands.
+5. Independent Codex B reviews the staged change and saved test evidence. Rejections return findings to A.
+6. B approval creates a local Git checkpoint. Final verification follows all approved tasks.
 
-## Verification
+Durable state, events, outputs and diagnostics are saved outside the target. A/B call and observed-token budgets
+persist across safe resumes. Stops preserve approved checkpoints and unfinished work.
 
-### Focused task checks and final verification
+## 2. How to use it
 
-Ordinary tasks ask Codex A to run their `test_commands` and report the actual
-results. Codex B receives that saved report as implementer claims, alongside the
-staged changes, and independently reviews it. The controller does not duplicate
-these focused checks unless `--controller-tests` is explicitly enabled. That mode
-is saved and cannot change during resume. Existing controller-tested checkpoints
-retain their original mode.
+### Required tools and checkout
 
-Controller-run focused checks and final verification inherit only ordinary
-runtime settings (such as PATH, temporary directories and Windows system paths),
-plus a target-local PYTHONPATH. Tokens and Codex/Git authentication settings are
-not inherited by those test subprocesses. If a test needs a non-secret setting,
-set `AUTOCODING_TEST_ENV_JSON` to a JSON object with only `CI`, `NO_COLOR`,
-`PYTHONDONTWRITEBYTECODE`, `PYTHONUTF8`, `PYTHONIOENCODING`, `PYTHONHASHSEED`,
-`LANG`, `LC_ALL`, `LC_CTYPE`, `TZ`, `TERM` or `AUTOCODING_CONFIG_DIR`. Credential
-keys and PATH/PYTHONPATH overrides are rejected. Codex A/B and controller Git
-operations keep their existing environment. This filter is not a sandbox for
-untrusted test code.
+Use Windows PowerShell with Python, Git and Codex CLI 0.163.0. Controller testing requires Windows MXC. The target
+must be a clean regular Git checkout on a named feature branch, with an initial commit and contained .git metadata.
+Linked worktrees are unsupported. Keep plan and run logs outside the target.
 
-New runs require an explicitly designated full unittest suite and a minimum test
-count in the prepared JSON plan, for example:
+From the backend checkout:
 
-```json
-{
-  "tasks": [{"id": "example", "prompt": "Externally prepared task instructions", "test_commands": [["python", "-m", "unittest", "tests.test_example"]]}],
-  "final_verification": {
-    "test_commands": [["python", "-B", "tests/ci_unittest.py"]],
-    "minimum_tests": 350,
-    "timeout_seconds": 1800
-  }
-}
-```
-
-The plan author must designate the project's actual full suite and appropriate
-minimum coverage; the example command/count apply to this backend. The final
-gate currently recognizes unittest summaries. It requires a successful exit,
-nonempty test evidence, sufficient test count, no skipped tests, and the exact
-final approved Git HEAD with a clean worktree. An arbitrary successful command
-or an implementer claim cannot mark a batch completed.
-
-Verification timeouts default to 1800 seconds and accept 30 through 86400 seconds,
-independently of the Codex A/B `--timeout`. Commands, coverage, timeout and testing
-mode are persisted for resume. TXT/MD and legacy runs can supply the verification
-policy alone in a JSON file using `--final-verification-config FILE`; subsequent
-resume can use the saved policy without that file. Conflicting settings stop.
-The backend CI job has a separate 60-minute budget for the complete regression
-suite; its Windows/Linux matrix, permissions and skip checks are unchanged.
-
-Failed final verification preserves approved commits and real output. Confirmed
-infrastructure failures can resume verification only. Missing or altered evidence
-requires fresh verification. Unverified cleanup keeps workspace protection.
-Post-commit test failures are not automatically attributed to a prepared task:
-provide an explicit scoped correction plan using the existing A/B loop, followed
-by fresh final verification. The controller never invents repair tasks or reopens
-approved work automatically.
-
-### Interrupted implementation attempts
-
-The runner saves a unique Codex A attempt identity before launch. A confirmed
-successful implementation is checkpointed with its exact staged diff before
-writing the captured output stream. Resume can reuse that implementation and
-continue controller verification and independent review without another A call.
-Attempt artifacts are never overwritten; repeated verification uses new output
-paths. A review-ready checkpoint still resumes B only.
-
-An interrupted running execution, a changed snapshot, or missing completion
-evidence stops recovery. Inspect the saved state and workspace ownership evidence;
-missing PIDs, missing locks and elapsed time do not establish safe cleanup. A
-successful execution whose snapshot could not be persisted requires inspection,
-rather than an automatic replay against existing changes.
-
-### Repository-local branch protection
-
-`main`, `master` and detached HEAD are always blocked as execution targets.
-Additional stable branch names are configured per target repository using the
-repeatable local Git setting `autocoding.protectedBranch`. For this Auto-Coding
-checkout, protect its stable backend branch with:
-
-```powershell
-git config --local --add autocoding.protectedBranch backend/core
-```
-
-Run this command once in each applicable clone; local Git configuration is not
-transferred by commits or clones. Other projects do not protect `backend/core`
-unless configured. Values are literal branch names, not wildcard patterns.
-The headless CLI, resume, review, commit and publication
-checks read this setting; development branches such as `fix/*` and `feature/*`
-remain usable. Invalid or unreadable protection settings block execution.
-
-12 automated tests passed in temporary Git repositories, including explicit regression cases for generated bytecode and resuming with an already-staged bytecode file. This is **not** a claim that the real Windows UI run has passed; resume it with the same plan, target, and logs.
-
-## Windows installation and resume
-
-## Durable event timeline
-
-The coordinator appends one UTF-8 JSON object per line to `events.jsonl` in the
-external `--logs` directory. Records use schema version 1 and contain `run_id`,
-monotonic per-run `seq`, `timestamp_utc`, `actor`, `event`, `outcome`, and optional
-`task_id`, `attempt`, `evidence`, and nonsecret `metadata`. The adjacent
-`run-manifest.json` captures the plan SHA256, ordered task IDs, initial Git HEAD,
-start time, and target path. On resume, the same run ID and existing records are
-retained. Each torn last line is preserved in a unique `events.incomplete-NNNN`
-sidecar; earlier complete records are retained during atomic recovery. A desktop reader can parse `events.jsonl` directly and
-follow evidence filenames relative to the log directory without launching Codex.
-Structured timeline metadata omits test command arguments; raw test output and
-other diagnostic evidence files retain their original contents and are not
-sanitized. If the log storage itself cannot be written, the runner fails closed
-and can only report the failure on stderr; it cannot guarantee a durable stopped
-event on an unavailable storage device.
-
-1. Extract the ZIP into `Downloads` (resulting folder: `auto_coding_simple_backend_v2_1`).
-2. Back up the existing pilot `Desktop/AutoCoding-Simple-Pilot/src/auto_coding/simple_run.py`, then copy `src/auto_coding/simple_run.py` from the extracted package over it.
-3. Run the tests from the extracted folder, with its `src` directory on `PYTHONPATH`.
-4. Resume the prior viewer run using the **same exact V2** `first_ui_slice.json`, target `AutoCoding-Viewer-Test`, and logs `AutoCoding-Viewer-Logs`, with `--resume --attempts 3` and **without** `--create-repo`.
-
-The original stopped attempt already committed `run-summary`. It must not be recreated or reset.
-
-## Native Windows dashboard (Slice 2B-2)
-
-From this checkout, install the optional UI dependency and launch with the source directory on `PYTHONPATH`. Windows also needs Microsoft Edge WebView2 Runtime:
-
-```powershell
+~~~powershell
 $env:PYTHONPATH = (Join-Path (Get-Location) "src")
-py -m pip install "pywebview[winforms]"
-py -B -m auto_coding.desktop_app
-# Optional: reopen a particular run immediately
-py -B -m auto_coding.desktop_app --logs "C:\Users\you\AutoCoding-Runs\run-<id>"
-```
+$plan = "C:\Plans\dashboard-plan.json"
+$repo = "C:\Projects\dashboard"
+~~~
 
-Local Codex CLI authentication is required before starting. The runner inherits the currently configured CLI model and reasoning settings; the dashboard has no model override controls. Git and Codex CLI must be available to the launched Python process.
+A new JSON plan has 1-30 ordered tasks. Each task needs an id, prompt and at least one focused test command as an
+argv array. The plan also needs a final_verification policy with test_commands and minimum_tests. See the [plan
+audit guide](docs/plan-audit.md).
 
-1. Enter a GitHub **OWNER/REPO** or GitHub URL and click **Connect repository**. The app creates or reopens its managed checkout. **My repositories** optionally lists repositories when `gh` is authenticated; manual entry works without `gh`. Choose a feature branch and click **Select branch**, or use **New Branch**, enter its name, and click **Create branch**. Choose the remote base (normally `origin/main`); an alternate base such as `origin/master` requires the explicit confirmation checkbox. New branches start from that freshly fetched base. Commit or discard outstanding changes before branch changes or START. Main, master and detached HEAD cannot run tasks.
-2. For existing local projects, **Advanced / Local Project** retains Project folder **Browse**. Otherwise the managed checkout is selected automatically. Click **Browse** beside Task plan and select the intended TXT, MD or JSON plan. TXT/MD represents one task; JSON can include ordered tasks and explicit test command argv arrays (see `examples`). Keep the plan outside the target checkout, or commit it before starting. Browsing, opening and cancelling selection never launch work. Full paths, branch, working tree and validation errors appear in the dashboard.
-3. Enter a whole-number total attempt limit from **1 through 10** (default **3**). Invalid or empty entries explain why START and RESUME are disabled. Optionally select **Automatically push approved tasks** before START. Review the native confirmation containing the repo, branch, plan and publication policy. Cancelling does not launch anything. Approved task checkpoints are committed locally before any optional push. There is no automatic merge or force-push. Overview keeps setup compact, with preflight errors visible and safeguards in one expandable **Details** section.
-4. **Overview** shows recorded state, current task, task counts, child activity/errors and recent events. **Tasks** shows each attempt, test results and Codex B verdicts, with original feedback and summaries in expandable details. **Logs** shows timestamped actors/outcomes and evidence links. Its raw file list also supports legacy runs with no event timeline. Files are loaded only when selected, as text, confined to the chosen logs directory and capped at 1 MB. Missing/corrupt sources produce warnings. The UI polls every four seconds and preserves opened evidence and expanded details.
-5. New logs live in `%LOCALAPPDATA%\AutoCoding\runs\run-<id>` outside the project; the full selected log path remains accessible in **Details** after the child exits. Logs include `desktop-run.json`, `state.json`, `events.jsonl`, evidence files and `runner-output.txt` (including launch/initialization diagnostics). Historical process exits and diagnostics are in **Logs**; completed saved state takes priority over past exit warnings. A child exit code is never treated as task approval; only durable runner state supplies completion.
-6. To resume, click **Open Run** and choose its log directory. Desktop runs restore the original exact repo and plan paths. RESUME is enabled only for matching stopped state and inactive, known child status; the controller checks again at launch. Keep the original plan bytes and paths. Legacy runs without desktop metadata require selecting their original repo and plan explicitly. Choose **5** if the original total attempt limit of 3 was exhausted, then click **RESUME** and confirm. Staged work is reconciled by the existing runner. Running, missing-state or uncertain launches cannot be resumed through this UI; inspect the visible diagnostics instead of launching duplicate work.
+### Audit, inspect and authorize
 
-Closing the window leaves the Windows child process alive in the background. Open its saved log directory in another window to inspect progress. If its PID cannot be saved or its launch status is uncertain, the dashboard blocks START/RESUME and explains the error. An interrupted child whose durable state still says running is shown as unknown, rather than invented completion or approval. There is no stop/kill button in this slice.
+Audit is separate from A/B call budgets and does not implement the plan.
 
-Debug export, per-task model selection and `.exe` packaging remain unimplemented. No web server, remote assets or additional model controls are included. Imports and `--help` stay GUI-free; pywebview is loaded only when opening a native window.
+~~~powershell
+$auditLogs = "C:\AutoCoding-Runs\dashboard-audit"
+python -B -m auto_coding.simple_run audit $plan --repo $repo --logs $auditLogs --audit-model gpt-6-sol
+Get-Content (Join-Path $auditLogs "audit-report.json")
+~~~
 
-## GitHub workspace service (Feature 2)
+Inspect an APPROVE report before authorizing start:
 
-`auto_coding.github_workspace.GitHubWorkspaceManager` provides `connect`/`reopen`,
-`branches`, `fetch`, `create_branch`, `checkout_branch`, and optional
-`list_repositories`. Repository inputs are `OWNER/REPO`,
-`https://github.com/OWNER/REPO.git` (also without `.git`), or
-`git@github.com:OWNER/REPO.git`. Only github.com is supported. Git uses existing
-credential-manager or SSH authentication; `gh` is optional. Authentication and
-network failures have safe error codes and omit raw command diagnostics.
+~~~powershell
+$runLogs = "C:\AutoCoding-Runs\dashboard-run-01"
+python -B -m auto_coding.simple_run start $plan --repo $repo --logs $runLogs --approved-audit $auditLogs --max-agent-calls 40 --max-observed-tokens 500000
+~~~
 
-One checkout per normalized repository lives in
-`%LOCALAPPDATA%\AutoCoding\workspaces\<identity-sha256>`. The adjacent metadata
-contains only a schema version and normalized repository identity. Checkout reuse
-requires matching metadata and origin. Clones use separate attempt directories
-and publish the checkout only after verifying it. Failed attempts are left untouched;
-completed authentication/network failures and missing-Git failures can be retried without
-adopting or deleting their partial files. Unrelated directories are left untouched.
-On portable hosts without LocalAppData, explicitly set
-`AUTOCODING_CONFIG_DIR` to a per-user configuration directory; `AutoCoding/workspaces`
-and `AutoCoding/runs` live beneath it. Python callers can instead pass `config_dir`.
+The A/B invocation limit is shared. Observed-token budgeting counts recorded A/B input plus output usage; the audit
+call is separate. Missing trustworthy usage stops further calls under a token budget.
 
-The existing Bridge exposes `connect_github`, `github_repositories`,
-`github_branches`, `fetch_github`, `create_github_branch`, and
-`checkout_github_branch`. Connection selects the managed project without launching
-a run. Branch creation fetches current origin/main and creates a new feature
-branch from that commit. The New Branch form lists remote bases and defaults to
-main when available (otherwise master or another available remote branch).
-For an alternate base, explicitly select the confirmation checkbox before Create
-branch; the bridge passes `confirmed_base=True` only with that confirmation.
-Existing local or fetched
-remote feature branches can be selected. main/master are protected.
+### Resume and logs
 
-Branch changes require a clean worktree, no unresolved Git operation and no active
-or uncertain Auto-Coding job. Atomic per-checkout locks serialize clones, branch
-operations and desktop launches. Desktop reserves a shared job lock before spawning,
-including with custom run storage; the child claims that reservation once and holds
-it for its lifetime. Known spawn, plan-validation and CLI prerequisite failures
-release the reservation. An abandoned lock or unresolved launch record deliberately
-blocks changes until its process and logs have been inspected. Managed tool timeouts,
-direct runner Git timeouts (including checkpoint commits), subprocess interruptions,
-and executor exceptions retain an uncertain job lock because child processes may
-still be alive. Workspace Git timeouts and interruptions retain the checkout
-operation lock, including during cloning; subsequent branch operations, desktop
-START/RESUME, and direct managed runner launches remain blocked across service
-instances until the checkout and surviving processes have been inspected. The
-service never automatically expires or removes an uncertain lock. The service never resets,
-cleans, deletes checkouts, pushes or merges. This slice adds service APIs without
-changing the dashboard layout: the existing project picker and Open Run remain
-available, including legacy logs under `~/AutoCoding-Runs` or other external paths.
+After checking the stop reason and resolving it where safe, resume with the same plan bytes, target checkout and
+run-log directory:
 
-After Codex A and the configured tests pass, the runner saves a review-ready
-checkpoint before starting Codex B. Reviewer process failures, confirmed timeouts
-and invalid responses share a saved budget of three review invocations per
-checkpoint, including across restarts. Eligible retries wait 5 then 15 seconds;
-the saved deadline also applies on resume. Launch failures and output limits stop
-without automatic repetition. These failures do not consume Codex A correction
-attempts. A stopped run can resume review only when the plan, repository,
-Git HEAD, staged diff, test evidence and worktree still match the checkpoint.
-Unverified process cleanup or a run interrupted while a reviewer may still be
-active requires inspection. A REJECTED verdict with specific issues starts a new
-Codex A attempt and fresh tests.
+~~~powershell
+python -B -m auto_coding.simple_run start $plan --repo $repo --logs $runLogs --resume
+~~~
 
-After the saved review budget is exhausted, ordinary resume makes no Codex call.
-Inspect the failure and use the original command with both
-`--resume --retry-review-once` to authorize exactly one additional B invocation.
-The cumulative invocation count and evidence are preserved; a failed extra call
-stops again. This option revalidates the checkpoint and cannot bypass uncertain
-process cleanup. Legacy checkpoints use their existing invocation count.
+Saved settings, audit evidence, plan and checkout are checked on resume. Changed plans, checkouts or incompatible
+budget overrides are rejected. Resume cannot bypass exhausted call/token budgets, process-safety gates or a latched
+environment stop. The explicit --retry-review-once option can authorize one extra B review attempt, subject to other
+budgets and safety checks.
 
-Correction prompts preserve the latest blockers and include a deduplicated
-checklist of earlier review issues within a 14,000-character feedback budget.
-Older omissions are explicit in the prompt; complete verdicts remain in run history.
-Codex B is asked for a location, reproduction, expected result and fix check for
-each blocker. Contradictory or oversized verdicts are invalid responses, never approvals.
+Useful external run-log files include state.json, run-manifest.json, events.jsonl, Codex logs, test output and
+test-environment-*.json diagnostics. The terminal stop message names its diagnostic. Keep logs private because test
+output can contain project data. Do not store credentials in the checkout.
 
-Each run exit refreshes `metrics.json` in its external log directory from the
-existing event timeline. It contains per-run and per-task A/B and controller-test
-invocations, launch failures, observed execution time, process/review outcomes,
-actual B retry invocations, and distinct implementation/correction attempts.
-Execution time covers the executor call and cleanup, excluding retry waits and Git
-or log bookkeeping. Counts come from observed executions, not reserved review budget.
-Starts without an observed finish, and uncertain launch results, are reported as
-unconfirmed rather than invented invocations. Older timelines can lack duration
-and usage observations.
+### Optional desktop interface
 
-Token metrics accept only a single complete [documented Codex JSON turn](https://learn.chatgpt.com/docs/non-interactive-mode)'s
-`input_tokens`, `cached_input_tokens`, and `output_tokens`. Missing, malformed,
-or ambiguous usage is `null`, never an estimated zero. Reported sums include only
-observed usage; `usage_observations`, `duration_observations`, and invocation counts
-show their coverage. These counters are not billing, cost, or quota measurements.
-Rebuilding replaces the derived summary instead of adding counters, so resume and
-review-only recovery do not count prior work again. `source_last_seq` identifies
-the source position. A failed export warns and can leave an older snapshot; metrics
-never participate in approval, cleanup, retry-budget, or Git safety decisions.
+The viewer needs optional pywebview and, on Windows, Microsoft Edge WebView2 Runtime. Install only if the desktop
+UI is wanted:
 
-Run the headless regressions without Codex, a native window or network calls:
+~~~powershell
+python -m pip install "pywebview[winforms]"
+python -B -m auto_coding.desktop_app
+~~~
 
-```powershell
-$env:PYTHONPATH = (Join-Path (Get-Location) "src")
-py -B -m unittest discover -s tests -v
-```
+Codex CLI and Git must also be available to the Python process.
 
-When Node.js is on PATH, this suite also checks JavaScript syntax and exercises the actual UI script with a fake DOM/bridge, including button dispatch, cancellation, navigation, polling, duplicate clicks and state transitions. Only JavaScript-specific checks are skipped if Node is absent. The filesystem symlink test skips on Windows installations without symlink privileges.
+## 3. Test sandbox permissions
 
-### GitHub Actions backend verification
+Controller tests use Codex Windows MXC with windows.sandbox=mxc and a read-only profile. Source configuration
+denies the filesystem root, allows reads of the Windows system directory, selected Python runtime directory and
+target checkout, and allows writes only to owned scratch under external logs. TEMP, TMP and TMPDIR point to
+scratch. Network access is configured off.
 
-The **Backend unit tests** workflow runs the complete unittest suite on Windows and Linux with Python 3.12, 3.13 and 3.14. It requires Git and Node.js on each runner, uses no Codex calls or deployment credentials, and has read-only repository permission. Every matrix job must pass. The CI runner lists all skips and fails on unexpected ones; Windows process-tree, timeout, Job Object, lock-cleanup and PID tests must execute on Windows. Linux skips the Windows-only tests. A Windows runner may report the documented symlink-privilege skip. Open the workflow run's job log and step summary for the test counts and skip reasons; a green Linux job alone does not validate Windows process cleanup.
+The checkout, including Git metadata, is readable but not writable to tests. Unrelated host paths are denied. Test
+subprocesses inherit filtered ordinary runtime variables such as PATH and temporary paths; Codex, Git, cloud and
+authentication variables are excluded. Limited non-secret settings can be provided through
+AUTOCODING_TEST_ENV_JSON. It cannot replace PATH or PYTHONPATH. Environment filtering is hygiene, not a sandbox.
 
-## Desktop run controller (Slice 2A)
+These permissions are source-confirmed. The B11b native MXC validation recorded source reads, scratch writes,
+denied source/.git writes and denied reads of an unrelated fixture for CLI 0.163.0. Network denial is configured;
+this README does not claim every network path or runtime was tested. PATH does not grant tool access: the current
+profile does not provision arbitrary compilers or package-manager runtime trees. Do not keep secrets in the
+readable target checkout.
 
-`auto_coding.desktop_control.DesktopController` is the headless controller API used by the desktop dashboard. Select paths with `select_repo(path)`, `select_plan(path)`, and `select_logs(path)`; `start()` creates a unique directory under `~/AutoCoding-Runs`, while `resume()` requires the original repo, plan, and an existing run directory. Each new run stores `desktop-run.json` with those paths and its child PID. `snapshot()` combines the read-only durable log snapshot with controller activity, exit code, and any readable error. `selected_paths()` and `job_status()` provide small UI-facing accessors, and `poll()` can be called on a UI timer. The controller writes launch intent before creating a child; if saving its PID fails after launch, it keeps the child observable in the current window and blocks resume from a reopened window while the metadata says the child status is unknown. Runs use the current Python interpreter with `-B -m auto_coding.simple_run`. START blocks default branches and dirty worktrees. RESUME only accepts a stopped state and leaves reconciliation of staged edits to the runner.
+## 4. Toolchain compatibility
 
-Closing the window does not terminate the child: it continues in the background. This avoids killing Codex mid-change. The run PID and paths are retained in its logs so a reopened UI can monitor the child; if the child disappears, the controller reports that and leaves runner state untouched for inspection.
+Evidence is for execution inside controller MXC, not host or VS Code availability.
 
-When an existing run is reopened with `launching`/`running` metadata but no valid child PID, `job_status()` reports `active: null`, `uncertain: true`, and an actionable `error` rather than incorrectly reporting the run as idle. `reopen()` also returns a warning. Starting or resuming while that run is unresolved is blocked. Stopped metadata never reuses a historical PID as evidence of a live process.
+| Toolchain or configuration | Evidence |
+| --- | --- |
+| Python headless unittest | Verified inside controller MXC |
+| Python tkinter.Tcl() in one Dashboard V1 runtime | Known failing in a documented configuration |
+| Node.js | Not verified |
+| Headless browsers | Not verified |
+| C/C++ | Not verified |
+| Rust | Not verified |
+| Go | Not verified |
+| Java | Not verified |
+| .NET | Not verified |
+| Other declared toolchains | Not verified |
 
-## Desktop bridge API (Slice 2B-1)
+Historically, tkinter.Tcl() reported "Can't find a usable init.tcl" in one Dashboard V1 MXC configuration. This is
+not a claim about all Python/Tk installations. No blanket Node.js or browser compatibility claim is established.
 
-The native window now connects its existing `Bridge` to `DesktopController`.
-The Slice 2B-2 dashboard uses this approved selection and launch API for its native controls. Opening without `--logs` shows a ready
-state. Existing `--logs` runs, including legacy runs without `desktop-run.json`,
-remain available for inspection and confined evidence reads.
+Task test_commands accept project-specific argv, but the sandbox does not install dependencies. Final verification
+has a format limitation: every command must exit successfully, and its saved output must contain a successful
+Python unittest summary, no skips, and at least minimum_tests tests. CTest, Cargo, Go, Gradle, .NET or browser
+output does not satisfy that gate as-is.
 
-The JS API provides `select_repo(path?)`, `select_plan(path?)`, `open_run(path?)`,
-`selected_paths()`, `job_status()`, `start(attempts=3)`, `resume(attempts=3)`,
-`snapshot()`, and `evidence(relative_name)`. Omitting a selection path opens the
-native folder or TXT/MD/JSON file picker. Cancellation preserves selections;
-selection never launches a process. START and RESUME always require a separate
-native confirmation showing the selected paths, current branch, attempts and publication policy, and return the
-controller's launch result. Without a dialog boundary they fail closed.
+## 5. JSON plan checklist
 
-`snapshot()` preserves the viewer fields and adds `controller`, containing
-selected paths, process status, validation errors, and `resume_ready`.
-Resume readiness requires existing paths, a matching original plan hash and
-repository in a stopped state, and no active or uncertain job. The controller
-still performs its launch-time checks. Opening a different run clears previous
-repository/plan selections; legacy runs need their original paths explicitly
-selected before resume can be considered. Invalid run selection preserves the
-previous run. Selection changes are blocked while a job is active or uncertain
-so its tracking metadata continues to describe the original job.
+Before audit:
 
-Headless callers can inject `dialogs`, `controller`, and `controller_factory`
-into `Bridge`. `NativeDialogs` is bound only after the native window is created;
-it supports pywebview's `FileDialog` enum and older dialog constants. Importing
-the module or requesting `--help` does not import pywebview.
+- Inspect existing project functionality and reuse suitable helpers.
+- Keep tasks narrow, ordered and explicit about acceptance criteria.
+- Declare real focused test commands as argv arrays, not shell strings.
+- Verify required tools inside the actual controller sandbox.
+- Do not use optional skips to meet mandatory acceptance criteria.
+- Designate final verification that meets the current unittest evidence gate.
+- Keep plan and run logs outside the target checkout.
+- Audit the exact final JSON, inspect the report, then explicitly approve.
 
-## Desktop visual polish: launch and manual smoke checklist
+## 6. Failures and recovery
 
-With the optional pywebview dependency and Edge WebView2 Runtime already installed,
-run this single command from the checkout root in PowerShell:
+A completed test command that returns nonzero with confirmed cleanup is a code/test failure. Its evidence goes to A
+within saved attempt limits. Timeouts and incomplete results follow their dedicated stop paths. B reviews
+independently only after focused task checks pass.
 
-```powershell
-py -B -c "import sys; sys.path.insert(0, 'src'); from auto_coding.desktop_app import main; raise SystemExit(main())"
-```
+A structured process-launch failure or verified sandbox preflight limitation is a confirmed environment blocker.
+The controller stops at that command, saves a bounded test-environment-*.json diagnostic, and does not launch
+another test command, A or B, or approve the task. Ordinary resume refuses a saved environment-stop latch; inspect
+it before separately authorized recovery.
 
-The dashboard uses a fixed 210px navigation sidebar, a project/state header and
-readable system fonts on charcoal panels. Overview owns Run setup, full selectable
-project/plan paths, branch/readiness diagnostics, onboarding or progress/current
-task, and five recent events. Tasks owns attempt/test/commit rows with distinct
-approved/rejected labels and collapsed original Codex B feedback. Logs owns the
-UTC event timeline, local actor/outcome/event search, missing/corrupt warnings,
-and selectable raw evidence above the timeline (text only, maximum 1 MB).
-Original event, attempt, verdict and process diagnostics remain expandable.
-No coordinator/controller rules or stored evidence are changed. Debug ZIP export,
-model/reasoning dropdowns and standalone `.exe` packaging are not implemented.
+An unclassified execution problem stops without guessing it is a permission failure. Diagnostics preserve known
+facts and unknowns. Uncertain process cleanup retains its safety gate. Stops preserve approved commits and existing
+source changes; they never approve incomplete work.
 
-Automated tests use mocked processes, dialogs, pywebview and DOM; they never start
-Codex or open a GUI. Perform this separate manual check on Windows:
-
-1. Launch without `--logs`. At **1280x720**, then **1600x900**, check the fixed
-   sidebar, readable labels, normal vertical scrolling and no page/toolbar
-   horizontal overflow. Tab through navigation, Browse, Attempts, Start, Resume,
-   Open Run and details. Verify visible focus, hover and selected navigation;
-   Enter/Space must activate buttons. Overview shows **Idle** and onboarding;
-   Tasks/Logs show their own empty state and a working **Go to run setup** button.
-2. Use a disposable Git project with an initial commit on `feature/ui-smoke`.
-   Keep a one-task plan outside it asking for `greet.py` to print
-   `Hello, Auto-Coding!` and a Python test of that output. Authenticate the local
-   Codex CLI. In the review instructions ask Codex B to reject only reproducible
-   in-scope functional, regression, accessibility or security issues; personal
-   color/style preferences and optional redesign notes are nonblocking.
-3. Browse for the project and plan, including a long path with spaces. Read and
-   select/copy the entire paths; confirm branch and readiness. Cancel a picker
-   and verify selections remain. Main/master, dirty trees and invalid plans
-   must disable Start with an understandable reason. Resume explains its matching
-   stopped-run requirement. Selecting files must never launch work.
-4. Cancel Start's native confirmation once; verify no run launches. Confirm it
-   once with Attempts **3**; verify **Running**, protected disabled controls,
-   progress/current task and recent activity. Follow Tasks/Logs without a repeated
-   setup block. Inspect test exits, approved versus rejected rows, commit SHA,
-   and collapsed full feedback/attempt/verdict details. Long rejection text must
-   remain in details rather than filling the main view.
-5. In Logs, search an actor, outcome and nonexistent term; confirm matching counts
-   and clearing search restores events. Select evidence: it must appear above the
-   timeline, remain selectable/scrollable through polling, and close correctly.
-   Literal `<script>`/`<img>` text must never execute. Inspect missing/corrupt
-   warnings and the 1 MB cap using saved disposable log fixtures. Inspect CLI
-   authentication or initialization failures in `runner-output.txt` if present.
-6. Close and reopen the app and **Open Run** with its saved external log folder.
-   Closing must leave a live runner alone. A known inactive completed run must
-   show calm green **Completed**, including when historical child exit is **1**.
-   Expand **Process history** to find that exact failure. No stale launch-accepted
-   message or historical orange failure headline should remain. Verify actual
-   result/checkpoint SHA and Git status in the disposable project.
-7. Inspect saved stopped, checkpointing, missing-state and uncertain-process runs:
-   labels must read **Stopped**, **Awaiting recovery**, **Awaiting recorded state**
-   or **Unknown child status** as appropriate. Inactive state still recorded as
-   running must show **Unknown run state**. No child exit alone implies approval;
-   a live/unknown child retains priority over recorded completion. Resume enables
-   only with the original matching repo/plan and a known inactive stopped run;
-   choose Attempts **5** if the original total of 3 was exhausted, then cancel
-   once and confirm once. Do not force a Git lock conflict or edit evidence to
-   obtain a preferred display.
-
-Run the scoped headless desktop checks and GUI-free help from PowerShell:
-
-```powershell
-$env:PYTHONPATH = (Join-Path (Get-Location) "src")
-py -B -m unittest discover -s tests -p "test_desktop*.py" -v
-py -B -m auto_coding.desktop_app --help
-```
-
-Node.js on PATH enables actual script syntax and mocked DOM interaction checks,
-including navigation, launch cancellation/locking, status transitions, search,
-expandable reviews, text-safe evidence and completion after historical exit 1.
-Without Node those checks explicitly skip; no runtime is installed by the app.
-The filesystem symlink test skips when Windows does not grant symlink privileges.
-Manual native-window/resolution checks are not implied by these headless tests.
-
-Process exits observed by the controller are saved in `desktop-run.json` as
-`process_history` for later inspection. Older runs without that field remain
-readable; absent historical exit codes are not invented. START readiness is an
-eligibility display derived from validated paths and controller preflight;
-launch-time controller checks still make the final decision.
-
-## Dashboard GitHub workflow (Feature 3)
-
-Repository and branch selection never launch Codex. START and RESUME use the same
-DesktopController as local projects, with a native confirmation showing the
-repository, branch, plan and attempts. No terminal, editor, GitHub website or
-project-folder picker is required for the managed workflow. Git authentication
-must already be configured; errors identify access or connectivity problems
-without exposing subprocess diagnostics. Branch changes and publication fail
-closed for dirty, active or uncertain checkouts.
-
-**Push Approved Commits** is optional and explains why it is disabled. It requires
-a clean named feature branch, matching fetch and push origins, no active or
-uncertain run, and approval evidence for every unpublished commit. New checkpoint
-history includes the approved parent and binary patch hash; old checkpoints
-without this evidence remain local and require review. Generated caches and
-sensitive filenames block publication. The app re-fetches and rechecks before
-using a non-force explicit `git push origin HEAD:refs/heads/<branch>` (with local
-push hooks disabled). Divergence stops with a fetch/review warning. A new remote
-feature branch may be published normally. There is no merge-to-main action.
-
-Publication reads structured checkpoint state, never raw evidence files. Existing
-raw logs remain available only through explicit evidence selection. Local commits
-are labelled local; remote publication requires confirmation from the remote.
-
-**Automatically push approved tasks** starts unchecked and requires native START
-confirmation for that run. Repository, branch and publication settings are fixed
-for the run. The same coordinator synchronously pushes each independently approved,
-integrity-validated local checkpoint by its exact SHA to the selected origin feature
-branch. It verifies origin identity, all unpublished approvals and sensitive paths;
-main/master, force pushes, tags, hooks and automatic merges are excluded.
-
-On failure, further tasks stop with **Approved locally, push pending**. Local commits
-remain intact. Fix access/connectivity, then use **Resume (Retry Push)** with the
-original plan and logs: the same SHA is reconciled and retried before further tasks,
-without rerunning Codex or creating another checkpoint. Divergence requires manual
-review; the runner never merges it automatically. A timeout or interrupted process
-may retain the existing uncertain-job gate; inspect process/lock status first rather
-than launching a competing writer. Push start/result events include UTC timestamps,
-SHA and confirmed/unconfirmed remote outcome; state.json also records the latest
-publication attempt. Resume checks the actual remote even after saved success.
-
-CLI behavior stays local when the options are omitted. Explicit opt-in uses both
-`--auto-push-repository OWNER/REPO --auto-push-branch feature/name`; resume uses the
-same options plus `--resume`. Old logs without these settings remain local. One-shot
-**Push Approved Commits** remains available. Per-task model/reasoning selection and
-Merge to Main remain deferred.
+Captured process-failure excerpts are limited to 16 KiB and marked when truncated or incomplete. Hard controller
+termination can lose buffered output. A nested runtime or dependency failure after launch may look like a normal
+nonzero test result; the controller cannot identify every tool failure.
