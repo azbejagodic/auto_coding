@@ -9,6 +9,27 @@ from pathlib import Path
 from auto_coding.desktop_app import HTML
 
 
+# Read permitted files directly: Node's file-entry loader/--check normalizes
+# Windows ancestors outside the MXC read roots. Keep real syntax compilation
+# and the CommonJS wrapper without using that file-entry loader.
+CHECK_JAVASCRIPT = """
+const fs = require('node:fs');
+const vm = require('node:vm');
+new vm.Script(fs.readFileSync(process.argv[1], 'utf8'), {filename: process.argv[1]});
+"""
+RUN_COMMONJS = """
+const fs = require('node:fs');
+const path = require('node:path');
+const Module = require('node:module');
+const filename = process.argv[1];
+const entry = new Module(filename, module);
+entry.filename = filename;
+entry.paths = Module._nodeModulePaths(path.dirname(filename));
+entry._compile(fs.readFileSync(filename, 'utf8'), filename);
+entry.loaded = true;
+"""
+
+
 class DesktopUITests(unittest.TestCase):
     def test_controls_are_visible_and_scoped_to_bridge(self):
         class Controls(HTMLParser):
@@ -97,19 +118,44 @@ class DesktopUITests(unittest.TestCase):
 
     def test_actual_ui_buttons_navigation_polling_and_state_transitions(self):
         node = shutil.which("node")
-        if not node:
-            self.skipTest("Node.js absent; headless UI interaction checks unavailable")
+        self.assertIsNotNone(node, "Node.js is required for mandatory headless UI interaction checks")
         script = HTML.split("<script>", 1)[1].split("</script>", 1)[0]
         fixture = Path(__file__).with_name("desktop_ui_harness.cjs")
         with tempfile.TemporaryDirectory() as td:
             js = Path(td) / "dashboard.js"
             js.write_text(script, encoding="utf-8")
-            syntax = subprocess.run([node, "--check", str(js)], capture_output=True,
+            syntax = subprocess.run([node, "-e", CHECK_JAVASCRIPT, str(js)], capture_output=True,
                                     text=True, timeout=20)
             self.assertEqual(syntax.returncode, 0, syntax.stderr)
-            result = subprocess.run([node, str(fixture), str(js)], capture_output=True,
+            result = subprocess.run([node, "-e", RUN_COMMONJS, str(fixture), str(js)], capture_output=True,
                                     text=True, encoding="utf-8", errors="replace", timeout=20)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Dashboard button, navigation, polling, evidence and state contracts passed", result.stdout)
+
+    def test_node_launchers_preserve_compilation_commonjs_and_failure_exit(self):
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "Node.js is required for mandatory headless UI interaction checks")
+        with tempfile.TemporaryDirectory() as td:
+            source = Path(td) / "fixture.cjs"
+            source.write_text("const = ;", encoding="utf-8")
+            invalid = subprocess.run([node, "-e", CHECK_JAVASCRIPT, str(source)],
+                                     capture_output=True, text=True, timeout=20)
+            self.assertNotEqual(invalid.returncode, 0)
+            self.assertIn("SyntaxError", invalid.stderr)
+            source.write_text("const assert = require('node:assert/strict'); "
+                              "assert.equal(__filename, process.argv[1]); "
+                              "assert.equal(__dirname, require('node:path').dirname(__filename)); "
+                              "assert.equal(exports, module.exports); "
+                              "exports.checked = true; console.log('COMMONJS_OK');", encoding="utf-8")
+            valid = subprocess.run([node, "-e", RUN_COMMONJS, str(source)],
+                                   capture_output=True, text=True, timeout=20)
+            self.assertEqual(valid.returncode, 0, valid.stdout + valid.stderr)
+            self.assertIn("COMMONJS_OK", valid.stdout)
+            source.write_text("require('node:assert/strict').fail('INTENTIONAL_ASSERTION');", encoding="utf-8")
+            failed = subprocess.run([node, "-e", RUN_COMMONJS, str(source)],
+                                    capture_output=True, text=True, timeout=20)
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertIn("INTENTIONAL_ASSERTION", failed.stderr)
 
 
 if __name__ == "__main__":
