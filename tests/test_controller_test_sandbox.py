@@ -2,6 +2,7 @@
 import copy
 import json
 import os
+import stat
 from pathlib import Path
 import subprocess
 import sys
@@ -24,12 +25,20 @@ class ControllerTestSandboxTests(unittest.TestCase):
         (self.repo / ".git").mkdir(parents=True)
         self.logs = self.root / "logs"; self.logs.mkdir()
         self.windows = self.root / "Windows"; self.windows.mkdir()
+        self.toolchain = self.root / "tools" / "runtime"
+        self.toolchain.mkdir(parents=True)
+        (self.toolchain / "tool.exe").write_text("fixture")
         self.git = lambda repo, args: str(self.repo / ".git")
         self.command = ["python", "-m", "unittest", "test_target"]
         for context in (patch.object(sandbox.sys, "platform", "win32"),
-                        patch.dict(os.environ, {"SYSTEMROOT": str(self.windows)}),
+                        patch.dict(os.environ, {"SYSTEMROOT": str(self.windows),
+                            "USERPROFILE": str(self.root / "users" / "profile"),
+                            "HOME": str(self.root / "users" / "profile"),
+                            "PROGRAMDATA": str(self.root / "programdata")}),
+                        patch.object(sandbox.Path, "home", return_value=self.root / "users" / "profile"),
                         patch.object(sandbox.shutil, "which", return_value=str(self.root / "codex.exe"))):
             context.start(); self.addCleanup(context.stop)
+        os.environ.pop(sandbox.TOOLCHAIN_DIRS_ENV, None)
         self.check = patch.object(sandbox, "check_cli", return_value=str(self.root / "codex.exe"))
         self.check_mock = self.check.start(); self.addCleanup(self.check.stop)
 
@@ -80,6 +89,74 @@ class ControllerTestSandboxTests(unittest.TestCase):
                          [str(spec.scratch / "tmp")] * 3)
         self.assertEqual(Path(spec.environment["CODEX_HOME"]).parent, spec.scratch)
         self.assertIn('os.environ.clear()', sandbox._BOOTSTRAP)
+
+    def test_opt_in_toolchain_is_read_only_without_other_permission_changes(self):
+        with patch.dict(os.environ, {sandbox.TOOLCHAIN_DIRS_ENV: json.dumps([str(self.toolchain)])}):
+            spec, _ = self.prepare()
+        self.addCleanup(spec.cleanup)
+        filesystem = self.check_mock.call_args.kwargs["filesystem"]
+        self.assertEqual(filesystem[self.toolchain.as_posix()], "read")
+        self.assertEqual(filesystem[":root"], "deny")
+        self.assertEqual(filesystem[self.repo.as_posix()], "read")
+        self.assertEqual([key for key, value in filesystem.items() if value == "write"], [spec.scratch.as_posix()])
+        settings = self.check_mock.call_args.args[0]
+        policy = tomllib.loads(settings[1])["permissions"][self.check_mock.call_args.args[1]]
+        self.assertEqual(policy["filesystem"], filesystem)
+        self.assertEqual(policy["network"], {"enabled": False})
+        self.assertNotIn(sandbox.TOOLCHAIN_DIRS_ENV, spec.environment)
+        self.assertNotIn(sandbox.TOOLCHAIN_DIRS_ENV, json.loads(spec.argv[-1])[2])
+
+    def test_missing_configuration_keeps_default_roots(self):
+        spec, _ = self.prepare(); self.addCleanup(spec.cleanup)
+        filesystem = self.check_mock.call_args.kwargs["filesystem"]
+        self.assertEqual(len(filesystem), 5)
+        self.assertNotIn(self.toolchain.as_posix(), filesystem)
+
+    def test_invalid_toolchain_roots_and_configuration_fail_before_launch(self):
+        profile = self.root / "users" / "profile"; profile.mkdir(parents=True)
+        for value in (str(self.root.anchor), str(self.root.parent), str(self.repo), str(self.logs),
+                      str(profile), str(profile.parent), str(self.windows),
+                      str(self.toolchain / "tool.exe"), str(self.root / "missing"), "relative/tools",
+                      str(self.toolchain / ".." / "runtime"), str(self.toolchain) + ".",
+                      "\\\\server\\share\\tools", str(self.toolchain) + ":stream"):
+            with self.subTest(value=value), patch.dict(os.environ, {sandbox.TOOLCHAIN_DIRS_ENV: json.dumps([value])}):
+                with self.assertRaises(sandbox.ControllerTestEnvironmentError) as caught:
+                    self.prepare()
+                self.assertTrue(caught.exception.cleanup_confirmed)
+                self.assertFalse(caught.exception.process_started)
+                self.assertEqual(caught.exception.classification, "confirmed_environment_blocker")
+        for raw in ("invalid JSON", '{}', '[1]', json.dumps([str(self.toolchain)] * 9)):
+            with self.subTest(raw=raw), patch.dict(os.environ, {sandbox.TOOLCHAIN_DIRS_ENV: raw}):
+                with self.assertRaises(sandbox.ControllerTestEnvironmentError): self.prepare()
+        self.check_mock.assert_not_called()
+        self.assertEqual(self.scratch(), [])
+
+    def test_reparse_ancestors_and_nested_links_are_rejected(self):
+        original = Path.lstat
+        nested = self.toolchain / "linked"; nested.mkdir()
+        for dangerous in (self.toolchain, self.toolchain.parent, nested, self.toolchain / "tool.exe"):
+            def lstat(path, *args, **kwargs):
+                if path == dangerous:
+                    return Mock(st_mode=stat.S_IFDIR, st_file_attributes=0x400)
+                return original(path, *args, **kwargs)
+            with self.subTest(path=dangerous), patch.dict(os.environ, {
+                    sandbox.TOOLCHAIN_DIRS_ENV: json.dumps([str(self.toolchain)])}), patch.object(Path, "lstat", lstat):
+                with self.assertRaises(sandbox.ControllerTestEnvironmentError): self.prepare()
+        self.check_mock.assert_not_called()
+        self.assertEqual(self.scratch(), [])
+
+    def test_git_and_credentials_inside_installations_remain_denied(self):
+        for name in (".git", ".codex", ".env", ".npmrc", "credentials.json"):
+            sensitive = self.toolchain / name
+            sensitive.write_text("harmless fixture")
+            with self.subTest(name=name), patch.dict(os.environ, {
+                    sandbox.TOOLCHAIN_DIRS_ENV: json.dumps([str(self.toolchain)])}):
+                spec, _ = self.prepare()
+                filesystem = self.check_mock.call_args.kwargs["filesystem"]
+                self.assertEqual(filesystem[self.toolchain.as_posix()], "read")
+                self.assertEqual(filesystem[sensitive.as_posix()], "deny")
+                spec.cleanup()
+            sensitive.unlink()
 
     def test_effective_permissions_reject_conflicting_grants_and_backend(self):
         spec, _ = self.prepare(); self.addCleanup(spec.cleanup)

@@ -5,13 +5,86 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import sys
 import uuid
 
 from auto_coding.python_environment import test_environment
+from auto_coding.sensitive_paths import is_sensitive_path
 from auto_coding.reviewer_permissions import (
     ReviewerEnvironmentError, activated, check_cli, prepare_review,
 )
+
+
+# Operator-controlled only: JSON array of trusted, preinstalled installation
+# directories. Never loaded from a plan or target file, or passed to test code.
+TOOLCHAIN_DIRS_ENV = "AUTOCODING_TEST_TOOLCHAIN_DIRS_JSON"
+
+
+def trusted_toolchain_filesystem(repo, logs, runtime, windows):
+    raw = os.environ.get(TOOLCHAIN_DIRS_ENV)
+    if raw is None:
+        return {}
+    try:
+        if len(raw) > 32768:
+            raise ValueError
+        values = json.loads(raw)
+        if not isinstance(values, list) or len(values) > 8:
+            raise ValueError
+        protected = [repo, logs, runtime, windows, Path(__file__).resolve().parents[2],
+                     Path.home(), Path.home().parent]
+        protected += [Path(os.environ[key]) for key in ("USERPROFILE", "HOME", "PROGRAMDATA")
+                      if os.environ.get(key)]
+        protected = [path.resolve(strict=False) for path in protected]
+        result, denied = {}, []
+        for value in values:
+            if (not isinstance(value, str) or not value or len(value) > 4096
+                    or any(ord(char) < 32 for char in value)):
+                raise ValueError
+            path = Path(value)
+            # No relative, UNC/device, drive-relative, ADS, dot or short-name
+            # spellings. Canonical local installation paths only.
+            if (not path.is_absolute() or value.startswith(("\\\\", "//"))
+                    or len(path.parts) < 3 or ":" in value[2:]
+                    or is_sensitive_path(value) or ".codex" in {part.casefold() for part in path.parts}
+                    or any(part in {".", ".."} or part.endswith((".", " "))
+                           or "~" in part for part in value.replace("\\", "/").split("/"))):
+                raise ValueError
+            for component in (path, *path.parents):
+                info = component.lstat()
+                if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+                    raise ValueError
+            resolved = path.resolve(strict=True)
+            if resolved != path or not resolved.is_dir():
+                raise ValueError
+            if any(resolved.is_relative_to(item) or item.is_relative_to(resolved) for item in protected):
+                raise ValueError
+            result[resolved.as_posix()] = "read"
+            # Nested links must not turn an approved installation into a route
+            # to unrelated host files. Fail closed on unreadable/oversized trees.
+            entries = 0
+            def scan_error(error):
+                raise error
+            for parent, directories, files in os.walk(resolved, followlinks=False, onerror=scan_error):
+                for name in directories + files:
+                    entries += 1
+                    candidate = Path(parent) / name
+                    if entries > 50000:
+                        raise ValueError
+                    info = candidate.lstat()
+                    if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+                        raise ValueError
+                    if (is_sensitive_path(str(candidate)) or name.casefold() == ".codex"):
+                        if not any(candidate.is_relative_to(parent) for parent in denied):
+                            denied.append(candidate)
+                            result[candidate.as_posix()] = "deny"
+                            if len(denied) > 128:
+                                raise ValueError
+        if len(json.dumps(result)) > 16384:
+            raise ValueError
+        return result
+    except (OSError, ValueError, TypeError, RuntimeError) as exc:
+        raise ReviewerEnvironmentError("Invalid or unsafe trusted controller-test toolchain directories") from exc
 
 
 class ControllerTestEnvironmentError(ValueError):
@@ -70,6 +143,7 @@ def prepare(command, repo, logs, git):
             raise ControllerTestEnvironmentError("Unsupported overlapping runtime/checkout paths")
         filesystem = {":root": "deny", windows.as_posix(): "read", runtime.as_posix(): "read",
                       repo.as_posix(): "read", spec.scratch.as_posix(): "write"}
+        filesystem.update(trusted_toolchain_filesystem(repo, logs, runtime, windows))
         name = "auto_coding_tests_" + uuid.uuid4().hex
         policy = 'permissions.' + name + '={extends=":read-only",filesystem={' + ','.join(
             json.dumps(key) + '=' + json.dumps(value) for key, value in filesystem.items()
