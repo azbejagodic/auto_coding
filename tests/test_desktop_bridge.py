@@ -76,7 +76,8 @@ class DesktopBridgeTests(unittest.TestCase):
 
     @patch("auto_coding.desktop_control.Popen")
     @patch.object(DesktopController, "preflight", return_value={"branch":"feature/smoke", "clean":True, "errors":[]})
-    def test_full_lifecycle_confirmation_live_completion_and_existing_run(self, preflight, popen):
+    @patch.object(DesktopController, "audit_status", return_value={"status":"APPROVE", "verified":True, "start_approved":True, "directory":"verified-fixture"})
+    def test_full_lifecycle_confirmation_live_completion_and_existing_run(self, approval, preflight, popen):
         controller = DesktopController(self.root / "runs")
         bridge = Bridge(controller=controller, dialogs=self.dialogs)
         self.assertFalse(bridge.job_status()["start_ready"])
@@ -393,7 +394,8 @@ class DesktopBridgeTests(unittest.TestCase):
         process = Mock(pid=424242)
         process.poll.return_value = None
         popen.return_value = process
-        with patch.object(controller, "_validate"):
+        with patch.object(controller, "_validate"), patch.object(controller, "audit_status",
+                return_value={"start_approved":True, "directory":"verified-fixture"}):
             self.assertTrue(bridge.start()["ok"])
             self.assertIn("already active", bridge.start()["error"])
         self.assertEqual(popen.call_count, 1)
@@ -419,6 +421,181 @@ class DesktopBridgeTests(unittest.TestCase):
             self.assertTrue(bridge.resume()["ok"])
         self.assertEqual(popen.call_count, 2)
         self.assertIn("--resume", popen.call_args.args[0])
+
+
+
+class DurableAuditBridgeTests(unittest.TestCase):
+    """Real verification/ledger helpers; no model, network, or child launch."""
+
+    def setUp(self):
+        from auto_coding import plan_audit, simple_run
+        self.audit, self.engine = plan_audit, simple_run
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name).resolve()
+        self.repo = self.root / "target"
+        self.repo.mkdir()
+        self.plan = self.root / "plan.json"
+        # Match the existing final verification schema.
+        from test_plan_audit import POLICY
+        self.policy = POLICY
+        self.plan.write_text(json.dumps({"tasks":[{"id":"one", "prompt":"Implement one",
+            "test_commands":[["python", "-B", "-m", "unittest"]]}], "final_verification":self.policy}))
+        self.target = {"repo":str(self.repo), "file_id":[1, 2], "git_dir":str(self.repo / ".git"),
+                       "head":"initial", "branch":"feature/test"}
+        self.snapshot = patch.object(plan_audit, "snapshot", side_effect=lambda *args:dict(self.target)).start()
+        self.addCleanup(patch.stopall)
+        patch.object(simple_run, "safe_repo", return_value=self.repo).start()
+        self.controller = DesktopController(self.root / "runs")
+        self.controller.repo, self.controller.plan = self.repo, self.plan
+        self.check = {"branch":"feature/test", "clean":True, "errors":[], "start_error":None}
+        patch.object(self.controller, "preflight", side_effect=lambda:dict(self.check)).start()
+        self.dialogs = Mock()
+        self.dialogs.confirm.return_value = True
+        self.bridge = Bridge(controller=self.controller, dialogs=self.dialogs)
+        self.directory = self.root / "audit"
+        self.directory.mkdir()
+        self.controller.logs = self.directory
+        self.report = {"decision":"APPROVE", "summary":"Feasible <script>data</script>", "overall_risk":"low",
+            "tasks":[{"task_id":"one", "findings":["Specific"], "recommended_changes":[], "blocking_issues":[]}],
+            "recommended_changes":[], "blocking_issues":[]}
+
+    def save_evidence(self, decision="APPROVE"):
+        self.report["decision"] = decision
+        if decision == "REVISE":
+            self.report["recommended_changes"] = ["Specify acceptance criteria"]
+        if decision == "BLOCK":
+            self.report["blocking_issues"] = ["Missing dependency"]
+        _, _, identity, config = self.audit.audit_inputs(self.engine, self.plan, self.repo,
+            model="fixture-model", controller_tests=False)
+        evidence = {"version":1, "identity":identity, "configuration":config,
+                    "report_sha256":self.audit.digest(self.report)}
+        self.engine.save_json(self.directory / "audit-report.json", self.report)
+        self.engine.save_json(self.directory / "audit-evidence.json", evidence)
+        self.ledger = self.audit.ledger_path(self.repo, identity)
+        self.record = {"status":"completed", "directory":str(self.directory),
+                       "evidence_sha256":self.audit.digest(evidence)}
+        self.engine.save_json(self.ledger, self.record)
+        return evidence
+
+    def test_approval_arrives_while_other_run_busy_then_recovers_without_second_audit(self):
+        self.check["errors"] = ["An earlier desktop run may still be active."]
+        self.assertFalse(self.bridge.job_status()["start_ready"])
+        self.save_evidence()
+        status = self.bridge.job_status()
+        self.assertEqual(status["audit"]["status"], "APPROVE")
+        self.assertTrue(status["audit"]["verified"])
+        self.assertFalse(status["start_ready"])
+        self.assertIn("earlier desktop run", status["start_reason"])
+        before = self.ledger.read_bytes()
+        self.check["errors"] = []
+        status = self.bridge.job_status()
+        self.assertTrue(status["start_ready"])
+        self.assertFalse(status["audit_ready"])
+        self.assertEqual(before, self.ledger.read_bytes())
+        with patch("auto_coding.desktop_control.Popen") as spawn:
+            spawn.return_value.poll.return_value = None
+            spawn.return_value.pid = 12345
+            self.assertTrue(self.bridge.start()["ok"])
+            argv = spawn.call_args.args[0]
+            self.assertEqual(argv[argv.index("--approved-audit") + 1], str(self.directory))
+            self.assertNotIn("--controller-tests", argv)
+
+    def test_changed_identity_invalidates_even_after_busy_run_finishes(self):
+        self.save_evidence()
+        for field in ("head", "branch", "repo"):
+            with self.subTest(field=field):
+                original = self.target[field]
+                self.target[field] = "changed"
+                self.assertFalse(self.bridge.job_status()["start_ready"])
+                self.assertFalse(self.controller.audit_status()["verified"])
+                self.target[field] = original
+        with patch.object(self.engine, "requested_verification", return_value={"changed":True}):
+            self.assertFalse(self.bridge.job_status()["start_ready"])
+        self.plan.write_text(self.plan.read_text() + "\n")
+        status = self.bridge.job_status()
+        self.assertFalse(status["start_ready"])
+        self.assertTrue(status["audit_ready"], "Corrected bytes get a new one-shot identity")
+
+    def test_missing_forged_incomplete_and_tampered_evidence_cannot_start(self):
+        with patch("auto_coding.desktop_control.Popen") as spawn:
+            self.assertFalse(self.bridge.start()["ok"])
+            self.save_evidence()
+            self.ledger.unlink()
+            self.assertFalse(self.bridge.job_status()["start_ready"])
+            self.record["status"] = "invoking"
+            self.engine.save_json(self.ledger, self.record)
+            self.assertFalse(self.bridge.job_status()["start_ready"])
+            self.assertFalse(self.bridge.job_status()["audit_ready"])
+            self.record["status"] = "completed"
+            self.engine.save_json(self.ledger, self.record)
+            self.report["summary"] = "forged"
+            self.engine.save_json(self.directory / "audit-report.json", self.report)
+            self.assertFalse(self.bridge.start()["ok"])
+            spawn.assert_not_called()
+
+    def test_revise_block_and_success_exit_without_evidence_are_not_approval(self):
+        for decision in ("REVISE", "BLOCK"):
+            with self.subTest(decision=decision):
+                self.save_evidence(decision)
+                self.controller.exit_code = 1
+                status = self.bridge.job_status()
+                self.assertEqual(status["audit"]["status"], decision)
+                self.assertEqual(status["audit"]["report"]["summary"], self.report["summary"])
+                self.assertFalse(status["start_ready"])
+                self.assertFalse(status["audit_ready"])
+                self.assertIn("exact revised bytes", status["start_reason"])
+        (self.directory / "audit-evidence.json").unlink()
+        self.controller.exit_code = 0
+        self.assertFalse(self.bridge.job_status()["start_ready"])
+
+    def test_reopen_and_different_run_selection_do_not_reuse_ui_permission(self):
+        self.save_evidence()
+        fresh = DesktopController(self.root / "runs")
+        self.assertTrue(fresh.reopen(self.directory)["ok"])
+        fresh.plan = self.plan
+        self.assertTrue(fresh.audit_status()["start_approved"])
+        unrelated = self.root / "other-run"
+        unrelated.mkdir()
+        self.bridge._controller_factory = lambda: DesktopController(self.root / "runs")
+        self.assertTrue(self.bridge.open_run(str(unrelated))["ok"])
+        self.assertFalse(self.bridge.job_status()["start_ready"])
+
+    def test_running_unknown_and_failed_intent_remains_one_shot(self):
+        self.controller.logs = None
+        with patch("auto_coding.desktop_control.check_audit_model"), patch(
+                "auto_coding.desktop_control.Popen") as spawn:
+            process = spawn.return_value
+            process.pid = 12345
+            process.poll.return_value = None
+            self.assertTrue(self.bridge.job_status()["audit_ready"])
+            self.assertTrue(self.bridge.start_audit("fixture-model")["ok"])
+            status = self.bridge.job_status()
+            self.assertEqual(status["audit"]["status"], "Running")
+            self.assertFalse(status["audit_ready"])
+            self.assertFalse(self.bridge.start_audit("another-model")["ok"])
+            process.poll.return_value = 1
+            status = self.bridge.job_status()
+            self.assertEqual(status["audit"]["status"], "Infrastructure error")
+            self.assertFalse(status["audit_ready"])
+            self.assertFalse(self.bridge.start_audit("another-model")["ok"])
+            spawn.assert_called_once()
+        intent = self.controller.logs / "desktop-run.json"
+        intent.write_text(json.dumps({"repo":str(self.repo), "plan":str(self.plan), "status":"launching"}))
+        reopened = DesktopController(self.controller.runs_dir)
+        reopened.reopen(self.controller.logs)
+        status = Bridge(controller=reopened).job_status()
+        self.assertEqual(status["audit"]["status"], "Unknown")
+        self.assertFalse(status["audit_ready"])
+        self.assertFalse(status["start_ready"])
+
+    def test_changes_during_native_confirmation_are_revalidated(self):
+        self.save_evidence()
+        self.assertTrue(self.bridge.job_status()["start_ready"])
+        self.dialogs.confirm.side_effect = lambda _: self.target.update(head="changed") or True
+        with patch("auto_coding.desktop_control.Popen") as spawn:
+            self.assertFalse(self.bridge.start()["ok"])
+            spawn.assert_not_called()
 
 
 if __name__ == "__main__":

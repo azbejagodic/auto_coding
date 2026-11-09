@@ -219,51 +219,89 @@ class DesktopController:
                 return self._fail(str(exc))
 
     def audit_status(self) -> dict:
-        """Display verified CLI evidence; intent/exit code never imply approval."""
-        result = {"status": "Not audited", "identity": None, "report": None}
-        if self.logs is None:
-            return result
+        """Revalidate durable evidence independently of another run's availability.
+
+        No verdict is cached: changed bytes/checkout/policy revoke permission on
+        the next snapshot and again on launch. A busy run never deletes evidence.
+        """
+        result = {"status": "Idle", "identity": None, "report": None,
+                  "verified": False, "start_approved": False, "audit_ready": False}
         try:
-            directory = self.logs
-            intent = self.logs / "desktop-audit.json"
-            if intent.exists():
+            if self.repo is None or self.plan is None:
+                return result
+            tasks, fingerprint = load_tasks(self.plan)
+            if self.repo == Path(simple_run.__file__).resolve().parents[2]:
+                raise ValueError("Select a separate target checkout; the live controller checkout cannot be audited.")
+            directory = None
+            intent = self.logs / "desktop-audit.json" if self.logs else None
+            # An implementation run has its own saved approval binding. Never
+            # turn that binding into permission to start a different new run.
+            state = read_run(self.logs).get("state") if self.logs else None
+            if state and "plan_audit" in state:
+                manifest = plan_audit.read_json(self.logs / "run-manifest.json")
+                plan_audit.verify_resume(simple_run, state, manifest, self.repo, fingerprint, tasks)
+                simple_run.verify_resume_git(self.repo, state, manifest, tasks)
+                if (state["repo"] != str(self.repo)
+                        or simple_run.require_run_branch(self.repo) != manifest["branch"]
+                        or simple_run.requested_verification(self.plan, fingerprint, None) != state["final_verification"]):
+                    raise ValueError("Saved run repository, branch or verification policy changed")
+                evidence, report = plan_audit.load_evidence(simple_run, state["plan_audit"]["directory"],
+                    self.repo, fingerprint, [t["id"] for t in tasks])
+                return dict(result, status="APPROVE", verified=True, identity=evidence["identity"],
+                            configuration=evidence["configuration"], report=report,
+                            directory=state["plan_audit"]["directory"], scope="resume")
+            if self.logs and (self.logs / "audit-evidence.json").exists():
+                directory = self.logs
+                result["identity"] = plan_audit.read_json(directory / "audit-evidence.json")["identity"]
+            elif intent and intent.exists():
                 saved = plan_audit.read_json(intent)
-                result["identity"] = saved["identity"]
-                result["configuration"] = saved["configuration"]
                 directory = Path(saved["directory"]).resolve()
                 if directory != self.logs / "audit":
                     raise ValueError("Audit directory differs from saved launch location")
-                result["status"] = "Uncertain"
-                if ((self.process is not None and self.process.poll() is None)
-                        or self._selected_run_active()):
+                result.update(identity=saved["identity"], configuration=saved["configuration"])
+            elif self.logs:
+                return result
+
+            # Uses exactly the CLI's identity and input checks, without a model
+            # capability probe or any call to Codex. Model/goal cannot buy retries.
+            _, _, identity, _ = plan_audit.audit_inputs(simple_run, self.plan, self.repo,
+                model="identity-check", controller_tests=False)
+            ledger = plan_audit.ledger_path(self.repo, identity)
+            launch_logs = self.runs_dir / ("run-audit-" + plan_audit.digest(identity))
+            consumed = ledger.exists() or launch_logs.exists()
+            result["audit_ready"] = not consumed
+            if ledger.exists():
+                prior = plan_audit.read_json(ledger)
+                directory = Path(prior["directory"]).resolve()
+            elif directory is None and launch_logs.exists():
+                directory = launch_logs / "audit"
+            if directory is None:
+                return result
+            result["directory"] = str(directory)
+            if not (directory / "audit-evidence.json").exists():
+                result["status"] = "Unknown"
+                if intent and intent.exists() and (self.process is not None and self.process.poll() is None
+                                                   or self._selected_run_active()):
                     result["status"] = "Running"
-                elif self.exit_code is not None:
-                    result["status"] = "Failed"
-            evidence_path = directory / "audit-evidence.json"
-            if evidence_path.exists():
-                evidence = plan_audit.read_json(evidence_path)
-                identity = evidence["identity"]
-                if result["identity"] is not None and result["identity"] != identity:
-                    raise ValueError("Audit evidence identity differs from launch intent")
-                result["identity"] = identity
-                if self.repo is None or self.plan is None:
-                    raise ValueError("Select the original repository and plan to verify this audit")
-                tasks, fingerprint = load_tasks(self.plan)
-                evidence, report = plan_audit.load_evidence(simple_run, directory, self.repo,
-                    fingerprint, [task["id"] for task in tasks])
-                if report["decision"] == "APPROVE":
-                    plan_audit.authorize(simple_run, directory, self.repo, fingerprint, tasks,
-                        simple_run.requested_verification(self.plan, fingerprint, None), controller_tests=False)
-                result.update(status=report["decision"], report=report, directory=str(directory),
-                              configuration=evidence["configuration"])
-                if report["decision"] == "APPROVE" and self.exit_code not in (None, 0):
-                    result.update(status="Failed", report=None)
-                if (self._launch_uncertain or self._selected_run_unknown()
-                        or self.process is not None or self._selected_run_active()):
-                    result.update(status="Uncertain", report=None)
+                elif intent and intent.exists() and self.exit_code is not None:
+                    result["status"] = "Infrastructure error"
+                result["error"] = "No completed controller-owned audit evidence. Saved one-shot calls cannot be repeated."
+                return result
+            evidence, report = plan_audit.load_evidence(simple_run, directory, self.repo,
+                fingerprint, [task["id"] for task in tasks])
+            result.update(identity=evidence["identity"], configuration=evidence["configuration"], report=report)
+            if evidence["identity"] != identity or evidence["configuration"]["controller_tests"] is not False:
+                raise ValueError("Audit target or verification configuration changed; audit the revised inputs")
+            result["status"] = report["decision"]
+            if report["decision"] == "APPROVE":
+                plan_audit.authorize(simple_run, directory, self.repo, fingerprint, tasks,
+                    identity["verification_policy"], controller_tests=False)
+                result.update(verified=True, start_approved=True)
+            else:
+                result["error"] = "Revise the plan, then audit the exact revised bytes before starting."
             return result
         except (OSError, ValueError, KeyError, TypeError, PilotError) as exc:
-            result.update(status="Uncertain", report=None, error=str(exc))
+            result.update(status="Unknown", verified=False, start_approved=False, error=str(exc))
             return result
 
     @staticmethod
@@ -344,6 +382,10 @@ class DesktopController:
                 runs_dir = self.runs_dir.resolve(strict=False)
                 if runs_dir == self.repo or runs_dir.is_relative_to(self.repo):
                     raise ValueError("Application run storage must be outside the target repository.")
+                approval = self.audit_status()
+                if not approval.get("start_approved"):
+                    raise ValueError(approval.get("error") or "Start requires a verified APPROVE audit for these exact inputs.")
+                approved_audit = approval["directory"]
                 runs_dir.mkdir(parents=True, exist_ok=True)
                 logs = runs_dir / ("run-" + uuid.uuid4().hex)
                 logs.mkdir(exist_ok=False)
@@ -351,7 +393,7 @@ class DesktopController:
                 self.process_history = []
                 self.exit_code = None
                 self._metadata(logs)
-                return self._launch(attempts, False, auto_push=auto_push)
+                return self._launch(attempts, False, auto_push=auto_push, approved_audit=approved_audit)
             except (OSError, ValueError, PilotError) as exc:
                 return self._fail(str(exc))
 
@@ -393,14 +435,14 @@ class DesktopController:
             except (OSError, ValueError, PilotError) as exc:
                 return self._fail(str(exc))
 
-    def _launch(self, attempts: int, resume: bool, auto_push: bool = False) -> dict:
+    def _launch(self, attempts: int, resume: bool, auto_push: bool = False, approved_audit=None) -> dict:
         config = None
         if resume:
             config = read_run(self.logs).get("state", {}).get("auto_push")
         elif auto_push:
             config = {"repository": self.repository, "branch": self.preflight()["branch"]}
         return launch_runner(self, repo=self.repo, plan=self.plan, logs=self.logs, attempts=attempts,
-                             resume=resume, publication=config, popen=Popen, persist_metadata=self._metadata,
+                             resume=resume, publication=config, approved_audit=approved_audit, popen=Popen, persist_metadata=self._metadata,
                              reserve=reserve_job, cancel=cancel_reservation, fail=self._fail)
 
     def _read_metadata(self):

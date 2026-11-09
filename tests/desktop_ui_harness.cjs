@@ -67,7 +67,7 @@ const contents = () => get('app').textContent;
   assert(!get('browse-project').disabled);
   assert(get('start').disabled);
   assert.equal(get('header-state').textContent, 'Idle');
-  assert(contents().includes('Audit and authorize new runs with the CLI.'));
+  assert(contents().includes('Select a plan and repository, then audit and authorize a new run.'));
   assert(!contents().includes('Ready for your first run'));
   assert.equal(get('run-setup').hidden, false);
   const initial = structuredClone(data);
@@ -142,7 +142,7 @@ const contents = () => get('app').textContent;
     assert(get('start').disabled);
     assert(get('preflight').textContent.includes(error));
   }
-  data.controller.start_ready = true; data.controller.preflight.errors = [];
+  data.controller.start_ready = false; data.controller.audit_ready = true; data.controller.preflight.errors = [];
   await poll();
   assert(get('start-audit').disabled, 'Audit requires an explicit model');
   get('audit-model').value = 'audit-model'; get('audit-model').oninput();
@@ -197,10 +197,41 @@ const contents = () => get('app').textContent;
     await poll();
     assert(get('start').disabled);
     assert.equal(get('audit-result').className, 'pill muted');
-    assert.equal(get('audit-result').textContent, 'Not audited');
+    assert.equal(get('audit-result').textContent, 'Idle');
     await click('start');
     assert.equal(calls.length, beforeStart);
   }
+  // Only the verified backend verdict can open the Start gate. Busy remains separate.
+  data.controller.audit = {status:'APPROVE', verified:true, start_approved:true, identity:{plan_sha256:'exact'}};
+  data.controller.start_ready = false;
+  data.controller.start_reason = 'Run busy. Wait for the earlier run.';
+  await poll();
+  assert.equal(get('audit-result').className, 'pill green');
+  assert(get('start').disabled);
+  assert(get('start-reason').textContent.includes('Run busy'));
+  data.controller.start_ready = true;
+  await poll();
+  assert(!get('start').disabled, 'Unchanged approval becomes usable when busy run ends');
+  await click('start');
+  assert.deepEqual(calls.at(-1), ['start', 3]);
+  for (const status of ['Unknown', 'REVISE', 'BLOCK', 'Infrastructure error', 'Running', 'Idle', 'APPROVE']) {
+    data.controller.audit = {status, verified:false, start_approved:false, error:'Revise exact bytes <img onerror=bad()>'};
+    data.controller.start_ready = false;
+    await poll();
+    assert(get('start').disabled);
+    assert.notEqual(get('audit-result').className, 'pill green');
+    assert(get('audit-identity').textContent.includes('<img onerror=bad()>'));
+  }
+  // A failed poll must also clear the previously green result immediately.
+  data.controller.audit = {status:'APPROVE', verified:true, start_approved:true};
+  data.controller.start_ready = true;
+  await poll(); failStatus = true; await poll();
+  assert(get('start').disabled);
+  assert.notEqual(get('audit-result').className, 'pill green');
+  failStatus = false;
+  data.controller.audit = {status:'Idle'};
+  data.controller.start_ready = false;
+  calls.length = 0;
   // Existing recovery still uses the same controller bridge.
   data.controller.logs = data.root = 'C:\\runs\\one';
   data.exists = true; data.empty = false;

@@ -314,6 +314,25 @@ class PlanAuditTests(unittest.TestCase):
         self.assertEqual(second.calls, ["B", "A", "B", "final"])
         self.assertEqual(len(self.calls), 1)
 
+    def test_desktop_resumed_approval_uses_saved_binding_without_new_start_permission(self):
+        from auto_coding.desktop_app import Bridge
+        from auto_coding.desktop_control import DesktopController
+        self.do_audit()
+        self.assertEqual(self.start(approved_audit=self.logs), 0)
+        controller = DesktopController(self.root / "desktop-runs")
+        controller.repo, controller.plan, controller.logs = self.repo, self.plan, self.run_logs
+        bridge = Bridge(controller=controller)
+        status = bridge.job_status()
+        self.assertEqual(status["audit"]["status"], "APPROVE")
+        self.assertTrue(status["audit"]["verified"])
+        self.assertEqual(status["audit"]["scope"], "resume")
+        self.assertFalse(status["start_ready"])
+        self.git("commit", "--allow-empty", "-m", "unrelated HEAD")
+        self.assertFalse(bridge.job_status()["audit"]["verified"])
+        self.git("checkout", "-b", "feature/other")
+        self.assertFalse(bridge.job_status()["audit"]["verified"])
+        self.assertEqual(len(self.calls), 1)
+
     def test_revise_blocks_start(self):
         self.report.update(decision="REVISE", recommended_changes=["Specify observable acceptance criteria for task one"])
         self.assertEqual(self.do_audit(), 1)

@@ -42,6 +42,12 @@ class DesktopControlTests(unittest.TestCase):
         self.controller = DesktopController(self.runs)
         self.assertTrue(self.controller.select_repo(self.repo)["ok"])
         self.assertTrue(self.controller.select_plan(self.plan)["ok"])
+        # These process/recovery tests isolate launch mechanics from the audit
+        # verifier, covered with durable evidence in test_desktop_bridge.
+        approval = patch.object(self.controller, "audit_status", return_value={
+            "start_approved":True, "directory":str(self.root / "verified-audit")})
+        approval.start()
+        self.addCleanup(approval.stop)
 
     def tearDown(self): self.temp.cleanup()
 
@@ -119,7 +125,7 @@ class DesktopControlTests(unittest.TestCase):
         src = str(Path(__file__).resolve().parents[1] / "src")
         self.assertEqual(args[0], [__import__("sys").executable, "-B", "-m", "auto_coding.simple_run",
                                    "--repo", str(self.repo), "--logs", str(self.controller.logs),
-                                   "--attempts", "3", str(self.plan)])
+                                   "--attempts", "3", "--approved-audit", str(self.root / "verified-audit"), str(self.plan)])
         self.assertFalse(kwargs["shell"])
         self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
         self.assertEqual(kwargs["stderr"], subprocess.STDOUT)
@@ -466,7 +472,7 @@ class DesktopAuditTests(unittest.TestCase):
             spawn.assert_not_called()
         self.controller.process.code = 0
         self.controller.poll()
-        self.assertEqual(self.controller.audit_status()['status'], 'Failed')
+        self.assertEqual(self.controller.audit_status()['status'], 'Infrastructure error')
         with patch('auto_coding.desktop_control.check_audit_model'), patch('auto_coding.desktop_control.Popen') as spawn:
             result = self.controller.start_audit('fake-audit-model')
             self.assertIn('already recorded', result['error'])
@@ -486,7 +492,7 @@ class DesktopAuditTests(unittest.TestCase):
         reopened = DesktopController(self.controller.runs_dir)
         self.assertTrue(reopened.reopen(logs)['ok'])
         self.assertIsNone(reopened.job_status()['active'])
-        self.assertEqual(reopened.audit_status()['status'], 'Uncertain')
+        self.assertEqual(reopened.audit_status()['status'], 'Unknown')
         with patch('auto_coding.desktop_control.Popen') as spawn:
             self.assertFalse(reopened.start_audit('fake-audit-model')['ok'])
             spawn.assert_not_called()
@@ -517,11 +523,11 @@ class DesktopAuditTests(unittest.TestCase):
         reopened.reopen(self.controller.logs)
         self.assertEqual(reopened.audit_status()['status'], 'APPROVE')
         self.controller.exit_code = 1
-        self.assertEqual(self.controller.audit_status()['status'], 'Failed')
+        self.assertEqual(self.controller.audit_status()['status'], 'APPROVE')
         self.controller.exit_code = 0
         identity = self.controller.audit_status()['identity']
         (self.fixture.repo / 'changed-source').write_text('changed after audit')
-        self.assertEqual(reopened.audit_status()['status'], 'Uncertain')
+        self.assertEqual(reopened.audit_status()['status'], 'Unknown')
         self.assertEqual(reopened.audit_status()['identity'], identity)
 
     def test_failed_spawn_consumes_desktop_intent_and_preserves_diagnostics(self):
@@ -571,7 +577,7 @@ class DesktopAuditTests(unittest.TestCase):
                 bridge = Bridge(controller=controller)
                 self.assertEqual(bridge.job_status()['audit']['report']['decision'], decision)
                 (directory / 'audit-report.json').write_text('{}')
-                self.assertEqual(controller.audit_status()['status'], 'Uncertain')
+                self.assertEqual(controller.audit_status()['status'], 'Unknown')
 
     def test_missing_model_auth_config_and_dirty_target_fail_before_spawn(self):
         with patch('auto_coding.desktop_control.Popen') as spawn:

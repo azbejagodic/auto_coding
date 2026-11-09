@@ -151,7 +151,7 @@ progress{width:100%;height:12px;accent-color:#72adf9}
 <button id="stop" disabled aria-describedby="run-unavailable">Stop after task</button>
 <button id="download-logs" disabled aria-describedby="run-unavailable">Download Logs</button>
 </div>
-<p id="start-reason" class="muted">Start requires verified audit approval and durable authorization. The desktop cannot establish these yet; use the existing CLI for new runs.</p>
+<p id="start-reason" class="muted">Start requires verified audit approval for the exact selected plan and target, and native authorization.</p>
 <p id="run-unavailable" class="muted">Desktop stop and log download are not wired yet. Read recorded evidence in Logs.</p>
 <dl class="run-summary" aria-live="polite" aria-atomic="true">
 <div><dt>Status</dt><dd id="run-status">Idle</dd></div>
@@ -283,12 +283,14 @@ function message(text, error = false) {
 function updateControls() {
   const c = latest?.controller || {};
   const locked = busy || !ready || c.active !== false || c.uncertain;
-  document.getElementById('start-audit').disabled = locked || !c.start_ready || !document.getElementById('audit-model').value.trim();
+  document.getElementById('start-audit').disabled = locked || !c.audit_ready || !document.getElementById('audit-model').value.trim();
   document.getElementById('audit-model').disabled = locked;
   document.getElementById('audit-goal').disabled = locked;
   const audit = c.audit || {};
-  document.getElementById('audit-result').textContent = audit.status || 'Not audited';
-  document.getElementById('audit-identity').textContent = audit.identity ? JSON.stringify({identity:audit.identity, configuration:audit.configuration, report:audit.report, error:audit.error}, null, 2) : '';
+  document.getElementById('audit-result').textContent = audit.status || 'Idle';
+  document.getElementById('audit-result').className = 'pill ' + (audit.status === 'APPROVE' && audit.verified === true ? 'green' : ['REVISE', 'REJECT', 'BLOCK', 'Infrastructure error'].includes(audit.status) ? 'red' : ['Running', 'Unknown'].includes(audit.status) ? 'amber' : 'muted');
+  document.getElementById('audit-identity').textContent = JSON.stringify({identity:audit.identity, configuration:audit.configuration, report:audit.report, error:audit.error}, null, 2);
+  document.getElementById('audit-unavailable').textContent = c.audit_reason || audit.error || 'One read-only audit per exact plan and target. Reopen saved logs to inspect results. Report download is not wired yet.';
   controls.forEach(id => { document.getElementById(id).disabled = locked; });
   ['github-branch', 'select-branch', 'new-branch', 'fetch-github', 'branch-base', 'branch-base-confirm', 'create-branch'].forEach(id => {
     document.getElementById(id).disabled = locked || !c.repository || c.preflight?.clean !== true;
@@ -300,8 +302,8 @@ function updateControls() {
   document.getElementById('push-approved').disabled = locked || !c.push?.eligible;
   document.getElementById('push-reason').textContent = c.push?.reason || 'Select a managed repository to publish approved local checkpoints.';
   const validAttempts = validateAttempts();
-  // No desktop authorization bridge exists yet. Preflight eligibility is not approval.
-  document.getElementById('start').disabled = true;
+  document.getElementById('start').disabled = locked || !c.start_ready || audit.status !== 'APPROVE' || audit.verified !== true || audit.start_approved !== true || !validAttempts;
+  document.getElementById('start-reason').textContent = c.start_reason || 'Start requires verified audit approval for the exact selected inputs and native authorization.';
   document.getElementById('resume').disabled = locked || !c.resume_ready || !validAttempts;
   document.getElementById('resume').textContent = latest?.state?.publication?.outcome === 'pending' ? 'Retry Push' : 'Resume';
   document.getElementById('refresh').disabled = busy || !ready;
@@ -438,7 +440,7 @@ function render(data) {
   if (!c.logs && !data.root) {
     const empty = el('section', undefined, 'empty');
     empty.append(el('p', page === 'overview'
-      ? 'Select a project and JSON plan. Audit and authorize new runs with the CLI. Open Run to inspect saved work.'
+      ? 'Select a plan and repository, then audit and authorize a new run. Open Run to inspect saved work.'
       : page === 'tasks' ? 'No task history yet. Start or open a run.' : 'No run evidence yet. Start or open a run.'));
     if (page !== 'overview') { const setup = el('button', 'Go to run setup'); setup.onclick = () => navigate('overview'); empty.append(setup); }
     app.append(empty);
@@ -546,7 +548,7 @@ async function refresh(clearMessage = true) {
   refreshing = (async () => {
     try { const data = await window.pywebview.api.snapshot(); if (clearMessage) message(''); render(data); }
     catch (error) {
-      latest = {...(latest || {}), controller: {...(latest?.controller || {}), active: null, uncertain: true}};
+      latest = {...(latest || {}), controller: {...(latest?.controller || {}), active: null, uncertain: true, audit:{status:'Unknown', verified:false}, start_ready:false, audit_ready:false}};
       render(latest);
       message('Could not load status: ' + error, true);
     }
@@ -804,7 +806,19 @@ class Bridge:
                     and status["preflight"].get("clean") is True
                     and not status["preflight"].get("start_error")
                     and not status["preflight"].get("errors"))
-                # This is eligibility only; the controller revalidates on launch.
+                eligible = status["start_ready"]
+                audit = status.get("audit", {})
+                status["audit_ready"] = eligible and audit.get("audit_ready") is True
+                status["start_ready"] = eligible and audit.get("start_approved") is True
+                unavailable = ("Run busy or child status unknown. Wait, then unchanged approval will be revalidated."
+                    if status["active"] is not False or status.get("uncertain")
+                    else " ".join(status["preflight"].get("errors", [])) or "Target must be clean and eligible." if not eligible else None)
+                status["start_reason"] = unavailable or ("Verified APPROVE. Start requires native authorization."
+                    if status["start_ready"] else audit.get("error") or "Start requires verified APPROVE evidence for the exact selected inputs.")
+                status["audit_reason"] = unavailable or audit.get("error") or (
+                    "This exact plan and target already consumed their one-shot audit. Inspect the saved result; revise the plan before another audit."
+                    if not audit.get("audit_ready") else "Ready for one read-only audit. Configure an explicit model supporting High.")
+                # The controller and CLI revalidate again on launch.
                 status["resume_ready"] = bool(
                     not errors and paths["repo"] and plan_sha and state
                     and (state.get("status") == "stopped" or
