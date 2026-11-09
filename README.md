@@ -76,3 +76,18 @@ This is a **shape example**, not a ready-to-run plan: replace the example test c
 - [ ] Keep A/B calls and token limits bounded. A failed run retains its evidence and any approved checkpoints; don't erase it to hide the failure.
 
 **Source of truth:** `simple_run.py` (JSON validation / execution), `controller_test_sandbox.py` (permissions), `final_verification.py` (completion evidence), and their tests. This README is a planning aid, **not** a verified inventory of every installed tool.
+
+The desktop **Stop after task** control sends a cooperative request to the existing
+runner, including runs started from PowerShell: open that run's external logs in
+the dashboard and select **Stop after task**. **Stop requested** means the request
+is persisted; executing A/B calls, corrections, and safe checkpoint handling may
+finish first. The runner records `STOPPED` before starting the next task or final
+verification. It never kills the runner or its subprocesses. Closing the window
+leaves the request effective. Reopening shows the durable request and outcome.
+
+Resume with the original CLI arguments plus `--resume`, or use desktop Resume.
+Existing plan/audit, process ownership, and Git checkpoint reconciliation still
+apply. After successful reconciliation, an explicitly resumed cooperative stop is
+acknowledged in saved state and the timeline; `stop-request-*.json` remains in the
+external run directory. Resume never repeats the plan audit. Uncertain execution
+or cleanup continues to block resume.

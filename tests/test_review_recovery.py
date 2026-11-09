@@ -121,6 +121,135 @@ class ReviewRecoveryTests(unittest.TestCase):
         self.assertEqual(state["history"], [])
         return state
 
+    def test_cooperative_stop_during_task_retains_approval_then_resumes(self):
+        from auto_coding import stop_control
+        from auto_coding.desktop_control import DesktopController
+        tasks = json.loads(self.plan.read_text())
+        tasks["tasks"].append({"id": "two", "prompt": "Implement two", "test_commands": [["fake-test"]]})
+        self.plan.write_text(json.dumps(tasks))
+        fake = FakeExecutor()
+        requests = []
+        def execute(argv, cwd, timeout, **options):
+            if "--output-last-message" in argv and "--output-schema" not in argv:
+                controller = DesktopController(self.root / "desktop-runs")
+                controller.reopen(self.logs)  # CLI run, with no desktop metadata or Popen handle.
+                binding = controller.job_status()["stop_identity"]
+                self.assertTrue(controller.stop_after_task(binding)["ok"])
+                requests.append(binding)
+            return fake(argv, cwd, timeout, **options)
+        # Exercise the PowerShell entry point with its real runner and injected
+        # non-network executor. There is no desktop launch metadata or child handle.
+        from backend_fixtures import FINAL_POLICY, approved_plan_fixture
+        real_run = runner.run
+        def cli_run(*args, **kwargs):
+            kwargs.update(execute=execute, final_verification_config=FINAL_POLICY, controller_tests=True)
+            return real_run(*args, **kwargs)
+        with approved_plan_fixture(), patch.object(runner, "run", side_effect=cli_run), \
+                patch.object(runner, "new_workflow_test_mode", return_value=True), \
+                patch.object(runner.shutil, "which", return_value="fixture-codex"):
+            self.assertEqual(runner.main([str(self.plan), "--repo", str(self.repo), "--logs", str(self.logs)]), 1)
+        self.assertEqual((fake.a_calls, fake.b_calls, fake.test_calls), (1, 1, 1))
+        state = self.state()
+        self.assertEqual(state["completed"], ["one"])
+        self.assertEqual(state["safe_stop"], requests[0])
+        reopened = DesktopController(self.root / "desktop-runs")
+        self.assertTrue(reopened.reopen(self.logs)["ok"])
+        self.assertEqual(reopened.job_status()["outcome"], "stopped")
+        self.assertTrue(reopened.job_status()["stop_requested"])
+        first_commit = state["history"][0]["commit"]
+        self.assertTrue(runner.git_clean(self.repo))
+        resumed = FakeExecutor()
+        # Give task two distinct content while retaining the normal fake behavior.
+        resumed.a_calls = 1
+        self.assertEqual(self.run_fake(resumed, resume=True), 0)
+        state = self.state()
+        self.assertEqual(state["status"], "completed")
+        self.assertEqual(state["history"][0]["commit"], first_commit)
+        self.assertEqual(state["resumed_stops"], requests)
+        self.assertEqual(state["stop_generation"], 1)
+        self.assertIsNone(stop_control.pending(self.logs))
+        self.assertTrue((self.logs / "stop-request-00000000.json").is_file())
+        with self.assertRaises(ValueError):
+            stop_control.request(self.logs, requests[0])
+
+    def test_stop_after_approval_precedes_final_suite_and_failed_resume_keeps_signal(self):
+        from auto_coding import stop_control
+        original = runner.local_commit
+        def commit(repo, ident):
+            result = original(repo, ident)
+            stop_control.request(self.logs, stop_control.identity(self.logs))
+            return result
+        with patch.object(runner, "local_commit", side_effect=commit):
+            self.assertEqual(self.run_fake(FakeExecutor()), 1)
+        state = self.state()
+        self.assertEqual(state["completed"], ["one"])
+        self.assertNotIn("final_verification_result", state)
+        binding = state["safe_stop"]
+        (self.repo / "unrecognized.txt").write_text("changed")
+        with self.assertRaises(PilotError):
+            self.run_fake(FakeExecutor(review_only=True), resume=True)
+        self.assertEqual(stop_control.pending(self.logs), binding)
+        self.assertEqual(self.state()["safe_stop"], binding)
+        (self.repo / "unrecognized.txt").unlink()
+        self.assertEqual(self.run_fake(FakeExecutor(review_only=True), resume=True), 0)
+        self.assertEqual(self.state()["resumed_stops"], [binding])
+        self.assertTrue(any(e["event"] == "stop_resumed" for e in self.events()))
+
+    def test_stop_during_final_verification_preserves_passed_suite_for_resume(self):
+        from auto_coding import stop_control
+        original = runner.final_verification
+        def verify(*args):
+            result = original(*args)
+            stop_control.request(self.logs, stop_control.identity(self.logs))
+            return result
+        with patch.object(runner, "final_verification", side_effect=verify):
+            self.assertEqual(self.run_fake(FakeExecutor()), 1)
+        self.assertEqual(self.state()["status"], "stopped")
+        self.assertEqual(self.state()["final_verification_result"]["status"], "passed")
+        self.assertEqual(self.run_fake(FakeExecutor(review_only=True), resume=True), 0)
+        self.assertEqual(self.state()["final_verification_invocations"], 1)
+
+    def test_stop_before_first_task_never_invokes_an_agent(self):
+        from auto_coding import stop_control
+        original = runner.EventLog.emit
+        def emit(events, actor, event, *args, **kwargs):
+            result = original(events, actor, event, *args, **kwargs)
+            if event == "plan_validated":
+                stop_control.request(self.logs, stop_control.identity(self.logs))
+            return result
+        with patch.object(runner.EventLog, "emit", new=emit):
+            self.assertEqual(self.run_fake(FakeExecutor(review_only=True)), 1)
+        self.assertEqual(self.state()["completed"], [])
+        self.assertEqual(self.state()["status"], "stopped")
+        self.assertIsNotNone(self.state()["safe_stop"])
+        self.assertFalse(any(e["event"] in {"process_started", "review_started", "final_verification_started"}
+                             for e in self.events()))
+
+    def test_stop_request_never_clears_uncertain_process_cleanup(self):
+        from auto_coding import stop_control
+        fake = FakeExecutor()
+        def execute(argv, cwd, timeout, **options):
+            result = fake(argv, cwd, timeout, **options)
+            stop_control.request(self.logs, stop_control.identity(self.logs))
+            return runner._CallResult(*result, cleanup_confirmed=False, process_started=True)
+        self.assertEqual(self.run_fake(execute), 1)
+        state = self.state()
+        self.assertIn("uncertain_process", state)
+        self.assertNotIn("safe_stop", state)
+        self.assertIsNotNone(stop_control.pending(self.logs))
+        with self.assertRaises((OSError, PilotError)):
+            self.run_fake(FakeExecutor(review_only=True), resume=True)
+        self.assertIsNotNone(stop_control.pending(self.logs))
+        self.assertNotIn("resumed_stops", self.state())
+
+    def test_completed_run_cannot_receive_stop_and_resume_makes_no_agent_calls(self):
+        from auto_coding import stop_control
+        self.assertEqual(self.run_fake(FakeExecutor()), 0)
+        with self.assertRaisesRegex(ValueError, "Completed"):
+            stop_control.request(self.logs, stop_control.identity(self.logs))
+        self.assertEqual(self.run_fake(FakeExecutor(review_only=True), resume=True), 0)
+        self.assertNotIn("safe_stop", self.state())
+
     def test_successful_a_tests_b_commit(self):
         fake = FakeExecutor()
         self.assertEqual(self.run_fake(fake), 0)

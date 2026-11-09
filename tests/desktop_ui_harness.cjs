@@ -50,6 +50,7 @@ const api = {
   open_run: async (...args) => { calls.push(['open_run', ...args]); return {ok:true, cancelled:true}; },
   start: async (...args) => { calls.push(['start', ...args]); if (launchResult.ok) { data.controller.active = true; data.controller.logs = data.root = 'C:\\runs\\one'; data.exists = true; data.empty = false; } return launchResult; },
   start_audit: async (...args) => { calls.push(['start_audit', ...args]); return launchResult; },
+  stop_after_task: async (...args) => { calls.push(['stop_after_task', ...args]); data.controller.stop_requested = true; return {ok:true}; },
   resume: async (...args) => { calls.push(['resume', ...args]); data.controller.active = true; data.controller.resume_ready = false; return {ok:true}; },
   evidence: async name => { evidenceReads++; return {ok:true, text:'<img src=x onerror=bad()> original evidence: ' + name}; }
 };
@@ -262,6 +263,21 @@ const contents = () => get('app').textContent;
   assert(!calls.some(call => call[0] === 'start'));
   assert(get('auto-push').disabled, 'Publication settings cannot change mid-run');
   assert.equal(get('run-status').textContent, 'Running');
+  data.controller.stop_identity = {run_id:'cli-run', generation:0};
+  data.controller.stop_requested = false;
+  await poll();
+  assert.equal(get('stop').textContent, 'Stop after task');
+  assert.equal(get('stop').disabled, false);
+  await click('stop');
+  assert.equal(calls.at(-1)[0], 'stop_after_task');
+  assert.equal(calls.at(-1)[1].run_id, 'cli-run');
+  assert(get('message').textContent.includes('Stop requested'));
+  await poll();
+  assert.equal(get('stop').textContent, 'Stop requested');
+  assert.equal(get('stop').disabled, true);
+  data.controller.stop_requested = false;
+  delete data.controller.stop_identity;
+
   assert(get('browse-project').disabled && get('resume').disabled);
   data.state = {status:'running', current_task:'task-1', completed:[], history:[
     {task:'task-1', attempt:1, tests:[{index:1, exit_code:1, timed_out:false}],

@@ -22,7 +22,7 @@ from auto_coding.github_workspace import (GitHubWorkspaceManager, storage_root, 
 from auto_coding.process_runner import bounded_run
 from auto_coding.repository_activity import repository_busy
 from auto_coding.launch_preflight import launch_preflight, validate_repository_root
-from auto_coding import run_lifecycle
+from auto_coding import run_lifecycle, stop_control
 from auto_coding.run_launcher import launch_runner
 from auto_coding import plan_audit, simple_run
 from auto_coding.reviewer_permissions import check_audit_model
@@ -505,9 +505,30 @@ class DesktopController:
         # A durable result cannot prove that an active/unknown child is idle.
         outcome = ("unknown" if uncertain or active is None else "active" if active else
                    (state or {}).get("status", "unavailable"))
-        return {"active": active, "uncertain": uncertain, "outcome": outcome,
+        stop = {"stop_identity": None, "stop_requested": False}
+        if self.logs and state:
+            try:
+                stop["stop_identity"] = stop_control.identity(self.logs)
+                stop["stop_requested"] = stop_control.pending(self.logs) is not None
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                stop["stop_error"] = str(exc)
+        return {**stop, "active": active, "uncertain": uncertain, "outcome": outcome,
                 "process_history": list(self.process_history),
                 "exit_code": self.exit_code, "error": self.error}
+
+    def stop_after_task(self, expected) -> dict:
+        with self._lock:
+            try:
+                status = self.poll()
+                # Unknown CLI activity may receive a cooperative request, but it
+                # never authorizes process cleanup, lock removal or resume.
+                if status["active"] is False and not status["uncertain"]:
+                    if not self.logs or not stop_control.pending(self.logs):
+                        raise ValueError("No active run to stop.")
+                record = stop_control.request(self.logs, expected)
+                return {"ok": True, "stop_requested": True, "identity": record}
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                return self._fail(str(exc))
 
     def snapshot(self) -> dict:
         self.poll()

@@ -36,7 +36,7 @@ from auto_coding.launch_preflight import validate_feature_branch, configured_pro
 from auto_coding.sensitive_paths import is_sensitive_path, changed_paths, CHANGE_PATH_OPTIONS
 from auto_coding.final_verification import verification_policy, policy_sha256, unittest_evidence
 from auto_coding import plan_audit
-from auto_coding import controller_test_sandbox
+from auto_coding import controller_test_sandbox, stop_control
 
 
 MAX_PLAN = 512 * 1024
@@ -1975,6 +1975,25 @@ def final_verification(repo, logs, state, state_path, events, execute, tasks):
     return True
 
 
+def stop_at_task_boundary(repo, logs, state, state_path, events):
+    request = stop_control.pending(logs, state)
+    if request is None:
+        return False
+    assert_test_process_safe(repo)
+    assert_process_safe(repo)
+    if any(state.get(key) for key in ("pending_execution", "pending_review", "pending_checkpoint",
+                                      "uncertain_process", "uncertain_test")):
+        raise PilotError("Stop boundary has unresolved execution or checkpoint evidence")
+    if not git_clean(repo):
+        raise PilotError("Stop boundary requires a clean approved checkpoint")
+    state.update(status="stopped", current_task=None, safe_stop=request)
+    save_json(state_path, state)
+    events.emit("controller", "stopped", "success", evidence={"state": "state.json"},
+                metadata={"reason": "stop after task", "stop_request": request})
+    print("STOPPED: Stop after task requested; approved checkpoints retained. Use --resume after inspection.")
+    return True
+
+
 def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False, attempts=3,
         auto_push=None, retry_review_once=False,
         final_verification_config=None, controller_tests=None,
@@ -2123,6 +2142,15 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
             events.emit("controller", "legacy_branch_bound", "observed",
                         metadata={"branch": selected_branch, "reason": "existing Git evidence verified before binding"})
         events.emit("controller", "resume_reconciled", "success", metadata={"completed_tasks": list(state["completed"])})
+        if state.get("safe_stop") is not None:
+            request = stop_control.pending(logs, state)
+            if request != state["safe_stop"]:
+                raise PilotError("Stopped request evidence changed; inspect before resume")
+            state["stop_generation"] = request["generation"] + 1
+            state.setdefault("resumed_stops", []).append(request)
+            del state["safe_stop"]
+            save_json(state_path, state)
+            events.emit("controller", "stop_resumed", "success", metadata={"stop_request": request})
         if state.get("status") == "completed" and not auto_push and final_evidence_valid(repo, logs, state):
             require_run_branch(repo, state["branch"])
             print("Already completed; approved Git checkpoints and final suite evidence verified; no invocation needed")
@@ -2222,6 +2250,9 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
         if ident in state["completed"]:
             continue
         prior = [h for h in state["history"] if h.get("task") == ident]
+        if not prior and not state.get("pending_review") and not state.get("pending_execution"):
+            if stop_at_task_boundary(repo, logs, state, state_path, events):
+                return 1
         state["current_task"] = ident
         if state.get("pending_review"):
             if state["pending_review"].get("task") != ident:
@@ -2418,7 +2449,11 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
     require_run_branch(repo, state["branch"])
     if head(repo) != expected_run_head(state, manifest):
         raise PilotError("Git HEAD changed before run completion")
+    if stop_at_task_boundary(repo, logs, state, state_path, events):
+        return 1
     if not final_verification(repo, logs, state, state_path, events, execute, tasks):
+        return 1
+    if stop_at_task_boundary(repo, logs, state, state_path, events):
         return 1
     state["status"] = "completed"
     state["current_task"] = None

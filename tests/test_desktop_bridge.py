@@ -44,6 +44,16 @@ class FakeController:
 
 
 class DesktopBridgeTests(unittest.TestCase):
+    def test_stop_bridge_forwards_exact_identity_without_launch_or_confirmation(self):
+        controller = FakeController()
+        controller.stop_after_task = Mock(return_value={"ok": True, "stop_requested": True})
+        bridge = Bridge(controller=controller)
+        identity = {"run_id": "selected-run", "generation": 0}
+        self.assertTrue(bridge.stop_after_task(identity)["ok"])
+        controller.stop_after_task.assert_called_once_with(identity)
+        controller.start.assert_not_called()
+        controller.resume.assert_not_called()
+
     def test_reopen_cli_run_preserves_progress_duration_errors_without_launch(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -241,7 +251,7 @@ class DesktopBridgeTests(unittest.TestCase):
     def test_public_bridge_surface_contains_only_scoped_methods(self):
         self.assertEqual({name for name in dir(self.bridge) if not name.startswith("_")},
                          {"select_repo", "select_plan", "open_run", "selected_paths",
-                          "job_status", "start", "start_audit", "resume", "snapshot", "evidence",
+                          "job_status", "start", "start_audit", "resume", "stop_after_task", "snapshot", "evidence",
                           "connect_github", "github_repositories", "github_branches",
                           "create_github_branch", "checkout_github_branch", "fetch_github", "push_approved_commits"})
 

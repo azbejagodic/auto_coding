@@ -51,6 +51,55 @@ class DesktopControlTests(unittest.TestCase):
 
     def tearDown(self): self.temp.cleanup()
 
+    def test_stop_idle_wrong_run_duplicates_and_reopen(self):
+        from auto_coding import stop_control
+        self.assertFalse(self.controller.stop_after_task(None)["ok"])
+        logs = self.runs / "run-cli"
+        logs.mkdir(parents=True)
+        # Stop accepts the same bounded state size as the dashboard reader.
+        state = {"run_id": "cli-run", "repo": str(self.repo), "plan_sha256": "sha", "status": "running",
+                 "diagnostics": "x" * (1024 * 1024)}
+        (logs / "state.json").write_text(json.dumps(state))
+        (logs / "run-manifest.json").write_text(json.dumps({"run_id": "cli-run",
+            "target_repo": str(self.repo), "plan_sha256": "sha"}))
+        self.controller.reopen(logs)
+        binding = self.controller.job_status()["stop_identity"]
+        with patch("auto_coding.desktop_control.Popen") as launch:
+            self.assertFalse(self.controller.stop_after_task(dict(binding, run_id="../other"))["ok"])
+            self.assertTrue(self.controller.stop_after_task(binding)["ok"])
+            request = logs / "stop-request-00000000.json"
+            original = request.read_bytes()
+            self.assertTrue(self.controller.stop_after_task(binding)["ok"])
+            self.assertEqual(request.read_bytes(), original)
+            reopened = DesktopController(self.runs)
+            reopened.reopen(logs)
+            self.assertTrue(reopened.job_status()["stop_requested"])
+            launch.assert_not_called()
+        self.assertEqual(stop_control.pending(logs), binding)
+        state["status"] = "completed"
+        (logs / "state.json").write_text(json.dumps(state))
+        self.assertFalse(self.controller.stop_after_task(binding)["ok"])
+
+    def test_stop_rejects_checkout_storage_and_other_run_evidence(self):
+        from auto_coding import stop_control
+        logs = self.repo / "logs"
+        logs.mkdir()
+        state = {"run_id": "one", "repo": str(self.repo), "plan_sha256": "sha"}
+        manifest = {"run_id": "one", "target_repo": str(self.repo), "plan_sha256": "sha"}
+        (logs / "state.json").write_text(json.dumps(state))
+        (logs / "run-manifest.json").write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, "outside"):
+            stop_control.identity(logs)
+        external = self.root / "external"
+        external.mkdir()
+        (external / "state.json").write_text(json.dumps(state))
+        (external / "run-manifest.json").write_text(json.dumps(manifest))
+        binding = stop_control.identity(external)
+        (external / "stop-request-00000000.json").write_text(json.dumps(dict(binding, logs="../other")))
+        with self.assertRaisesRegex(ValueError, "another run"):
+            stop_control.request(external, binding)
+
+
     @patch("auto_coding.desktop_control.Popen", side_effect=FakeProcess)
     def test_explicit_auto_push_arguments_and_locked_resume_settings(self, popen):
         self.controller.repository = "owner/repo"

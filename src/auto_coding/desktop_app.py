@@ -153,7 +153,7 @@ progress{width:100%;height:12px;accent-color:#72adf9}
 <button id="download-logs" disabled aria-describedby="run-unavailable">Download Logs</button>
 </div>
 <p id="start-reason" class="muted">Start requires verified audit approval for the exact selected plan and target, and native authorization.</p>
-<p id="run-unavailable" class="muted">Desktop stop and log download are not wired yet. Read recorded evidence in Logs.</p>
+<p id="run-unavailable" class="muted">Stop finishes the current task: executing A/B calls and safe checkpoint handling may finish first. Log download is not wired yet.</p>
 <dl class="run-summary">
 <div><dt>Status</dt><dd id="run-status" role="status" aria-live="polite">Idle</dd></div>
 <div><dt>Task current/total</dt><dd id="run-task" role="status" aria-live="polite">-- / --</dd></div>
@@ -324,6 +324,8 @@ function updateControls() {
   document.getElementById('start-reason').textContent = c.start_reason || 'Start requires verified audit approval for the exact selected inputs and native authorization.';
   document.getElementById('resume').disabled = locked || !c.resume_ready || !validAttempts;
   document.getElementById('resume').textContent = latest?.state?.publication?.outcome === 'pending' ? 'Retry Push' : 'Resume';
+  document.getElementById('stop').disabled = busy || !ready || !c.stop_identity || c.stop_requested || latest?.state?.status === 'completed' || (c.active !== true && !c.uncertain);
+  document.getElementById('stop').textContent = c.stop_requested ? 'Stop requested' : 'Stop after task';
   document.getElementById('refresh').disabled = busy || !ready;
 }
 function validateAttempts() {
@@ -581,22 +583,23 @@ async function refresh(clearMessage = true) {
 async function act(method) {
   if (busy || !ready) return;
   if (['start', 'resume'].includes(method) && !validateAttempts()) { updateControls(); return; }
-  const button = {'select_repo':'browse-project', 'select_plan':'browse-plan', 'open_run':'open-run', start:'start', resume:'resume', start_audit:'start-audit'}[method];
+  const button = {'select_repo':'browse-project', 'select_plan':'browse-plan', 'open_run':'open-run', start:'start', resume:'resume', start_audit:'start-audit', stop_after_task:'stop'}[method];
   if (document.getElementById(button).disabled) return;
   busy = true;
   updateControls();
   let accepted = false;
-  message(method === 'start' || method === 'resume' ? 'Waiting for native launch confirmation...' : 'Waiting for selection...');
+  message(method === 'start' || method === 'resume' ? 'Waiting for native launch confirmation...' : method === 'stop_after_task' ? 'Saving stop request...' : 'Waiting for selection...');
   try {
     if (refreshing) await refreshing;
     const args = method === 'start' || method === 'resume' ? [Number(document.getElementById('attempts').value)] : [];
+    if (method === 'stop_after_task') args.push(latest?.controller?.stop_identity);
     if (method === 'start_audit') args.push(document.getElementById('audit-model').value.trim(), document.getElementById('audit-goal').value);
     if (method === 'start' && document.getElementById('auto-push').checked === true) args.push(true);
     const result = await window.pywebview.api[method](...args);
     accepted = result.ok && !result.cancelled;
     if (accepted) document.getElementById('auto-push').checked = false;
     if (args.length && accepted) navigate('overview');
-    message(result.cancelled ? 'Cancelled. No work launched.' : result.error || result.warning || (result.ok ? (args.length ? 'Launch accepted. Waiting for durable runner progress.' : 'Selection updated. No work launched.') : 'Action failed.'), !result.ok && !result.cancelled);
+    message(result.cancelled ? 'Cancelled. No work launched.' : result.error || result.warning || (method === 'stop_after_task' && result.ok ? 'Stop requested. Executing A/B calls and safe checkpoint handling may finish first.' : '') || (result.ok ? (args.length ? 'Launch accepted. Waiting for durable runner progress.' : 'Selection updated. No work launched.') : 'Action failed.'), !result.ok && !result.cancelled);
   } catch (error) { message('Action failed: ' + error, true); }
   finally {
     busy = false;
@@ -665,7 +668,7 @@ document.getElementById('push-approved').onclick = () => workspaceAction('push_a
 document.getElementById('refresh').onclick = refresh;
 document.getElementById('attempts').oninput = updateControls;
 ['overview', 'tasks', 'logs'].forEach(name => { document.getElementById('nav-' + name).onclick = () => navigate(name); });
-Object.entries({'browse-project':'select_repo', 'browse-plan':'select_plan', 'open-run':'open_run', start:'start', resume:'resume', 'start-audit':'start_audit'}).forEach(([id, method]) => { document.getElementById(id).onclick = () => act(method); });
+Object.entries({'browse-project':'select_repo', 'browse-plan':'select_plan', 'open-run':'open_run', start:'start', resume:'resume', stop:'stop_after_task', 'start-audit':'start_audit'}).forEach(([id, method]) => { document.getElementById(id).onclick = () => act(method); });
 document.getElementById('audit-model').oninput = updateControls;
 updateControls();
 window.addEventListener('pywebviewready', () => { ready = true; refresh(); });
@@ -954,6 +957,13 @@ class Bridge:
             return self._failure(exc)
         finally:
             self._launch_lock.release()
+
+    def stop_after_task(self, expected):
+        with self._lock:
+            try:
+                return self._controller.stop_after_task(expected)
+            except Exception as exc:
+                return self._failure(exc)
 
     def resume(self, attempts=3):
         return self._launch("resume", attempts)
