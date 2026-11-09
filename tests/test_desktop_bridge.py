@@ -18,6 +18,8 @@ class FakeController:
         self.result = {"ok": True, "error": None, "argv": ["fake-runner"]}
         self.start = Mock(return_value=self.result)
         self.resume = Mock(return_value=self.result)
+        self.audit_status = Mock(return_value={"start_approved": True,
+            "directory": "verified-fixture", "identity": {"plan_sha256": "fixture"}})
         self.job_status = Mock(return_value={"active": False, "uncertain": False,
                                            "exit_code": None, "error": None})
 
@@ -596,6 +598,45 @@ class DurableAuditBridgeTests(unittest.TestCase):
         with patch("auto_coding.desktop_control.Popen") as spawn:
             self.assertFalse(self.bridge.start()["ok"])
             spawn.assert_not_called()
+
+    def test_confirmation_names_approval_and_cancellation_creates_no_run(self):
+        evidence = self.save_evidence()
+        self.dialogs.confirm.return_value = False
+        with patch("auto_coding.desktop_control.Popen") as spawn:
+            self.assertTrue(self.bridge.start(4)["cancelled"])
+            spawn.assert_not_called()
+        text = self.dialogs.confirm.call_args.args[0]
+        for value in (str(self.repo), str(self.plan), str(self.directory),
+                      self.target["branch"], evidence["identity"]["plan_sha256"], "Attempts: 4"):
+            self.assertIn(value, text)
+        self.assertFalse(self.controller.runs_dir.exists())
+
+    def test_different_valid_approval_during_confirmation_needs_new_consent(self):
+        self.save_evidence()
+        def replace_approval(_):
+            self.plan.write_text(self.plan.read_text() + "\n")
+            self.save_evidence()
+            self.assertTrue(self.controller.audit_status()["start_approved"])
+            return True
+        self.dialogs.confirm.side_effect = replace_approval
+        with patch("auto_coding.desktop_control.Popen") as spawn:
+            result = self.bridge.start()
+            self.assertFalse(result["ok"])
+            self.assertIn("changed during confirmation", result["error"])
+            spawn.assert_not_called()
+
+    def test_old_stopped_run_cannot_borrow_approval_for_new_start(self):
+        self.save_evidence()
+        old = self.root / "run-old"
+        old.mkdir()
+        self.engine.save_json(old / "state.json", {"status": "stopped",
+            "repo": str(self.repo), "plan_sha256": self.engine.load_tasks(self.plan)[1],
+            "completed": [], "history": []})
+        self.controller.logs = old
+        with patch("auto_coding.desktop_control.Popen") as spawn:
+            self.assertFalse(self.controller.start()["ok"])
+            spawn.assert_not_called()
+        self.assertFalse(self.controller.audit_status()["start_approved"])
 
 
 if __name__ == "__main__":

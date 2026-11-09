@@ -4,11 +4,13 @@ import copy
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from auto_coding import simple_run as runner
 from auto_coding import plan_audit as audit
@@ -163,6 +165,111 @@ class PlanAuditTests(unittest.TestCase):
         self.assertEqual(self.start(fake, resume=True), 0)
         self.assertEqual(len(self.calls), 1)
         self.assertEqual(len(fake.calls), 5)
+
+    def cli_audit(self):
+        # The PowerShell command enters this same main() path. Only execution
+        # is replaced; real Git, reservation, ledger and evidence code runs.
+        original = runner.audit
+        with patch.object(runner.shutil, "which", return_value="fake-codex"), patch.object(
+                runner, "audit", side_effect=lambda *a, **kw: original(*a, execute=self.execute, **kw)), \
+                contextlib.redirect_stdout(io.StringIO()):
+            return runner.main(["audit", "--repo", str(self.repo), "--logs", str(self.logs),
+                                "--audit-model", "fake-audit-model", str(self.plan)])
+
+    def test_powershell_audit_gui_start_and_authorized_resume_share_runner(self):
+        from auto_coding.desktop_app import Bridge
+        from auto_coding.desktop_control import DesktopController
+        self.assertEqual(self.cli_audit(), 0)
+        evidence_before = (self.logs / "audit-evidence.json").read_bytes()
+        controller = DesktopController(self.root / "desktop-runs")
+        controller.repo, controller.plan = self.repo, self.plan
+        dialogs = Mock()
+        dialogs.confirm.return_value = True
+        bridge = Bridge(controller=controller, dialogs=dialogs)
+        self.assertTrue(bridge.job_status()["start_ready"])
+        process = Mock(pid=424242)
+        process.poll.return_value = None
+        with patch("auto_coding.desktop_control.Popen", return_value=process) as spawn:
+            launched = bridge.start(4)
+            self.assertTrue(launched["ok"], launched)
+            self.assertFalse(bridge.start()["ok"])
+            spawn.assert_called_once()
+        argv = launched["argv"]
+        self.assertEqual(argv, [sys.executable, "-B", "-m", "auto_coding.simple_run",
+            "--repo", str(self.repo), "--logs", str(controller.logs), "--attempts", "4",
+            "--approved-audit", str(self.logs), str(self.plan)])
+        executor = Executor()
+        original = runner.run
+        # Run the exact GUI child command through the same CLI start parser,
+        # claiming its reservation, with deterministic A/B and test results.
+        with patch.dict(os.environ, spawn.call_args.kwargs["env"]), patch.object(
+                runner.shutil, "which", return_value="fake-codex"), patch.object(
+                runner, "run", side_effect=lambda *a, **kw: original(*a, execute=executor, **kw)), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(runner.main(["start", *argv[4:]]), 0)
+        self.assertEqual(executor.calls, ["A", "B", "A", "B", "final"])
+        self.assertEqual((self.logs / "audit-evidence.json").read_bytes(), evidence_before)
+        self.assertEqual(len(self.calls), 1)
+        process.poll.return_value = 0
+        controller.poll()
+        state_path = controller.logs / "state.json"
+        state = audit.read_json(state_path)
+        state["status"] = "stopped"
+        runner.save_json(state_path, state)
+        reopened = DesktopController(controller.runs_dir)
+        self.assertTrue(reopened.reopen(controller.logs)["ok"])
+        # Changed HEAD from approved checkpoints is valid only for this resume.
+        self.assertFalse(reopened.audit_status()["start_approved"])
+        with patch("auto_coding.desktop_control.Popen", return_value=process) as spawn:
+            resumed = Bridge(controller=reopened, dialogs=dialogs).resume(4)
+            self.assertTrue(resumed["ok"], resumed)
+        self.assertIn("--resume", resumed["argv"])
+        self.assertNotIn("--approved-audit", resumed["argv"])
+        with patch.dict(os.environ, spawn.call_args.kwargs["env"]), patch.object(
+                runner.shutil, "which", return_value="fake-codex"), patch.object(
+                runner, "run", side_effect=lambda *a, **kw: original(*a, execute=executor, **kw)), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(runner.main(["start", *resumed["argv"][4:]]), 0)
+        self.assertEqual(executor.calls, ["A", "B", "A", "B", "final"])
+        self.assertEqual(len(self.calls), 1)
+
+    def test_cli_and_gui_refuse_missing_and_stale_powershell_approval(self):
+        from auto_coding.desktop_control import DesktopController
+        controller = DesktopController(self.root / "desktop-runs")
+        controller.repo, controller.plan = self.repo, self.plan
+        original = runner.run
+        executor = Executor()
+        for change in ("missing", "plan", "head", "branch", "dirty", "policy"):
+            with self.subTest(change=change):
+                if change != "missing":
+                    # Each case changes inputs from the most recent approval.
+                    self.assertEqual(self.cli_audit(), 0)
+                    self.logs = Path(audit.read_json(audit.ledger_path(self.repo, self.identity()))["directory"])
+                if change == "plan":
+                    self.plan.write_text(self.plan.read_text() + "\n")
+                elif change == "head":
+                    self.git("commit", "--allow-empty", "-m", "changed after audit")
+                elif change == "branch":
+                    self.git("checkout", "-b", "feature/changed")
+                elif change == "dirty":
+                    (self.repo / "seed.txt").write_text("dirty")
+                elif change == "policy":
+                    document = json.loads(self.plan.read_text())
+                    document["final_verification"]["test_commands"] = [["changed-final"]]
+                    self.plan.write_text(json.dumps(document))
+                with patch("auto_coding.desktop_control.Popen") as spawn:
+                    self.assertFalse(controller.start()["ok"])
+                    spawn.assert_not_called()
+                with patch.object(runner.shutil, "which", return_value="fake-codex"), patch.object(
+                        runner, "run", side_effect=lambda *a, **kw: original(*a, execute=executor, **kw)), \
+                        contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(runner.main(["start", "--repo", str(self.repo), "--logs",
+                        str(self.root / ("blocked-" + change)), "--approved-audit", str(self.logs), str(self.plan)]), 1)
+                if change == "dirty":
+                    (self.repo / "seed.txt").write_text("seed")
+                # Audit outputs must be empty for a new identity, as in CLI use.
+                self.logs = self.root / ("audit-after-" + change)
+        self.assertEqual(executor.calls, [])
 
     def test_three_dependent_tasks_audit_checkpoints_real_final_suite_and_reopen(self):
         source = self.repo / "pricing.py"

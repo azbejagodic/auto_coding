@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import threading
 from pathlib import Path
@@ -861,10 +862,18 @@ class Bridge:
                 if action == "resume" and self._controller.logs:
                     auto_push = bool(read_run(self._controller.logs).get("state", {}).get("auto_push"))
                 branch = self._controller.preflight()["branch"]
-                message = (f"{action.upper()} the local runner?\nRepository: {getattr(self._controller, 'repository', None) or paths['repo']}"
+                approval = None
+                if action == "start":
+                    approval = self._controller.audit_status()
+                    if not approval.get("start_approved"):
+                        raise ValueError(approval.get("error") or "Start requires verified APPROVE audit evidence.")
+                message = (f"{action.upper()} the local runner?\nRepository: {paths['repo']}"
                            f"\nBranch: {branch or 'Unknown (launch will be blocked)'}"
                            f"\nPlan: {paths['plan']}\nSelected logs: {paths['logs']}"
-                           f"\nAttempts: {attempts}\nThe runner may modify and commit project files."
+                           + (f"\nApproved audit: {approval['directory']}"
+                              f"\nAudit identity: {json.dumps(approval.get('identity'), sort_keys=True)}"
+                              if approval is not None else "\nResume uses this run's persisted authorization and recovery checks.")
+                           + f"\nAttempts: {attempts}\nThe runner may modify and commit project files."
                            + ("\nAutomatically push approved tasks: ENABLED for this run to origin/" + str(branch)
                             if auto_push else "\nCheckpoints remain local. No automatic push, merge, force-push or branch creation.")
                            + "\nNO automatic main merge or force push."
@@ -876,6 +885,11 @@ class Bridge:
                     return {"ok": False, "cancelled": True, "error": "Launch cancelled."}
                 if self._controller.preflight()["branch"] != branch:
                     raise ValueError("Git branch changed during confirmation. Inspect the current branch and confirm again.")
+                if approval is not None:
+                    current = self._controller.audit_status()
+                    if (not current.get("start_approved")
+                            or any(current.get(key) != approval.get(key) for key in ("identity", "directory"))):
+                        raise ValueError("Approved audit changed during confirmation. Inspect the selected inputs and confirm again.")
                 options = {"attempts": attempts}
                 if action == "start" and auto_push:
                     options["auto_push"] = True
