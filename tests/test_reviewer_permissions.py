@@ -269,7 +269,8 @@ class ReviewerFlowTests(unittest.TestCase):
     def test_production_wrapper_requires_verification_and_checks_configuration(self):
         execute = recovery.FakeExecutor([recovery.APPROVED] * 3)
         execute.__wrapped__ = runner.call
-        with approved_plan_fixture(), patch.object(runner, "check_cli", return_value="codex") as checker, \
+        with approved_plan_fixture(), patch.object(runner, "new_workflow_test_mode", return_value=True), \
+                patch.object(runner, "check_cli", return_value="codex") as checker, \
                 patch.object(runner, "probe_review_storage") as storage, \
                 patch.object(runner.controller_test_sandbox, "run", side_effect=lambda command, repo, logs, timeout, **kw:
                              kw["launch"](command, repo, timeout)) as test_sandbox, \

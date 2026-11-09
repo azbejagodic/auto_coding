@@ -155,14 +155,13 @@ def controller_commands(task, state):
 
 
 def new_workflow_test_mode(plan, tasks, controller_tests):
-    """Require approved focused checks for new JSON runs, not saved workflows."""
+    """Require implementer-focused testing for new runs, not saved workflows."""
+    if controller_tests is True:
+        raise PilotError("New workflows require Codex A-focused testing; controller tests are only supported for saved workflows")
     if plan.suffix.lower() == ".json":
-        if controller_tests is False:
-            raise PilotError("New JSON workflows require controller-managed focused tests")
         if any(not task["test_commands"] for task in tasks):
             raise PilotError("Every task in a new JSON workflow requires at least one focused test_commands entry")
-        return True
-    return controller_tests if controller_tests is not None else False
+    return False
 
 
 def save_json(path: Path, value: dict) -> None:
@@ -2518,7 +2517,7 @@ def main(argv=None):
     parser.add_argument("--max-observed-tokens", type=int,
                         help="Stop new A/B calls once observed input plus output tokens reach this limit; missing usage also stops calls")
     parser.add_argument("--controller-tests", action="store_true", default=None,
-                        help="Controller-managed focused checks (required for new JSON workflows; resume preserves saved mode)")
+                        help="Retain controller-managed focused checks for a saved workflow; new workflows require Codex A-focused testing")
     parser.add_argument("--final-verification-config", type=Path,
                         help="JSON verification policy for TXT/MD or legacy plans; saved for subsequent resume")
     parser.add_argument("--model-a")

@@ -1,11 +1,11 @@
 """Explicit final-suite double for pre-existing task-flow regression fixtures.
 
-These tests opt in to controller focused checks to retain their original safety
-assertions. Final-gate failures and scheduling are tested with the real run API
+These tests construct historical controller-tested workflows to retain their
+original safety assertions. Final-gate failures and scheduling use the real run API
 in test_final_verification, without this helper.
 """
 import json
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from unittest.mock import patch
 
@@ -54,5 +54,9 @@ def run_with_verification(plan, repo, logs, **kwargs):
             return runner._CallResult(0, "Ran 1 test in 0.001s\n\nOK\n", False, True, True)
         return execute(argv, cwd, timeout, **options)
     kwargs["execute"] = with_final
-    with approved_plan_fixture():
+    # Only fixture creation uses the historical mode selector. Production resume,
+    # test execution, evidence validation and recovery remain unchanged.
+    historical_mode = (patch.object(runner, "new_workflow_test_mode", return_value=True)
+                       if kwargs["controller_tests"] is True else nullcontext())
+    with approved_plan_fixture(), historical_mode:
         return runner.run(plan, repo, logs, **kwargs)

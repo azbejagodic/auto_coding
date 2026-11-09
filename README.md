@@ -6,7 +6,7 @@
 
 | Capability | Existing implementation |
 | --- | --- |
-| JSON task loading, A → tests → B, corrections, budgets, local Git checkpoints | `src/auto_coding/simple_run.py` |
+| JSON task loading, A with focused tests → B, corrections, budgets, local Git checkpoints | `src/auto_coding/simple_run.py` |
 | One-time, read-only plan audit and approval binding | `src/auto_coding/plan_audit.py` |
 | Windows MXC controller-run tests and structured launch errors | `src/auto_coding/controller_test_sandbox.py` |
 | Sanitized Python/test environment | `src/auto_coding/python_environment.py` |
@@ -15,7 +15,7 @@
 | Existing desktop UI and bridge | `src/auto_coding/desktop_app.py`, `desktop_control.py`, `desktop_reader.py` |
 | Usage/event records and final-suite verification | `src/auto_coding/metrics.py`, `event_log.py`, `final_verification.py` |
 
-**Plan rule:** Inspect relevant source and tests first. Extend existing functionality; don't ask Codex A to rebuild the runner, audit, review, Git management, or desktop bridge. A implements code on the controller-selected branch; the **controller** owns tests, B review, commits and recovery. No Git branch creation, resets or commits inside task prompts.
+**Plan rule:** Inspect relevant source and tests first. Extend existing functionality; don't ask Codex A to rebuild the runner, audit, review, Git management, or desktop bridge. A implements code and runs the configured focused tests on the controller-selected branch; the **controller** owns B review, commits, recovery and the final verification suite. New workflows require this mode; saved workflows retain their recorded testing mode. No Git branch creation, resets or commits inside task prompts.
 
 ## Accepted JSON shape
 
@@ -39,7 +39,7 @@
 This is a **shape example**, not a ready-to-run plan: replace the example test commands and `minimum_tests` with real evidence-backed project values.
 
 - Top level: `tasks` and `final_verification` (required for new approved JSON runs); **1–30 tasks**; JSON file at most **128 KiB** for audit (**512 KiB** loader limit).
-- Each task: unique `id`, nonempty `prompt`, and meaningful `test_commands`. Commands are arrays of arguments, **not shell strings**; max **10 commands per task**, max **32 arguments per command**.
+- Each task: unique `id`, nonempty `prompt`, and meaningful `test_commands` for Codex A to execute and report. Commands are arrays of arguments, **not shell strings**; max **10 commands per task**, max **32 arguments per command**.
 - `final_verification`: `test_commands` (1–10), `minimum_tests` (positive integer), optional `timeout_seconds` (30–86400).
 - **Current limitation:** final verification recognizes **Python `unittest` summaries**, requires enough tests and no skips. Arbitrary build/test commands can be used for focused tests, but other languages need compatible, genuinely meaningful final verification before an autonomous run.
 

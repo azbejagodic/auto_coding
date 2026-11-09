@@ -282,7 +282,9 @@ class PythonEnvironmentTests(unittest.TestCase):
                 patch.dict(os.environ, {"OPENAI_API_KEY": "harmless-canary",
                                      "GITHUB_TOKEN": "harmless-github-canary"}), \
                 contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(runner.run(plan, self.target, logs, execute=execute, controller_tests=True), 1)
+            # Construct historical controller-tested state; resume below is unpatched.
+            with patch.object(runner, "new_workflow_test_mode", return_value=True):
+                self.assertEqual(runner.run(plan, self.target, logs, execute=execute, controller_tests=True), 1)
             self.assertEqual(calls, ["A", "focused", "B", "final"])
             self.assertEqual(runner.run(plan, self.target, logs, execute=execute, resume=True), 0)
             self.assertEqual(calls, ["A", "focused", "B", "final", "final"])
