@@ -201,16 +201,14 @@ def prepare_review(argv, repo, logs, git, *, check=check_cli):
         for setting in settings:
             command.extend(["-c", setting])
         spec.argv = [*command, argv[-1]]
-        spec.instructions = (f"\n\nREVIEW TEST ENVIRONMENT: target cwd is {repo}; writable scratch is {scratch}; "
+        spec.instructions = (f"\n\nCODE REVIEW ENVIRONMENT: target cwd is {repo}; writable scratch is {scratch}; "
             f"TEMP/TMP/TMPDIR must resolve to {scratch / 'tmp'}. Keep the supplied target PYTHONPATH. "
-            "Run configured tests against the actual target, never a copy. Do not modify source or Git metadata. "
-            "Report verification={status,details}: passed only for tests actually executed successfully; "
-            "failed for implementation failures; environment_blocked for permission/tooling setup failures; "
-            "not_run for unexecuted tests. Give commands and results in details. Put genuine code blockers "
-            "in issues even when testing is blocked. If no code blocker is established, use APPROVED with "
-            "empty issues and the truthful verification status; blocked/unexecuted testing cannot authorize "
-            "a commit. Do not repeatedly rerun suites after a shared setup failure. Missing code/dependencies "
-            "required by the task remain implementation blockers, not environment excuses.")
+            "Do not modify source or Git metadata. Do not execute tests, linting, builds or verification commands. "
+            "Existing tests and Codex A's test report may be read as context; the report contains implementer claims. "
+            "Report verification={status,details} with status=not_run: explain that testing is intentionally assigned "
+            "to Codex A and the final controller suite. Do not require extra coverage or independent test execution "
+            "for approval. Put concrete implementation defects or unmet task requirements in issues; otherwise "
+            "use APPROVED with empty issues. Never claim unexecuted tests passed.")
         return spec
     except BaseException as exc:
         # A failed config probe may itself have unverified descendants. Retain its scratch.

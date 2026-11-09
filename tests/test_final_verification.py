@@ -17,6 +17,9 @@ from backend_fixtures import approved_plan_fixture
 PASSED = "Ran 2 tests in 0.002s\n\nOK\n"
 FAILED = "Ran 2 tests in 0.002s\n\nFAILED (failures=1)\n"
 POLICY = {"test_commands": [["fake-final"]], "minimum_tests": 2, "timeout_seconds": 2400}
+CODE_REVIEW_APPROVED = {"decision": "APPROVED", "issues": [],
+                        "summary": "Requirements met; optional extra coverage is not a blocker",
+                        "verification": {"status": "not_run", "details": "Code review only; B did not execute tests"}}
 
 
 class Executor:
@@ -171,6 +174,78 @@ class FinalVerificationTests(unittest.TestCase):
         self.assertEqual(state["final_verification_result"]["test_count"], 2)
         names = [event["event"] for event in self.events()]
         self.assertLess(names.index("checkpoint_committed"), names.index("final_verification_started"))
+
+    def test_production_code_review_not_run_approval_checkpoints_then_final_suite(self):
+        fake = Executor(reviews=[CODE_REVIEW_APPROVED])
+        def execute(argv, cwd, timeout, *, prompt=None):
+            if "--output-schema" in argv:
+                self.assertNotIn("--sandbox", argv)
+                self.assertIn('--strict-config', argv)
+                self.assertTrue(any('extends=":read-only"' in part for part in argv))
+                self.assertTrue(any('network={enabled=false}' in part for part in argv))
+            return fake(argv, cwd, timeout, prompt=prompt)
+        execute.__wrapped__ = runner.call
+        with patch.object(runner, "check_cli", return_value="fake-codex"), \
+                patch.object(runner, "probe_review_storage"), \
+                patch.object(runner.controller_test_sandbox, "run", side_effect=lambda command, repo, logs, timeout, **kw:
+                             kw["launch"](command, repo, timeout)) as sandbox:
+            self.assertEqual(self.run_fake(execute), 0)
+        self.assertEqual(fake.calls, ["A", "B", "final"])
+        self.assertEqual(sandbox.call_count, 1)
+        self.assertEqual(sandbox.call_args.args[0], ["fake-final"])
+        prompt = fake.b_prompts[0]
+        for text in ("READ-ONLY code reviewer", "Do not execute tests, linting, builds or verification commands",
+                     "CODE REVIEW ENVIRONMENT", "status=not_run", "extra test modules or optional coverage",
+                     "implementer claims, not independently verified evidence"):
+            self.assertIn(text, prompt)
+        for text in ("Run configured tests", "minimal relevant checks", "significant missing test coverage",
+                     "blocked/unexecuted testing cannot authorize", "independently check):"):
+            self.assertNotIn(text, prompt)
+        state = self.state()
+        self.assertEqual(state["history"][0]["review"], CODE_REVIEW_APPROVED)
+        self.assertEqual(state["history"][0]["tests"], [])
+        self.assertEqual(state["status"], "completed")
+        self.assertEqual(state["final_verification_result"]["head"], state["history"][0]["commit"])
+        self.assertNotEqual(self.git("rev-parse", "HEAD"), self.initial)
+
+    def test_new_mode_failed_or_blocked_verification_cannot_authorize_commit(self):
+        for index, status in enumerate(("failed", "environment_blocked")):
+            with self.subTest(status=status):
+                answer = CODE_REVIEW_APPROVED | {"verification": {"status": status, "details": "Reported failure"}}
+                fake = Executor(reviews=[answer])
+                self.assertEqual(self.run_fake(fake, resume=bool(index)), 1)
+                self.assertEqual(fake.calls, ["B"] if index else ["A", "B"])
+                self.assertEqual(self.state()["completed"], [])
+                self.assertEqual(self.state()["pending_review"]["review_failure_kind"], "verification_" + status)
+                self.assertEqual(self.git("rev-parse", "HEAD"), self.initial)
+
+    def test_saved_not_run_verdict_integrity_and_resume_without_new_review(self):
+        fake = Executor(reviews=[CODE_REVIEW_APPROVED])
+        with patch.object(runner, "finish_review_verdict", side_effect=RuntimeError("interrupted before disposition")):
+            with self.assertRaisesRegex(RuntimeError, "interrupted before disposition"):
+                self.run_fake(fake)
+        verdict = self.logs / "one-01-b-verdict.json"
+        original = verdict.read_text()
+        verdict.write_text(json.dumps(CODE_REVIEW_APPROVED | {"summary": "altered approval"}))
+        execute = Mock()
+        with self.assertRaisesRegex(runner.PilotError, "Saved review response changed"):
+            self.run_fake(execute, resume=True)
+        execute.assert_not_called()
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.initial)
+        verdict.write_text(original)
+        self.assertEqual(self.run_fake(fake, resume=True), 0)
+        self.assertEqual(fake.calls, ["A", "B", "final"])
+        self.assertEqual(self.state()["history"][0]["review"], CODE_REVIEW_APPROVED)
+
+    def test_new_mode_reviewer_mutation_still_blocks_not_run_approval(self):
+        def hook(role):
+            if role == "B":
+                (self.repo / "app.py").write_text("unauthorized reviewer mutation")
+        fake = Executor(reviews=[CODE_REVIEW_APPROVED], hook=hook)
+        with self.assertRaisesRegex(runner.PilotError, "unstaged or untracked"):
+            self.run_fake(fake)
+        self.assertEqual(fake.calls, ["A", "B"])
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.initial)
 
     def test_saved_controller_failed_checks_return_to_a_before_b(self):
         fake = Executor(focused=[runner._CallResult(1, "focused regression failed", False, True, True)])
@@ -374,10 +449,17 @@ class FinalVerificationTests(unittest.TestCase):
         self.assertEqual(self.state()["final_verification"]["timeout_seconds"], 2400)
 
     def test_b_rejection_requires_fresh_a_report_and_independent_review(self):
-        fake = Executor(reviews=[{"decision": "REJECTED", "issues": ["Fix app.py version behavior"], "summary": "Incorrect"}])
+        self.document["tasks"][0]["prompt"] = "Set app.py VERSION = 2"
+        self.write_plan()
+        issue = "app.py:1 VERSION is 1; the task requires 2. Set VERSION = 2 to fix version behavior."
+        fake = Executor(reviews=[{"decision": "REJECTED", "issues": [issue], "summary": "Incorrect",
+                                 "verification": CODE_REVIEW_APPROVED["verification"]}, CODE_REVIEW_APPROVED])
         self.assertEqual(self.run_fake(fake), 0)
         self.assertEqual(fake.calls, ["A", "B", "A", "B", "final"])
-        self.assertIn("version behavior", fake.a_prompts[1])
+        self.assertIn(issue, fake.a_prompts[1])
+        self.assertIn("+VERSION = 1", fake.b_prompts[0])
+        self.assertIn("+VERSION = 2", fake.b_prompts[1])
+        self.assertEqual((self.repo / "app.py").read_text(), "VERSION = 2\n")
         self.assertIn("implementation 2", fake.b_prompts[1])
         self.assertNotEqual(self.state()["history"][0]["a_report"], self.state()["history"][1]["a_report"])
 
@@ -389,7 +471,7 @@ class FinalVerificationTests(unittest.TestCase):
         self.assertNotEqual(self.state()["status"], "completed")
 
     def test_review_only_recovery_preserves_mode_timeout_and_implementation(self):
-        fake = Executor(reviews=[runner._CallResult(127, "connection unavailable", False, True, False)])
+        fake = Executor(reviews=[runner._CallResult(127, "connection unavailable", False, True, False), CODE_REVIEW_APPROVED])
         self.assertEqual(self.run_fake(fake), 1)
         self.assertTrue(self.state()["pending_review"])
         self.assertEqual(self.run_fake(fake, resume=True), 0)

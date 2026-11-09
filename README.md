@@ -17,6 +17,8 @@
 
 **Plan rule:** Inspect relevant source and tests first. Extend existing functionality; don't ask Codex A to rebuild the runner, audit, review, Git management, or desktop bridge. A implements code and runs the configured focused tests on the controller-selected branch; the **controller** owns B review, commits, recovery and the final verification suite. New workflows require this mode; saved workflows retain their recorded testing mode. No Git branch creation, resets or commits inside task prompts.
 
+For new workflows, Codex B reviews code and task requirements without executing tests, linting or builds, or demanding optional coverage. It may read tests and A's reported results as context; those remain implementer claims. A code review can approve with `verification.status = "not_run"`. Concrete defects still block approval, and the controller's final suite remains required. Historical controller-tested workflows retain their verification gates.
+
 ## Accepted JSON shape
 
 ```json

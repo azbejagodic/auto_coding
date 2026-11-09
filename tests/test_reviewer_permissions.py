@@ -65,7 +65,10 @@ class ReviewerPermissionsTests(unittest.TestCase):
         self.assertEqual(spec.environment["TEMP"], str(spec.scratch / "tmp"))
         self.assertEqual([spec.environment[key] for key in ("TEMP", "TMP", "TMPDIR")], [str(spec.scratch / "tmp")] * 3)
         self.assertFalse(spec.scratch.is_relative_to(self.repo))
-        self.assertIn("environment_blocked", spec.instructions)
+        self.assertIn("status=not_run", spec.instructions)
+        self.assertIn("Do not execute tests, linting, builds or verification commands", spec.instructions)
+        self.assertNotIn("Run configured tests", spec.instructions)
+        self.assertNotIn("blocked/unexecuted testing cannot authorize", spec.instructions)
 
     def test_config_conflicts_and_extra_write_grants_fail_closed(self):
         scratch = self.logs / "scratch"

@@ -668,9 +668,7 @@ class ReviewRecoveryTests(unittest.TestCase):
 
     def test_implementer_prompt_limits_scope_and_requires_focused_verification_and_diff_review(self):
         fake = FakeExecutor()
-        # Historical implementer-tested workflow; new JSON runs cannot select it.
-        with patch.object(runner, "new_workflow_test_mode", return_value=False):
-            self.assertEqual(self.run_fake(fake, controller_tests=False), 0)
+        self.assertEqual(self.run_fake(fake, controller_tests=False), 0)
         prompt = fake.a_prompts[0]
         for text in ("only this task and necessary related changes", "focused tests relevant to modified behavior",
                      "Avoid the full test suite during individual tasks", "unless explicitly required or justified",
@@ -683,9 +681,9 @@ class ReviewRecoveryTests(unittest.TestCase):
             self.assertIn(text, prompt)
         self.assertEqual((fake.a_calls, fake.test_calls, fake.b_calls), (1, 0, 1))
         self.assertIn("Run the configured focused checks below as argv commands", prompt)
-        self.assertIn("minimal relevant checks where feasible", fake.b_prompts[0])
-        self.assertIn("Run configured tests against the actual target", fake.b_prompts[0])
-        self.assertNotIn("Do not execute tests", fake.b_prompts[0])
+        self.assertIn("Do not execute tests, linting, builds or verification commands", fake.b_prompts[0])
+        self.assertIn("status=not_run", fake.b_prompts[0])
+        self.assertNotIn("Run configured tests against the actual target", fake.b_prompts[0])
         self.assertNotIn("The controller already selected the Git branch", prompt)
 
     def test_controller_mode_assigns_verification_to_controller_and_supplies_evidence(self):
@@ -791,12 +789,26 @@ class ReviewRecoveryTests(unittest.TestCase):
                      "never approve solely on those claims"):
             self.assertIn(text, prompt)
 
-    def test_legacy_review_prompt_preserves_independent_testing_instructions(self):
-        prompt = runner.review_prompt_for({"prompt": "Implement one", "test_commands": []}, "", "", [])
-        for text in ("Avoid rerunning passing tests without a concrete reason", "do not run the full test suite by default",
-                     "test evidence is insufficient or suspicious", "minimal relevant checks where feasible"):
+    def test_new_review_prompt_requests_code_review_without_extra_testing(self):
+        task = {"prompt": "Implement reset; exclude architecture changes", "test_commands": [["focused-check"]]}
+        previous = {"attempt": 1, "review": {"issues": ["reset.py:4 leaves stale state"]}}
+        prompt = runner.review_prompt_for(task, "reset.py | 1 +", "complete diff", [],
+                                         "focused-check: failed reset assertion", previous)
+        for text in ("independent READ-ONLY code reviewer", "requirements", "acceptance criteria", "explicit exclusions",
+                     "Inspect all staged changes", "complete current-task implementation", "relevant surrounding code",
+                     "READ existing tests", "Do not execute tests, linting, builds or verification commands",
+                     "Do not request additional test execution", "extra test modules or optional coverage",
+                     "implementer claims, not independently verified evidence", "unresolved implementation defect",
+                     "Missing optional coverage or absence of independent test execution alone must not block approval",
+                     "demonstrable implementation defects or unmet explicit requirements", "every material defect",
+                     "code location", "concrete failure path", "impact", "minimal correction", "status=not_run",
+                     "Do not change files or Git metadata", "reset.py:4 leaves stale state", task["prompt"],
+                     "focused-check: failed reset assertion", "DIFF (truncated; inspect repository for full):\ncomplete diff"):
             self.assertIn(text, prompt)
-        self.assertNotIn("Do not execute tests", prompt)
+        for text in ("Run configured tests", "minimal relevant checks", "significant missing test coverage",
+                     "blocked/unexecuted testing cannot authorize", "independently check):"):
+            self.assertNotIn(text, prompt)
+        self.assertLess(len(prompt.split("\n\nTASK:")[0]), 3000)
 
     def test_controller_corrections_address_mechanisms_within_supported_scope(self):
         failures = [{"attempt": 1, "feedback": "controller assertion: unsafe path accepted"},
@@ -826,7 +838,8 @@ class ReviewRecoveryTests(unittest.TestCase):
         task = {"prompt": "Allocate external logs; exclude unsupported Git configurations",
                 "test_commands": [["python", "-m", "unittest", "test_paths"]]}
         tests = [{"index": 1, "exit_code": 0, "output": "saved-test.txt", "output_sha256": "saved-hash"}]
-        for controller in (True, False):
+        # The new concise mode has its own contract above; retain historical requirements here.
+        for controller in (True,):
             with self.subTest(controller_tests=controller):
                 prompt = runner.review_prompt_for(task, "paths.py | 2 +", "complete diff", tests,
                                                   controller_tests=controller)
@@ -851,9 +864,6 @@ class ReviewRecoveryTests(unittest.TestCase):
                 if controller:
                     self.assertIn("Approval requires passed focused controller verification", prompt)
                     self.assertIn("Do not execute tests, linting, builds", prompt)
-                else:
-                    self.assertNotIn("Approval requires passed focused controller verification", prompt)
-                    self.assertIn("minimal relevant checks where feasible", prompt)
 
     def test_reviewer_prompt_keeps_full_staged_diff_access_when_excerpt_is_truncated(self):
         for controller in (True, False):

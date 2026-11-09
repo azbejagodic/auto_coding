@@ -914,16 +914,42 @@ def review_prompt_for(task: dict, stat: str, diff: str, tests: list[dict], imple
                     "behavior for regressions introduced by the fixes. Report all remaining or newly discovered "
                     "issues together. Do not automatically approve solely because these findings were fixed.\n"
                     + "\n".join(f"- {issue}" for issue in issues))
+    context = ("\n\nTASK:\n" + task["prompt"] +
+        "\n\nCURRENT TASK CHANGES:\n" + stat + "\n\nDIFF (truncated; inspect repository for full):\n" + diff[:35000] +
+        "\n\nTEST RESULTS:\n" + json.dumps(tests) +
+        "\n\nCONFIGURED FOCUSED CHECKS (argv):\n" + json.dumps(task["test_commands"]) +
+        ("\n\nIMPLEMENTER TEST REPORT (claims, not controller verification; "
+         + ("independently check" if controller_tests else "context only") + "):\n"
+         + implementer_tests[:8000] + ("\n[report excerpt; inspect saved answer for the rest]" if len(implementer_tests) > 8000 else "")
+         if implementer_tests else ""))
+    if not controller_tests:
+        return ("You are Codex B, an independent READ-ONLY code reviewer. Read the TASK requirements, "
+            "acceptance criteria and explicit exclusions. Inspect all staged changes in the repository even if the "
+            "embedded DIFF is truncated. Review the complete current-task implementation, relevant surrounding code, "
+            "error paths and state transitions. You may READ existing tests to understand intended behavior. "
+            "Do not execute tests, linting, builds or verification commands. Do not request additional test execution "
+            "merely for confidence, extra test modules or optional coverage. Codex A owns focused testing; the "
+            "controller runs the final suite after all approved task commits. A's reported commands, results, failures "
+            "and limitations are implementer claims, not independently verified evidence. Never claim you executed "
+            "or verified tests you did not run. If a reported failure demonstrates an unresolved implementation defect, "
+            "reject with a concrete finding. Missing optional coverage or absence of independent test execution alone "
+            "must not block approval.\n"
+            "Check requested functionality, concrete bugs, meaningful regressions, authorization/security and data-loss "
+            "risks. Reject only for demonstrable implementation defects or unmet explicit requirements. Report every "
+            "material defect together: code location, affected requirement, concrete failure path, impact and minimal "
+            "correction. Source-derived defects can block without execution; speculation alone cannot. Stay within the "
+            "current task; do not perform unrelated architecture reviews or request optional refactoring. Recheck all "
+            "preceding findings against the corrected code. Approve when the implementation satisfies the task and no "
+            "material defects remain. Return APPROVED with empty issues, or REJECTED with actionable issues. "
+            f"Keep issues within {MAX_REVIEW_ISSUES_TOTAL} characters total; never approve an incomplete review. "
+            "Report verification={status,details} with status=not_run and explain that this is intentionally code review "
+            "only. Do not change files or Git metadata." + previous + context)
     verification = (
         "The controller runs verification. Use actual controller TEST RESULTS as verification evidence. "
         "Do not execute tests, linting, builds or verification suites, or duplicate controller verification. "
         "If verification is missing or insufficient, report the specific concern; never claim unrun tests passed. "
         "Approval requires passed focused controller verification, met requirements and no remaining material defects. "
-        "Still independently review code behavior and relevant edge cases; passing tests do not prove correctness. "
-        if controller_tests else
-        "Avoid rerunning passing tests without a concrete reason; do not run the full test suite by "
-        "default. If test evidence is insufficient or suspicious, independently investigate with minimal "
-        "relevant checks where feasible. ")
+        "Still independently review code behavior and relevant edge cases; passing tests do not prove correctness. ")
     return ("You are Codex B, an independent READ-ONLY reviewer. Start with the complete "
         "current-task Git diff and TASK requirements below. Inspect all staged changes in the repository "
         "even if the embedded DIFF is truncated. Inspect the current "
@@ -966,13 +992,7 @@ def review_prompt_for(task: dict, stat: str, diff: str, tests: list[dict], imple
         "optional polish in summary as non-blocking suggestions. Put every blocker in issues, "
         "not only in summary; the decision and issues must agree. Inspect Git/credential safety "
         "and data-loss risks carefully. Merge to Main and per-task model/reasoning selection "
-        "are deferred and are not approval blockers. Do not change files." + previous + "\n\nTASK:\n" + task["prompt"] +
-        "\n\nCURRENT TASK CHANGES:\n" + stat + "\n\nDIFF (truncated; inspect repository for full):\n" + diff[:35000] +
-        "\n\nTEST RESULTS:\n" + json.dumps(tests) +
-        "\n\nCONFIGURED FOCUSED CHECKS (argv):\n" + json.dumps(task["test_commands"]) +
-        ("\n\nIMPLEMENTER TEST REPORT (claims, not controller verification; independently check):\n"
-         + implementer_tests[:8000] + ("\n[report excerpt; inspect saved answer for the rest]" if len(implementer_tests) > 8000 else "")
-         if implementer_tests else ""))
+        "are deferred and are not approval blockers. Do not change files." + previous + context)
 
 
 def implementation_report(logs, task, attempt, *, expected=None, required=False):
@@ -1205,7 +1225,8 @@ def finish_review_verdict(repo, logs, state, state_path, events, task, *, produc
     verification = verdict.get("verification", {"status": "not_reported"})
     if (verdict["decision"] == "APPROVED" and
             (verification["status"] in {"failed", "environment_blocked"}
-             or (verification["status"] == "not_run" and task["test_commands"]))):
+             or (verification["status"] == "not_run" and task["test_commands"]
+                 and state.get("controller_tests", True)))):
         pending["review_failure_kind"] = "verification_" + verification["status"]
         state["status"] = "stopped"
         save_json(state_path, state)
