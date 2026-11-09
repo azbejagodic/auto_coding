@@ -14,7 +14,7 @@ from auto_coding import simple_run as runner
 from auto_coding import plan_audit as audit
 from auto_coding.repository_ownership import execution_lock
 from auto_coding.reviewer_permissions import command_environment, ReviewerEnvironmentError
-from test_final_verification import Executor, POLICY
+from test_final_verification import CODE_REVIEW_APPROVED, Executor, POLICY
 
 
 class PlanAuditTests(unittest.TestCase):
@@ -70,8 +70,9 @@ class PlanAuditTests(unittest.TestCase):
         return self.result
 
     def identity(self):
-        return {"plan_sha256": runner.load_tasks(self.plan)[1], "target": audit.snapshot(runner, self.repo),
-                "verification_policy": POLICY}
+        _, fingerprint = runner.load_tasks(self.plan)
+        return {"plan_sha256": fingerprint, "target": audit.snapshot(runner, self.repo),
+                "verification_policy": runner.requested_verification(self.plan, fingerprint, None)}
 
     def do_audit(self, **kwargs):
         with contextlib.redirect_stdout(io.StringIO()):
@@ -124,6 +125,144 @@ class PlanAuditTests(unittest.TestCase):
         self.assertEqual(self.start(fake, resume=True), 0)
         self.assertEqual(len(self.calls), 1)
         self.assertEqual(len(fake.calls), 5)
+
+    def test_three_dependent_tasks_audit_checkpoints_real_final_suite_and_reopen(self):
+        source = self.repo / "pricing.py"
+        source.write_text("# Dependent batch fixture.\n")
+        (self.repo / "test_pricing.py").write_text(
+            "import unittest\nimport pricing\n\n"
+            "class PricingTests(unittest.TestCase):\n"
+            "    def test_subtotal(self):\n"
+            "        self.assertEqual(pricing.subtotal([3, 4]), 7)\n"
+            "        self.assertEqual(pricing.subtotal([]), 0)\n"
+            "    def test_total(self):\n"
+            "        self.assertEqual(pricing.total([3, 4], 2), 5)\n"
+            "        self.assertEqual(pricing.total([3, 4], 99), 0)\n"
+            "    def test_receipt(self):\n"
+            "        self.assertEqual(pricing.receipt([3, 4], 2), 'Total: 5.00')\n")
+        self.git("add", "-A")
+        self.git("commit", "-m", "seed dependent batch tests")
+        initial = self.git("rev-parse", "HEAD")
+        names = ("subtotal", "total", "receipt")
+        changes = ("\ndef subtotal(prices):\n    return sum(prices)\n",
+                   "\ndef total(prices, discount=0):\n    return max(0, subtotal(prices) - discount)\n",
+                   "\ndef receipt(prices, discount=0):\n    return f'Total: {total(prices, discount):.2f}'\n")
+        focused = [[runner.sys.executable, "-B", "-m", "unittest", f"test_pricing.PricingTests.test_{name}"]
+                   for name in names]
+        final = [runner.sys.executable, "-B", "-m", "unittest", "-v", "test_pricing"]
+        policy = {"test_commands": [final], "minimum_tests": 3, "timeout_seconds": 30}
+        self.document = {"tasks": [
+            {"id": "one", "prompt": "Implement subtotal(prices) as the sum, including empty inputs", "test_commands": [focused[0]]},
+            {"id": "two", "prompt": "Implement total(prices, discount=0) using subtotal; clamp to zero", "test_commands": [focused[1]]},
+            {"id": "three", "prompt": "Implement receipt(prices, discount=0) using total, formatted as Total: 5.00", "test_commands": [focused[2]]}],
+            "final_verification": policy}
+        self.plan.write_text(json.dumps(self.document))
+        self.report["tasks"].append({"task_id": "three", "findings": ["Depends on total and subtotal"],
+                                     "recommended_changes": [], "blocking_issues": []})
+        self.assertEqual(self.do_audit(), 0)
+        self.assertEqual(self.do_audit(), 0)
+        tasks, fingerprint = runner.load_tasks(self.plan)
+        ids = [task["id"] for task in tasks]
+        evidence, _ = audit.load_evidence(runner, self.logs, self.repo, fingerprint, ids)
+        calls, focused_results, final_results = [], [], []
+
+        def execute(argv, cwd, timeout, *, prompt=None):
+            self.assertEqual(cwd, self.repo)
+            state = audit.read_json(self.run_logs / "state.json")
+            if argv == final:
+                self.assertIsNone(prompt)
+                self.assertEqual(calls, ["A", "B"] * 3)
+                self.assertEqual(state["completed"], ids)
+                self.assertEqual(len({record["commit"] for record in state["history"]}), 3)
+                self.assertEqual(self.git("status", "--porcelain"), "")
+                calls.append("final")
+                result = runner.call(argv, cwd, timeout)
+                final_results.append(result)
+                return result
+            # Any controller-focused test dispatch would fail here, rather than
+            # silently masquerading as part of the mock implementer's testing.
+            self.assertIn("--output-last-message", argv)
+            answer = Path(argv[argv.index("--output-last-message") + 1])
+            index = len(focused_results) - ("--output-schema" in argv)
+            self.assertIn(tasks[index]["prompt"], prompt)
+            if "--output-schema" in argv:
+                calls.append("B")
+                self.assertEqual(source.read_text(), "# Dependent batch fixture.\n" + "".join(changes[:index + 1]))
+                self.assertIn("+def " + names[index], self.git("diff", "--cached", "--", "pricing.py"))
+                self.assertIn("Do not execute tests, linting, builds or verification commands", prompt)
+                self.assertIn("status=not_run", prompt)
+                self.assertIn("claims, not controller verification; context only", prompt)
+                self.assertNotIn("Run configured tests", prompt)
+                self.assertNotIn("minimal relevant checks", prompt)
+                self.assertNotIn("--sandbox", argv)
+                self.assertTrue(any('extends=":read-only"' in part for part in argv))
+                answer.write_text(json.dumps(CODE_REVIEW_APPROVED))
+            else:
+                calls.append("A")
+                self.assertEqual(state["completed"], ids[:index])
+                self.assertEqual(self.git("rev-parse", "HEAD"), state["history"][-1]["commit"] if index else initial)
+                self.assertEqual(source.read_text(), "# Dependent batch fixture.\n" + "".join(changes[:index]))
+                self.assertIn(json.dumps([focused[index]]), prompt)
+                source.write_text(source.read_text() + changes[index])
+                result = runner.call(focused[index], cwd, timeout)
+                self.assertEqual(result[0], 0, result[1])
+                self.assertEqual(runner.unittest_evidence(result[1])["tests"], 1)
+                focused_results.append(result)
+                answer.write_text("Executed " + json.dumps(focused[index]) + "\n" + result[1])
+            return runner._CallResult(0, "Mock agent completed", False, True, True)
+
+        with patch.object(runner, "execute_controller_test", wraps=runner.execute_controller_test) as controller:
+            self.assertEqual(self.start(execute, approved_audit=self.logs, max_agent_calls=6), 0)
+            state = audit.read_json(self.run_logs / "state.json")
+            manifest = audit.read_json(self.run_logs / "run-manifest.json")
+            events = [json.loads(line) for line in (self.run_logs / "events.jsonl").read_text().splitlines()]
+            saved = state["final_verification_result"]
+            commits = [record["commit"] for record in state["history"]]
+            self.assertEqual(calls, ["A", "B"] * 3 + ["final"])
+            self.assertEqual(len(self.calls), 1)
+            self.assertEqual(len(focused_results), 3)
+            self.assertEqual(len(final_results), 1)
+            self.assertEqual(controller.call_count, 1)
+            self.assertEqual(controller.call_args.args[1], final)
+            self.assertFalse(state["controller_tests"])
+            self.assertEqual(state["status"], "completed")
+            self.assertEqual(state["completed"], ids)
+            self.assertEqual(state["plan_audit"], manifest["plan_audit"])
+            self.assertEqual(state["plan_audit"]["evidence_sha256"], audit.digest(evidence))
+            self.assertEqual(manifest["initial_git_head"], initial)
+            self.assertEqual(self.git("rev-list", "--reverse", f"{initial}..HEAD").splitlines(), commits)
+            self.assertEqual(saved["head"], commits[-1])
+            self.assertEqual(saved["branch"], self.git("branch", "--show-current"))
+            self.assertEqual(saved["plan_sha256"], fingerprint)
+            self.assertEqual(saved["policy_sha256"], runner.policy_sha256(policy))
+            self.assertEqual(saved["test_count"], 3)
+            self.assertEqual(state["final_verification_invocations"], 1)
+            self.assertTrue(runner.final_evidence_valid(self.repo, self.run_logs, state))
+            for record in state["history"]:
+                self.assertEqual(record["tests"], [])
+                self.assertEqual(record["review"]["verification"]["status"], "not_run")
+                report = (self.run_logs / record["a_report"]["output"]).read_bytes()
+                self.assertEqual(record["a_report"]["sha256"], hashlib.sha256(report).hexdigest())
+            test_events = [event for event in events if event["event"] == "test_started"]
+            self.assertEqual(len(test_events), 1)
+            checkpoints = [event for event in events if event["event"] == "checkpoint_committed"]
+            self.assertEqual(len(checkpoints), 3)
+            self.assertLess(checkpoints[-1]["seq"], test_events[0]["seq"])
+            output = self.run_logs / saved["tests"][0]["output"]
+            original = output.read_bytes()
+            self.assertEqual(original.decode("utf-8"), final_results[0][1])
+            self.assertEqual(saved["tests"][0]["output_sha256"], hashlib.sha256(original).hexdigest())
+            audit.verify_resume(runner, state, manifest, self.repo, fingerprint, tasks)
+            unexpected = unittest.mock.Mock(side_effect=AssertionError("Completed batch must not execute again"))
+            self.assertEqual(self.start(unexpected, resume=True), 0)
+            unexpected.assert_not_called()
+            self.assertEqual(controller.call_count, 1)
+        self.assertEqual(self.git("rev-parse", "HEAD"), commits[-1])
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        self.assertEqual(source.read_text(), "# Dependent batch fixture.\n" + "".join(changes))
+        self.assertEqual(output.read_bytes(), original)
+        self.assertEqual(audit.read_json(self.run_logs / "state.json")["final_verification_result"], saved)
+        self.assertEqual(len(self.calls), 1)
 
     def test_review_only_resume_preserves_binding_and_does_not_audit(self):
         self.do_audit()

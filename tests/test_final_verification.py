@@ -77,6 +77,8 @@ class VerificationPolicyTests(unittest.TestCase):
     def test_successful_exit_or_incidental_ok_is_not_test_evidence(self):
         self.assertIsNone(unittest_evidence("OK\n"))
         self.assertIsNone(unittest_evidence("all tests passed"))
+        self.assertIsNone(unittest_evidence("TAP version 13\n1..1\nok 1 - renders dashboard\n"))
+        self.assertIsNone(unittest_evidence("Test Suites: 1 passed, 1 total\nTests: 3 passed, 3 total\n"))
         self.assertTrue(unittest_evidence(PASSED)["successful"])
         self.assertFalse(unittest_evidence(PASSED + FAILED)["successful"])
         self.assertEqual(unittest_evidence("Ran 2 tests in 0.1s\n\nOK (skipped=1)\n")["skipped"], 1)
@@ -313,14 +315,34 @@ class FinalVerificationTests(unittest.TestCase):
                 self.assertNotIn("run_completed", [event["event"] for event in self.events()])
 
     def test_failed_final_suite_preserves_commits_and_real_failure_evidence(self):
-        fake = Executor(final=[runner._CallResult(1, FAILED, False, True, True)])
-        self.assertEqual(self.run_fake(fake), 1)
+        command = [runner.sys.executable, "-B", "-c",
+                   "import unittest\nfrom app import VERSION\n"
+                   "class Regression(unittest.TestCase):\n"
+                   "    def test_version(self):\n"
+                   "        self.assertEqual(VERSION, 2, 'unresolved implementation defect')\n"
+                   "unittest.main(argv=['final-suite'])\n"]
+        self.document["final_verification"] = POLICY | {"test_commands": [command], "minimum_tests": 1}
+        self.write_plan()
+        fake = Executor(reviews=[CODE_REVIEW_APPROVED], implementation="VERSION = 1\n")
+        outputs = []
+        def execute(argv, cwd, timeout, *, prompt=None):
+            if argv == command:
+                fake.calls.append("final")
+                result = runner.call(argv, cwd, timeout)
+                outputs.append(result[1])
+                return result
+            return fake(argv, cwd, timeout, prompt=prompt)
+        self.assertEqual(self.run_fake(execute), 1)
         state = self.state()
         self.assertEqual(state["final_verification_result"]["outcome"], "test_failure")
+        self.assertEqual(state["status"], "stopped")
         self.assertEqual(fake.calls, ["A", "B", "final"])
         self.assertEqual(state["completed"], ["one"])
         self.assertEqual(self.git("rev-parse", "HEAD"), state["history"][0]["commit"])
-        self.assertEqual((self.logs / "final-verification-0001-test-1.txt").read_text(), FAILED)
+        self.assertEqual((self.logs / "final-verification-0001-test-1.txt").read_bytes(), outputs[0].encode("utf-8"))
+        self.assertIn("unresolved implementation defect", outputs[0])
+        self.assertTrue(runner.unittest_evidence(outputs[0])["failed"])
+        self.assertNotIn("run_completed", [event["event"] for event in self.events()])
 
     def test_verified_timeout_resume_uses_saved_long_timeout_without_a_or_b(self):
         fake = Executor(final=[runner._CallResult(124, "PROCESS TIMED OUT", True, True, True)])
@@ -333,10 +355,28 @@ class FinalVerificationTests(unittest.TestCase):
         self.assertEqual(self.state()["final_verification_invocations"], 2)
 
     def test_launch_failure_is_infrastructure_failure_not_a_correction(self):
-        fake = Executor(final=[runner._CallResult(127, "unavailable", False, True, False)])
-        self.assertEqual(self.run_fake(fake), 1)
+        command = [str(self.repo / "nonexistent-final-tool")]
+        self.document["final_verification"] = POLICY | {"test_commands": [command]}
+        self.write_plan()
+        fake = Executor(reviews=[CODE_REVIEW_APPROVED])
+        def execute(argv, cwd, timeout, *, prompt=None):
+            if argv == command:
+                fake.calls.append("final")
+                return runner.call(argv, cwd, timeout)
+            return fake(argv, cwd, timeout, prompt=prompt)
+        self.assertEqual(self.run_fake(execute), 1)
         self.assertEqual(self.state()["final_verification_result"]["outcome"], "infrastructure_process_failure")
         self.assertEqual(fake.calls, ["A", "B", "final"])
+        checkpoint = self.git("rev-parse", "HEAD")
+        original = (self.logs / "final-verification-0001-test-1.txt").read_bytes()
+        self.assertIn(b"FileNotFoundError", original)
+        self.assertEqual(self.run_fake(execute, resume=True), 1)
+        self.assertEqual(fake.calls, ["A", "B", "final", "final"])
+        self.assertEqual(self.state()["status"], "stopped")
+        self.assertEqual(self.git("rev-parse", "HEAD"), checkpoint)
+        self.assertEqual((self.logs / "final-verification-0001-test-1.txt").read_bytes(), original)
+        self.assertTrue((self.logs / "final-verification-0002-test-1.txt").is_file())
+        self.assertNotIn("run_completed", [event["event"] for event in self.events()])
 
     def test_cleanup_uncertainty_blocks_resume_new_runs_and_later_commands(self):
         self.document["final_verification"] = POLICY | {"test_commands": [["fake-final"], ["fake-final"]]}
@@ -462,6 +502,26 @@ class FinalVerificationTests(unittest.TestCase):
         self.assertEqual((self.repo / "app.py").read_text(), "VERSION = 2\n")
         self.assertIn("implementation 2", fake.b_prompts[1])
         self.assertNotEqual(self.state()["history"][0]["a_report"], self.state()["history"][1]["a_report"])
+
+    def test_rejected_unchanged_correction_stops_at_review_limit_and_cannot_resume_loop(self):
+        issue = "app.py:1 VERSION remains 1; task requires VERSION = 2"
+        rejected = {"decision": "REJECTED", "issues": [issue], "summary": "Implementation defect remains",
+                    "verification": CODE_REVIEW_APPROVED["verification"]}
+        self.document["tasks"][0]["prompt"] = "Set app.py VERSION = 2"
+        self.write_plan()
+        fake = Executor(reviews=[rejected, rejected], implementation="VERSION = 1\n")
+        self.assertEqual(self.run_fake(fake, attempts=10), 1)
+        self.assertEqual(fake.calls, ["A", "B", "A", "B"])
+        self.assertIn(issue, fake.a_prompts[1])
+        self.assertEqual((self.logs / "one-01-diff.txt").read_bytes(), (self.logs / "one-02-diff.txt").read_bytes())
+        self.assertEqual(runner.task_review_rounds(self.state(), "one"), 2)
+        self.assertEqual(self.state()["status"], "stopped")
+        self.assertEqual(self.state()["completed"], [])
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.initial)
+        unexpected = Mock(side_effect=AssertionError("Exhausted review rounds must not launch more models"))
+        self.assertEqual(self.run_fake(unexpected, resume=True, attempts=10), 1)
+        unexpected.assert_not_called()
+        self.assertEqual(self.events()[-1]["metadata"]["reason"], "substantive review round limit")
 
     def test_invalid_b_verdict_cannot_reach_final_testing_or_commit(self):
         fake = Executor(reviews=["bad", "bad", "bad"])
