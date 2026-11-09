@@ -2,11 +2,113 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+from auto_coding.sensitive_paths import is_sensitive_path
+
 MAX_JSON = 4 * 1024 * 1024
 MAX_EVIDENCE = 1024 * 1024
+
+
+def directory_identity(root):
+    path = Path(root).absolute()
+    if path.resolve(strict=True) != path or not path.is_dir():
+        raise ValueError("Export directory must be a real directory, without links.")
+    stat = path.stat()
+    return str(path), stat.st_dev, stat.st_ino
+
+
+def redact_export(text):
+    """Conservative credential redaction for exported, already permitted text."""
+    text = re.sub(r"-----BEGIN [^-]*PRIVATE KEY-----.*?(?:-----END [^-]*PRIVATE KEY-----|$)",
+                  "[redacted private key]", text, flags=re.S)
+    text = re.sub(r"(?i)\b(?:sk-[\w-]+|gh[pousr]_[\w]+|github_pat_[\w]+|AKIA[A-Z0-9]{16})\b",
+                  "[redacted]", text)
+    text = re.sub(r'(?im)([\w-]*(?:token|password|secret|api[_-]?key|authorization|credential)[\w-]*["\s]*[:=]\s*)[^\r\n,}]+',
+                  r'\1[redacted]', text)
+    text = re.sub(r"(?i)\bBearer\s+[^\s\"']+", "Bearer [redacted]", text)
+    return re.sub(r"(https?://)[^/\s@]+@", r"\1[redacted]@", text)
+
+
+def export_file(root, name):
+    """Flat allowlisted evidence only; never export links, scratch or secrets."""
+    if (not isinstance(name, str) or not name or name in {".", ".."}
+            or any(c in name for c in '/\\:') or is_sensitive_path(name)
+            or name.startswith('.') or not name.endswith(('.txt', '.json', '.jsonl'))
+            or any(word in name.casefold() for word in ('scratch', 'prompt', 'environment'))):
+        return {"ok": False, "text": "Evidence excluded by export path policy."}
+    try:
+        path = Path(root) / name
+        if path.is_symlink() or path.resolve(strict=True) != path.absolute() or path.stat().st_nlink != 1:
+            raise ValueError("Linked evidence excluded.")
+        return read_evidence(root, name)
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "text": f"Evidence unavailable: {type(exc).__name__}."}
+
+
+def export_run(root, approved=None):
+    """Bounded summary plus explicitly opened evidence, using CLI artifacts."""
+    approved = approved or {}
+    identity = directory_identity(root)
+    for name in ('state.json', 'run-manifest.json', 'events.jsonl'):
+        path = Path(root) / name
+        if path.is_symlink() or (path.exists() and (
+                path.resolve() != path.absolute() or path.stat().st_nlink != 1)):
+            raise ValueError('Linked run records cannot be exported.')
+    data = read_run(root)
+    state = data.get('state') or {}
+    fields = ('run_id', 'status', 'current_task', 'completed', 'created_utc')
+    event_fields = ('seq', 'timestamp_utc', 'actor', 'event', 'outcome', 'task_id', 'attempt')
+    result = {'kind': 'run', 'state': {k: state[k] for k in fields if k in state},
+              'summary': data.get('summary'),
+              'events': [{k: e[k] for k in event_fields if k in e} for e in data['events'][:2000]],
+              'event_errors': data['event_errors'][:100], 'state_error': data['state_error'],
+              'events_truncated': len(data['events']) > 2000,
+              'files_truncated': len(set(approved) - {'metrics.json'}) > 49,
+              'notice': 'Only evidence explicitly opened in this window is included. Limits: 50 files, 1 MB each, 8 MB total.',
+              'files': {}}
+    # metrics.json is a standard derived artifact, not an arbitrary path.
+    names = ['metrics.json', *sorted(set(approved) - {'metrics.json'})[:49]]
+    budget = 8 * MAX_EVIDENCE
+    for name in names:
+        item = export_file(root, name)
+        if (name in approved and item['ok']
+                and hashlib.sha256(item['text'].encode('utf-8')).hexdigest() != approved[name]):
+            item = {'ok': False, 'text': 'Evidence changed since it was opened; reopen before exporting.'}
+        size = len(item['text'].encode('utf-8'))
+        if size > budget:
+            item = {'ok': False, 'text': 'Export total limit reached; evidence omitted.'}
+        else:
+            budget -= size
+        result['files'][name] = item
+    if directory_identity(root) != identity:
+        raise ValueError('Selected log directory changed during export.')
+    return result
+
+
+def export_audit(root, *, diagnostics=True):
+    """Verify the existing audit schema and durable ledger, including rejection."""
+    from auto_coding import plan_audit, simple_run
+    identity = directory_identity(root)
+    for name in ('audit-evidence.json', 'audit-report.json'):
+        item = export_file(root, name)
+        if not item['ok']:
+            raise ValueError(f'{name}: {item["text"]}')
+    evidence = plan_audit.read_json(Path(root) / 'audit-evidence.json')
+    report = plan_audit.read_json(Path(root) / 'audit-report.json')
+    evidence, report = plan_audit.load_evidence(simple_run, root,
+        Path(evidence['identity']['target']['repo']), evidence['identity']['plan_sha256'],
+        [t['task_id'] for t in report['tasks']])
+    result = {'kind': 'audit', 'identity': evidence['identity'], 'report': report,
+              'diagnostics': {name: export_file(root, name)
+                              for name in (('audit-output.txt', 'events.jsonl', 'metrics.json') if diagnostics else ())},
+              'notice': 'Read-only export. No plan edits or correction agent are invoked.'}
+    if directory_identity(root) != identity:
+        raise ValueError('Audit directory changed during export.')
+    return result
 
 
 def _utc(value):

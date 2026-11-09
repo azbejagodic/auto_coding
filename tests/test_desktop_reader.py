@@ -1,15 +1,62 @@
 import json
+import hashlib
 import shutil
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from auto_coding.desktop_reader import read_run, read_evidence
+from auto_coding.desktop_reader import read_run, read_evidence, export_run, export_file
 from auto_coding.desktop_app import HTML
 
 
 class DesktopReaderTests(unittest.TestCase):
+    def test_export_missing_truncated_unapproved_and_changed_evidence(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / 'state.json').write_text('{"status":"stopped"}')
+            (root / 'events.jsonl').write_text('{"event":"stopped"}\n{"event":')
+            (root / 'large.txt').write_bytes(b'x' * (1024 * 1024 + 1))
+            (root / 'test.txt').write_text('original')
+            approved = {'test.txt': hashlib.sha256(b'original').hexdigest(), 'large.txt': 'x', 'missing.txt': 'x'}
+            data = export_run(root, approved)
+            self.assertIn('Line 2', data['event_errors'][0])
+            self.assertIn('1 MB', data['files']['large.txt']['text'])
+            self.assertFalse(data['files']['missing.txt']['ok'])
+            self.assertEqual(data['files']['test.txt']['text'], 'original')
+            (root / 'test.txt').write_text('changed')
+            self.assertIn('changed', export_run(root, approved)['files']['test.txt']['text'])
+            for name in ('../test.txt', '/test.txt', 'C:\\test.txt', '.env', 'credentials.json',
+                         'scratch/test.txt', 'task-a-prompt.txt', 'file.txt:stream'):
+                self.assertFalse(export_file(root, name)['ok'], name)
+            (root / 'events.jsonl').write_text(''.join('{"event":"stopped"}\n' for _ in range(2001)))
+            data = export_run(root)
+            self.assertTrue(data['events_truncated'])
+            self.assertEqual(len(data['events']), 2000)
+
+    def test_export_symlink_denial_is_deterministic_without_host_privileges(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / 'link.txt').write_text('must not read')
+            original = Path.is_symlink
+            with patch.object(Path, 'is_symlink', lambda path: path.name == 'link.txt' or original(path)):
+                self.assertFalse(export_file(root, 'link.txt')['ok'])
+            (root / 'state.json').write_text('{"status":"stopped"}')
+            with patch.object(Path, 'is_symlink', lambda path: path.name == 'state.json' or original(path)):
+                with self.assertRaisesRegex(ValueError, 'Linked run records'):
+                    export_run(root)
+
+    def test_export_denies_symlinks_even_within_log_directory(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / 'source.txt').write_text('source')
+            try:
+                (root / 'link.txt').symlink_to(root / 'source.txt')
+            except (OSError, NotImplementedError):
+                self.skipTest('symlinks unavailable')
+            self.assertFalse(export_file(root, 'link.txt')['ok'])
+
     def test_cli_progress_clock_and_final_verification_evidence(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

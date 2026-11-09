@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import threading
 from pathlib import Path
 
-from auto_coding.desktop_reader import read_run, read_evidence
+from auto_coding.desktop_reader import (read_run, read_evidence, export_run, export_audit,
+                                       export_file, directory_identity, redact_export)
 from auto_coding.desktop_control import DesktopController
 from auto_coding.simple_run import load_tasks
 
@@ -141,7 +143,7 @@ progress{width:100%;height:12px;accent-color:#72adf9}
 <span>Result: <strong id="audit-result" class="pill muted" role="status" aria-live="polite" aria-atomic="true">Not audited</strong></span>
 <button id="download-audit" disabled aria-describedby="audit-unavailable">Download audit report/log</button>
 </div>
-<p id="audit-unavailable" class="muted">One read-only audit using the local authenticated Codex CLI. Select a JSON plan with focused checks and final verification, a clean feature branch, and an explicit model supporting High. Reopen existing audit logs to inspect results. Report download is not wired yet.</p>
+<p id="audit-unavailable" class="muted">One read-only audit using the local authenticated Codex CLI. Select a JSON plan with focused checks and final verification, a clean feature branch, and an explicit model supporting High. Reopen existing audit logs to inspect results. Download is available after a verified audit report exists.</p>
 <pre id="audit-identity" tabindex="0" aria-label="Immutable audit identity and report"></pre>
 </section>
 <hr class="section-divider">
@@ -153,7 +155,7 @@ progress{width:100%;height:12px;accent-color:#72adf9}
 <button id="download-logs" disabled aria-describedby="run-unavailable">Download Logs</button>
 </div>
 <p id="start-reason" class="muted">Start requires verified audit approval for the exact selected plan and target, and native authorization.</p>
-<p id="run-unavailable" class="muted">Stop finishes the current task: executing A/B calls and safe checkpoint handling may finish first. Log download is not wired yet.</p>
+<p id="run-unavailable" class="muted">Stop finishes the current task: executing A/B calls and safe checkpoint handling may finish first. Select a run to download its summary and evidence opened in this window.</p>
 <dl class="run-summary">
 <div><dt>Status</dt><dd id="run-status" role="status" aria-live="polite">Idle</dd></div>
 <div><dt>Task current/total</dt><dd id="run-task" role="status" aria-live="polite">-- / --</dd></div>
@@ -305,10 +307,12 @@ function updateControls() {
   document.getElementById('audit-model').disabled = locked;
   document.getElementById('audit-goal').disabled = locked;
   const audit = c.audit || {};
+  document.getElementById('download-audit').disabled = busy || !ready || !c.audit_export_available;
+  document.getElementById('download-logs').disabled = busy || !ready || !latest?.exists;
   document.getElementById('audit-result').textContent = audit.status || 'Idle';
   document.getElementById('audit-result').className = 'pill ' + (audit.status === 'APPROVE' && audit.verified === true ? 'green' : ['REVISE', 'REJECT', 'BLOCK', 'Infrastructure error'].includes(audit.status) ? 'red' : ['Running', 'Unknown'].includes(audit.status) ? 'amber' : 'muted');
   document.getElementById('audit-identity').textContent = JSON.stringify({identity:audit.identity, configuration:audit.configuration, report:audit.report, error:audit.error}, null, 2);
-  document.getElementById('audit-unavailable').textContent = c.audit_reason || audit.error || 'One read-only audit per exact plan and target. Reopen saved logs to inspect results. Report download is not wired yet.';
+  document.getElementById('audit-unavailable').textContent = c.audit_reason || audit.error || 'One read-only audit per exact plan and target. Reopen saved logs to inspect results. Download is available after a verified audit report exists.';
   controls.forEach(id => { document.getElementById(id).disabled = locked; });
   ['github-branch', 'select-branch', 'new-branch', 'fetch-github', 'branch-base', 'branch-base-confirm', 'create-branch'].forEach(id => {
     document.getElementById(id).disabled = locked || !c.repository || c.preflight?.clean !== true;
@@ -583,7 +587,7 @@ async function refresh(clearMessage = true) {
 async function act(method) {
   if (busy || !ready) return;
   if (['start', 'resume'].includes(method) && !validateAttempts()) { updateControls(); return; }
-  const button = {'select_repo':'browse-project', 'select_plan':'browse-plan', 'open_run':'open-run', start:'start', resume:'resume', start_audit:'start-audit', stop_after_task:'stop'}[method];
+  const button = {'select_repo':'browse-project', 'select_plan':'browse-plan', 'open_run':'open-run', start:'start', resume:'resume', start_audit:'start-audit', stop_after_task:'stop', download_audit:'download-audit', download_logs:'download-logs'}[method];
   if (document.getElementById(button).disabled) return;
   busy = true;
   updateControls();
@@ -597,9 +601,9 @@ async function act(method) {
     if (method === 'start' && document.getElementById('auto-push').checked === true) args.push(true);
     const result = await window.pywebview.api[method](...args);
     accepted = result.ok && !result.cancelled;
-    if (accepted) document.getElementById('auto-push').checked = false;
+    if (accepted && !method.startsWith('download_')) document.getElementById('auto-push').checked = false;
     if (args.length && accepted) navigate('overview');
-    message(result.cancelled ? 'Cancelled. No work launched.' : result.error || result.warning || (method === 'stop_after_task' && result.ok ? 'Stop requested. Executing A/B calls and safe checkpoint handling may finish first.' : '') || (result.ok ? (args.length ? 'Launch accepted. Waiting for durable runner progress.' : 'Selection updated. No work launched.') : 'Action failed.'), !result.ok && !result.cancelled);
+    message(result.cancelled ? 'Cancelled. No work launched.' : result.error || result.message || result.warning || (method === 'stop_after_task' && result.ok ? 'Stop requested. Executing A/B calls and safe checkpoint handling may finish first.' : '') || (result.ok ? (args.length ? 'Launch accepted. Waiting for durable runner progress.' : 'Selection updated. No work launched.') : 'Action failed.'), !result.ok && !result.cancelled);
   } catch (error) { message('Action failed: ' + error, true); }
   finally {
     busy = false;
@@ -668,7 +672,7 @@ document.getElementById('push-approved').onclick = () => workspaceAction('push_a
 document.getElementById('refresh').onclick = refresh;
 document.getElementById('attempts').oninput = updateControls;
 ['overview', 'tasks', 'logs'].forEach(name => { document.getElementById('nav-' + name).onclick = () => navigate(name); });
-Object.entries({'browse-project':'select_repo', 'browse-plan':'select_plan', 'open-run':'open_run', start:'start', resume:'resume', stop:'stop_after_task', 'start-audit':'start_audit'}).forEach(([id, method]) => { document.getElementById(id).onclick = () => act(method); });
+Object.entries({'browse-project':'select_repo', 'browse-plan':'select_plan', 'open-run':'open_run', start:'start', resume:'resume', stop:'stop_after_task', 'start-audit':'start_audit', 'download-audit':'download_audit', 'download-logs':'download_logs'}).forEach(([id, method]) => { document.getElementById(id).onclick = () => act(method); });
 document.getElementById('audit-model').oninput = updateControls;
 updateControls();
 window.addEventListener('pywebviewready', () => { ready = true; refresh(); });
@@ -699,6 +703,13 @@ class NativeDialogs:
     def confirm(self, message):
         return self._window.create_confirmation_dialog("Confirm local runner launch", message)
 
+    def save(self, filename):
+        enum = getattr(self._webview, 'FileDialog', None)
+        kind = getattr(enum, 'SAVE') if enum is not None else self._webview.SAVE_DIALOG
+        result = self._window.create_file_dialog(kind, save_filename=filename,
+                                                file_types=('JSON report (*.json)',))
+        return result[0] if result and not isinstance(result, str) else result
+
 
 class Bridge:
     """Small JS API. Selection never launches; each launch needs native confirmation.
@@ -716,6 +727,7 @@ class Bridge:
         self._launch_lock = threading.Lock()
         self._root = Path(root).expanduser() if root is not None else None
         self._selection_error = None
+        self._approved_evidence = {}
         if root is not None:
             result = self.open_run(str(root))
             if not result["ok"]:
@@ -968,6 +980,93 @@ class Bridge:
     def resume(self, attempts=3):
         return self._launch("resume", attempts)
 
+    def _audit_export_root(self):
+        if self._root:
+            for root in (self._root, self._root / 'audit'):
+                if (root / 'audit-evidence.json').exists():
+                    return root
+            # CLI runs do not persist a selectable plan path. Their matching
+            # state/manifest binding still identifies the historical audit.
+            records = [export_file(self._root, name) for name in ('state.json', 'run-manifest.json')]
+            if all(record['ok'] for record in records):
+                state, manifest = [json.loads(record['text']) for record in records]
+                binding = state.get('plan_audit')
+                if binding and binding == manifest.get('plan_audit'):
+                    from auto_coding import plan_audit
+                    root = Path(binding['directory'])
+                    saved = export_file(root, 'audit-evidence.json')
+                    if saved['ok']:
+                        evidence = json.loads(saved['text'])
+                        if (plan_audit.digest(evidence) == binding.get('evidence_sha256')
+                                and evidence['identity']['plan_sha256'] == state.get('plan_sha256')
+                                and evidence['identity']['target']['repo'] == state.get('repo')):
+                            return root  # export_audit independently verifies its ledger/report.
+        audit = self._controller.audit_status()
+        if audit.get('report') and audit.get('directory'):
+            return Path(audit['directory'])
+        raise ValueError('No verified audit report available. Open saved audit logs.')
+
+    def _download(self, kind):
+        with self._lock:
+            try:
+                if self._dialogs is None:
+                    raise ValueError('Native Save As is unavailable.')
+                root = self._audit_export_root() if kind == 'audit' else self._root
+                if root is None:
+                    raise ValueError('No run selected. Open run logs first.')
+                identity = directory_identity(root)
+                selected = self.selected_paths()
+                build = lambda: (export_audit(root) if kind == 'audit' else
+                    export_run(root, self._approved_evidence.get(identity, {})))
+                initial = build()  # Validate before Save As; re-read after the dialog.
+                destination = self._dialogs.save('audit-report.json' if kind == 'audit' else 'run-logs.json')
+                if not destination:
+                    return {'ok': False, 'cancelled': True, 'message': 'Download cancelled. No export written.'}
+                if not isinstance(destination, str) or not Path(destination).is_absolute():
+                    raise ValueError('Save As must select an absolute filename.')
+                if self.selected_paths() != selected or directory_identity(root) != identity:
+                    raise ValueError('Selected directory changed during Save As. Reopen and retry.')
+                destination = Path(destination)
+                resolved = destination.resolve(strict=False)
+                if destination.parent.resolve(strict=True) != destination.parent.absolute():
+                    raise ValueError('Save As directory must not contain links.')
+                forbidden = [Path(identity[0])]
+                if self._root:
+                    forbidden.append(self._root.resolve())
+                if selected.get('repo'):
+                    forbidden.append(Path(selected['repo']).resolve())
+                if kind == 'audit':
+                    forbidden.append(Path(initial['identity']['target']['repo']).resolve())
+                if any(resolved == path or resolved.is_relative_to(path) for path in forbidden):
+                    raise ValueError('Save exports outside the target checkout and original log directories.')
+                payload = build()
+                # Redact values before encoding, so exported JSON stays valid.
+                def clean(value):
+                    if isinstance(value, dict):
+                        return {redact_export(str(k)): ('[redacted]' if any(s in str(k).casefold()
+                            for s in ('password', 'secret', 'credential', 'api_key', 'authorization')) else clean(v))
+                            for k, v in value.items()}
+                    if isinstance(value, list):
+                        return [clean(v) for v in value]
+                    return redact_export(value) if isinstance(value, str) else value
+                content = json.dumps(clean(payload), ensure_ascii=False, indent=2)
+                if len(content.encode('utf-8')) > 12 * 1024 * 1024:
+                    raise ValueError('Export exceeds the 12 MB total limit; select fewer evidence files.')
+                # Exclusive creation prevents silent overwrite, including symlinks.
+                with destination.open('x', encoding='utf-8') as stream:
+                    stream.write(content)
+                return {'ok': True, 'message': f'Download saved: {destination}'}
+            except FileExistsError:
+                return {'ok': False, 'error': 'Destination exists. Choose a new filename; no file was overwritten.'}
+            except Exception as exc:
+                return self._failure(exc)
+
+    def download_audit(self):
+        return self._download('audit')
+
+    def download_logs(self):
+        return self._download('run')
+
     def snapshot(self):
         with self._lock:
             status = self.job_status()
@@ -976,6 +1075,11 @@ class Bridge:
             except Exception as exc:
                 data = {"root": str(self._root), "exists": False, "state": None,
                         "state_error": str(exc), "events": [], "event_errors": [], "empty": True}
+            try:
+                export_audit(self._audit_export_root(), diagnostics=False)
+                status['audit_export_available'] = True
+            except Exception:
+                status['audit_export_available'] = False
             data["controller"] = {**self.selected_paths(), **status}
             return data
 
@@ -984,7 +1088,11 @@ class Bridge:
             if not isinstance(name, str):
                 return {"ok": False, "text": "Evidence name must be a relative path string."}
             try:
-                return read_evidence(self._root, name) if self._root else {"ok":False, "text":"No log directory selected."}
+                result = read_evidence(self._root, name) if self._root else {"ok":False, "text":"No log directory selected."}
+                if result['ok'] and export_file(self._root, name)['ok']:
+                    self._approved_evidence.setdefault(directory_identity(self._root), {})[name] = hashlib.sha256(
+                        result['text'].encode('utf-8')).hexdigest()
+                return result
             except Exception as exc:
                 return {"ok": False, "text": f"Evidence could not be read: {exc}"}
 

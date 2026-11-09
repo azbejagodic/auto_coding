@@ -44,6 +44,109 @@ class FakeController:
 
 
 class DesktopBridgeTests(unittest.TestCase):
+    def test_download_save_cancel_errors_bounds_and_preserves_logs(self):
+        self.controller.logs = self.logs
+        self.controller.repo = self.root / 'target'
+        self.controller.repo.mkdir()
+        self.bridge._root = self.logs
+        (self.logs / 'state.json').write_text('{"status":"stopped","password":"hidden"}')
+        original = b'output\npassword=hidden\nsk-testcredential\n'
+        (self.logs / 'test.txt').write_bytes(original)
+        (self.logs / 'unapproved.txt').write_text('unapproved body')
+        self.bridge.evidence('test.txt')
+        self.dialogs.save.return_value = None
+        self.assertTrue(self.bridge.download_logs()['cancelled'])
+        for destination in (self.logs / 'export.json', self.controller.repo / 'export.json'):
+            self.dialogs.save.return_value = str(destination)
+            self.assertIn('outside', self.bridge.download_logs()['error'])
+            self.assertFalse(destination.exists())
+        destination = self.root / 'export.json'
+        self.dialogs.save.return_value = str(destination)
+        self.assertTrue(self.bridge.download_logs()['ok'])
+        payload = json.loads(destination.read_text(encoding='utf-8'))
+        self.assertEqual(payload['state'], {'status': 'stopped'})
+        self.assertNotIn('unapproved body', destination.read_text())
+        self.assertNotIn('hidden', destination.read_text())
+        self.assertNotIn('sk-testcredential', destination.read_text())
+        self.assertIn('[redacted]', payload['files']['test.txt']['text'])
+        self.assertIn('exists', self.bridge.download_logs()['error'])
+        self.assertEqual((self.logs / 'test.txt').read_bytes(), original)
+        self.controller.start.assert_not_called()
+        self.controller.resume.assert_not_called()
+        self.dialogs.save.return_value = str(self.root / 'missing' / 'export.json')
+        self.assertFalse(self.bridge.download_logs()['ok'])
+
+    def test_download_rejects_directory_change_during_save(self):
+        self.controller.logs = self.logs
+        self.bridge._root = self.logs
+        (self.logs / 'state.json').write_text('{"status":"stopped"}')
+        destination = self.root / 'download.json'
+        def changed(_):
+            self.logs.rename(self.root / 'moved')
+            self.logs.mkdir()
+            return str(destination)
+        self.dialogs.save.side_effect = changed
+        self.assertIn('changed', self.bridge.download_logs()['error'])
+        self.assertFalse(destination.exists())
+
+    def test_download_unavailable_and_native_save_dialog(self):
+        self.assertIn('No run', self.bridge.download_logs()['error'])
+        self.assertIn('No verified', self.bridge.download_audit()['error'])
+        window = Mock()
+        window.create_file_dialog.return_value = ('chosen.json',)
+        webview = SimpleNamespace(FileDialog=SimpleNamespace(SAVE='save'))
+        self.assertEqual(NativeDialogs(webview, window).save('audit-report.json'), 'chosen.json')
+        window.create_file_dialog.assert_called_once_with('save', save_filename='audit-report.json',
+                                                          file_types=('JSON report (*.json)',))
+
+    def test_reopened_cli_and_desktop_audit_exports_rejection_without_launch(self):
+        from auto_coding import plan_audit
+        for nested in (False, True):
+            with self.subTest(desktop=nested):
+                logs = self.logs / ('desktop' if nested else 'cli')
+                audit = logs / 'audit' if nested else logs
+                audit.mkdir(parents=True)
+                repo = self.root / 'target'
+                identity = {'target': {'repo': str(repo)}, 'plan_sha256': 'fixture'}
+                report = {'decision': 'REVISE', 'overall_risk': 'medium', 'summary': 'Needs work',
+                          'recommended_changes': ['Revise'], 'blocking_issues': [], 'tasks': [
+                              {'task_id': 'D07', 'findings': ['Finding'], 'recommended_changes': ['Fix'],
+                               'blocking_issues': []}]}
+                evidence = {'version': plan_audit.VERSION, 'identity': identity,
+                            'configuration': {'reasoning': 'high', 'prompt_version': plan_audit.VERSION,
+                                'permissions': 'b07-read-only-target-scratch-v1', 'model': 'fake'},
+                            'report_sha256': plan_audit.digest(report)}
+                (audit / 'audit-evidence.json').write_text(json.dumps(evidence))
+                (audit / 'audit-report.json').write_text(json.dumps(report))
+                (audit / 'audit-output.txt').write_text('diagnostic password=hidden')
+                ledger = self.root / 'ledger.json'
+                ledger.write_text(json.dumps({'status': 'completed', 'directory': str(audit.resolve()),
+                                              'evidence_sha256': plan_audit.digest(evidence)}))
+                self.bridge._root = logs
+                self.controller.logs = logs
+                self.dialogs.save.return_value = str(self.root / ('desktop.json' if nested else 'cli.json'))
+                with patch.object(plan_audit, 'ledger_path', return_value=ledger):
+                    self.assertTrue(self.bridge.download_audit()['ok'])
+                payload = json.loads(Path(self.dialogs.save.return_value).read_text())
+                self.assertEqual(payload['report'], report)
+                self.assertIn('[redacted]', payload['diagnostics']['audit-output.txt']['text'])
+                self.controller.start.assert_not_called()
+                self.controller.resume.assert_not_called()
+                run_logs = self.logs / ('desktop-run' if nested else 'cli-run')
+                run_logs.mkdir()
+                binding = {'directory': str(audit), 'evidence_sha256': plan_audit.digest(evidence)}
+                (run_logs / 'state.json').write_text(json.dumps({'plan_audit': binding,
+                    'repo': str(repo), 'plan_sha256': 'fixture'}))
+                (run_logs / 'run-manifest.json').write_text(json.dumps({'plan_audit': binding}))
+                self.bridge._root = run_logs
+                self.controller.logs = run_logs
+                self.dialogs.save.return_value = str(self.root / ('desktop-run.json' if nested else 'cli-run.json'))
+                with patch.object(plan_audit, 'ledger_path', return_value=ledger):
+                    self.assertTrue(self.bridge.download_audit()['ok'])
+                (audit / 'audit-report.json').write_text(json.dumps(dict(report, summary='tampered')))
+                with patch.object(plan_audit, 'ledger_path', return_value=ledger):
+                    self.assertIn('changed', self.bridge.download_audit()['error'])
+
     def test_stop_bridge_forwards_exact_identity_without_launch_or_confirmation(self):
         controller = FakeController()
         controller.stop_after_task = Mock(return_value={"ok": True, "stop_requested": True})
@@ -251,7 +354,7 @@ class DesktopBridgeTests(unittest.TestCase):
     def test_public_bridge_surface_contains_only_scoped_methods(self):
         self.assertEqual({name for name in dir(self.bridge) if not name.startswith("_")},
                          {"select_repo", "select_plan", "open_run", "selected_paths",
-                          "job_status", "start", "start_audit", "resume", "stop_after_task", "snapshot", "evidence",
+                          "job_status", "download_audit", "download_logs", "start", "start_audit", "resume", "stop_after_task", "snapshot", "evidence",
                           "connect_github", "github_repositories", "github_branches",
                           "create_github_branch", "checkout_github_branch", "fetch_github", "push_approved_commits"})
 
