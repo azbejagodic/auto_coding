@@ -44,6 +44,37 @@ class FakeController:
 
 
 class DesktopBridgeTests(unittest.TestCase):
+    def test_reopen_cli_run_preserves_progress_duration_errors_without_launch(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            logs = root / "cli-logs"
+            logs.mkdir()
+            (logs / "run-manifest.json").write_text(json.dumps({"task_ids": ["one"],
+                "start_time_utc": "2026-10-25T10:00:00Z"}))
+            state = {"repo": str(root / "target"), "status": "stopped", "completed": ["one"],
+                     "current_task": None, "final_verification_result": {"status": "failed", "outcome": "test_failure"}}
+            (logs / "state.json").write_text(json.dumps(state))
+            (logs / "events.jsonl").write_text(json.dumps({"actor": "controller",
+                "event": "final_verification_finished", "outcome": "failed", "timestamp_utc": "2026-10-25T11:00:00Z"}))
+            controller = DesktopController(root / "runs")
+            with patch("auto_coding.desktop_control.Popen") as launch:
+                self.assertTrue(controller.reopen(logs)["ok"])
+                data = controller.snapshot()
+                self.assertEqual(data["task_count"], 1)
+                self.assertEqual(data["summary"]["current"], 1)
+                self.assertEqual(data["summary"]["duration_seconds"], 3600)
+                self.assertEqual(data["summary"]["error"], "test_failure")
+                self.assertFalse(data["summary"]["completion_confirmed"])
+                self.assertFalse(data["controller"]["active"])
+                self.assertEqual(controller.repo, root / "target")
+                state["status"] = "running"
+                state["final_verification_result"] = {"status": "running"}
+                (logs / "state.json").write_text(json.dumps(state))
+                self.assertTrue(controller.reopen(logs)["ok"])
+                self.assertIsNone(controller.snapshot()["controller"]["active"])
+                launch.assert_not_called()
+                self.assertFalse((logs / "desktop-run.json").exists())
+
     def test_audit_cancel_duplicate_confirmation_and_options(self):
         self.controller.start_audit = Mock(return_value={"ok": True})
         self.dialogs.confirm.return_value = False

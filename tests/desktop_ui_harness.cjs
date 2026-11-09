@@ -32,6 +32,7 @@ let pendingSelection = null;
 let failStatus = false;
 let evidenceReads = 0;
 let snapshotReads = 0;
+let pendingSnapshot = null;
 const api = {
   github_repositories: async () => ({ok:true, available:false, repositories:[], message:'Enter OWNER/REPO manually; Git authentication remains available.'}),
   connect_github: async repository => { calls.push(['connect_github', repository]);
@@ -42,7 +43,7 @@ const api = {
   create_github_branch: async (repository, name, base, confirmed) => { calls.push(['create_github_branch', repository, name, base, confirmed]); data.controller.github.local.push(name); data.controller.preflight.branch = name; return {ok:true}; },
   fetch_github: async repository => { calls.push(['fetch_github', repository]); return {ok:true}; },
   push_approved_commits: async () => { calls.push(['push_approved_commits']); return {ok:false, error:'Remote branch changed. Fetch and review; no force push.'}; },
-  snapshot: async () => { snapshotReads++; if (failStatus) throw Error('status unavailable'); return structuredClone(data); },
+  snapshot: async () => { snapshotReads++; if (pendingSnapshot) await pendingSnapshot; if (failStatus) throw Error('status unavailable'); return structuredClone(data); },
   select_repo: async (...args) => { calls.push(['select_repo', ...args]); if (pendingSelection) await pendingSelection;
     data.controller.repo = 'C:\\project with spaces'; return {ok:true}; },
   select_plan: async (...args) => { calls.push(['select_plan', ...args]); data.controller.plan = 'C:\\plans\\task.json'; data.controller.start_ready = true; return {ok:true}; },
@@ -54,8 +55,13 @@ const api = {
 };
 const listeners = {};
 let poll;
+let tick;
+let now = Date.parse('2026-10-25T12:00:00Z');
+const documentListeners = {};
+document.addEventListener = (name, callback) => { documentListeners[name] = callback; };
 const context = vm.createContext({document, window:{pywebview:{api}, addEventListener:(name, callback) => { listeners[name] = callback; }},
-  setInterval:(callback, ms) => { assert.equal(ms, 4000); poll = callback; }});
+  Date: class extends Date { static now() { return now; } },
+  setInterval:(callback, ms) => { if (ms === 1000) tick = callback; else { assert.equal(ms, 4000); poll = callback; } }});
 vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), context);
 const flush = async () => { await new Promise(resolve => setImmediate(resolve)); };
 const click = async id => { await get(id).onclick(); await flush(); };
@@ -71,6 +77,20 @@ const contents = () => get('app').textContent;
   assert(!contents().includes('Ready for your first run'));
   assert.equal(get('run-setup').hidden, false);
   const initial = structuredClone(data);
+  // Slow native reads are shared; hidden/closed windows do no polling or clock work.
+  let releaseSnapshot;
+  pendingSnapshot = new Promise(resolve => { releaseSnapshot = resolve; });
+  const beforeSlow = snapshotReads;
+  const slow = poll(); const overlapping = poll();
+  assert.equal(snapshotReads, beforeSlow + 1);
+  releaseSnapshot(); await slow; await overlapping; pendingSnapshot = null;
+  document.hidden = true;
+  await poll(); tick();
+  assert.equal(snapshotReads, beforeSlow + 1);
+  document.hidden = false;
+  listeners.pagehide(); await poll(); tick();
+  assert.equal(snapshotReads, beforeSlow + 1);
+  listeners.pageshow(); await flush();
   await click('list-github');
   assert(get('message').textContent.includes('Enter OWNER/REPO manually'));
   assert(get('github-repositories').hidden);
@@ -335,6 +355,10 @@ const contents = () => get('app').textContent;
   data.controller.active = false; data.controller.resume_ready = false;
   data.state.status = 'completed'; data.state.completed = ['task-1'];
   await poll();
+  assert.notEqual(get('run-status').textContent, 'Completed', 'Task approval alone is not batch completion');
+  data.summary = {completion_confirmed:true, verification_status:'passed', current:1,
+    start_utc:'2026-10-25T10:00:00Z', duration_seconds:3661};
+  await poll();
   data.controller.exit_code = 1;
   data.controller.error = 'Runner stopped with exit code 1; inspect state.json and events.jsonl.';
   data.controller.process_history = [{exit_code:1, message:'Prior process failure'}];
@@ -342,6 +366,16 @@ const contents = () => get('app').textContent;
   assert.equal(get('run-status').textContent, 'Completed');
   assert.equal(get('header-state').textContent, 'Completed');
   assert.equal(get('header-state').className, 'pill green');
+  assert.equal(get('run-time').textContent, '01:01:01');
+  assert(get('time-hint').textContent.includes('Persisted duration'));
+  now += 5000; tick(); assert.equal(get('run-time').textContent, '01:01:01');
+  data.summary.verification_status = 'failed'; data.summary.completion_confirmed = false;
+  data.summary.error = 'test_failure <script>bad()</script>';
+  await poll();
+  assert.equal(get('run-status').textContent, 'Failed');
+  assert(contents().includes('test_failure <script>bad()</script>'));
+  data.summary.verification_status = 'passed'; data.summary.completion_confirmed = true; delete data.summary.error;
+  await poll();
   assert(!contents().includes('Runner stopped with exit code 1'));
   await click('nav-logs');
   assert(contents().includes('Runner stopped with exit code 1'));
@@ -380,6 +414,12 @@ const contents = () => get('app').textContent;
   data.controller.active = true;
   await poll();
   assert.equal(get('run-status').textContent, 'Running');
+  assert.equal(get('run-time').textContent, '02:00:05');
+  assert(get('time-hint').textContent.includes('Live wall time'));
+  const beforeTick = snapshotReads; now += 1000; tick();
+  assert.equal(get('run-time').textContent, '02:00:06');
+  assert.equal(snapshotReads, beforeTick, 'Clock never calls the bridge');
+  data.state.status = 'stopping'; await poll(); assert.equal(get('run-status').textContent, 'Stopping');
   assert.notEqual(get('header-state').textContent, 'Completed');
   data.controller.active = null; data.controller.uncertain = true; data.controller.error = 'Unknown launch; inspect logs';
   await poll();
@@ -388,6 +428,7 @@ const contents = () => get('app').textContent;
   assert(get('start').disabled && get('resume').disabled);
   data.root = data.controller.logs = 'C:\\legacy'; data.controller.active = false; data.controller.uncertain = false;
   data.state = null; data.events = []; data.state_error = 'state.json is corrupt or unreadable';
+  delete data.summary;
   data.files = [{label:'File', path:'legacy.txt', status:'available'}];
   await poll(); await click('nav-logs');
   assert(contents().includes('No events recorded'));

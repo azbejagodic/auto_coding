@@ -154,9 +154,9 @@ progress{width:100%;height:12px;accent-color:#72adf9}
 </div>
 <p id="start-reason" class="muted">Start requires verified audit approval for the exact selected plan and target, and native authorization.</p>
 <p id="run-unavailable" class="muted">Desktop stop and log download are not wired yet. Read recorded evidence in Logs.</p>
-<dl class="run-summary" aria-live="polite" aria-atomic="true">
-<div><dt>Status</dt><dd id="run-status">Idle</dd></div>
-<div><dt>Task current/total</dt><dd id="run-task">-- / --</dd></div>
+<dl class="run-summary">
+<div><dt>Status</dt><dd id="run-status" role="status" aria-live="polite">Idle</dd></div>
+<div><dt>Task current/total</dt><dd id="run-task" role="status" aria-live="polite">-- / --</dd></div>
 <div><dt>Time <small>(HH:MM:SS)</small></dt><dd id="run-time" aria-describedby="time-hint">--:--:--</dd></div>
 </dl>
 <p id="time-hint" class="muted">Elapsed time is unavailable in the current desktop snapshot.</p>
@@ -250,9 +250,10 @@ let logQuery = '';
 function runPresentation(data) {
   const c = data.controller || {}, state = data.state || {};
   if (c.uncertain || (c.active !== false && c.active !== true)) return {label:'Unknown child status', color:'amber'};
-  if (c.active) return {label:'Running', color:'blue'};
+  if (c.active) return {label:state.status === 'stopping' ? 'Stopping' : 'Running', color:'blue'};
   if (state.publication?.outcome === 'pending') return {label:'Approved locally, push pending', color:'amber'};
-  if (state.status === 'completed') return {label:'Completed', color:'green'};
+  if (data.summary?.verification_status === 'failed' || state.status === 'failed') return {label:'Failed', color:'red'};
+  if (state.status === 'completed' && data.summary?.completion_confirmed === true) return {label:'Completed', color:'green'};
   if (state.status === 'checkpointing' || state.pending_checkpoint) return {label:'Awaiting recovery', color:'amber'};
   if (state.status === 'stopped') return {label:'Stopped', color:'amber'};
   if (c.logs || data.root) return {label:state.status ? 'Unknown run state' : 'Awaiting recorded state', color:'amber'};
@@ -265,6 +266,22 @@ let ready = false;
 let refreshing = null;
 let evidenceRoot = null;
 let renderKey = null;
+let closed = false;
+function updateElapsed(now = Date.now()) {
+  const data = latest || {}, c = data.controller || {}, summary = data.summary || {};
+  const start = Date.parse(summary.start_utc);
+  const live = c.active === true && !c.uncertain && Number.isFinite(start) && now >= start;
+  const seconds = live ? Math.floor((now - start) / 1000) : summary.duration_seconds;
+  const valid = typeof seconds === 'number' && Number.isFinite(seconds) && seconds >= 0;
+  const whole = Math.floor(seconds);
+  const text = valid
+    ? [Math.floor(whole / 3600), Math.floor(whole / 60) % 60, whole % 60].map(n => String(n).padStart(2, '0')).join(':') : '--:--:--';
+  const hint = live ? 'Live wall time since persisted start UTC (includes pauses).'
+    : valid ? 'Persisted duration from recorded UTC events (includes pauses).'
+    : 'Elapsed time is unavailable: no confirmed start and end, or process status is unknown.';
+  if (document.getElementById('run-time').textContent !== text) document.getElementById('run-time').textContent = text;
+  if (document.getElementById('time-hint').textContent !== hint) document.getElementById('time-hint').textContent = hint;
+}
 const expanded = new Set();
 const controls = ['github-repo', 'connect-github', 'list-github', 'github-repositories', 'github-branch', 'select-branch', 'new-branch', 'fetch-github', 'branch-name', 'branch-base', 'branch-base-confirm', 'create-branch', 'cancel-branch', 'push-approved', 'browse-project', 'browse-plan', 'open-run', 'start', 'resume', 'attempts'];
 function detail(title, text, key) {
@@ -358,6 +375,7 @@ function render(data) {
   const searchFocused = document.activeElement?.id === 'log-search';
   const searchCursor = searchFocused ? document.activeElement.selectionStart : null;
   latest = data;
+  updateElapsed();
   const c = data.controller || {};
   const key = page + JSON.stringify(data);
   updateControls();
@@ -427,6 +445,7 @@ function render(data) {
     if (count == null || Number.isInteger(count) && position <= count) taskNumber = position;
   }
   document.getElementById('run-task').textContent = taskNumber + ' / ' + (count ?? '--');
+  if (data.summary) document.getElementById('run-task').textContent = (data.summary.current ?? '--') + ' / ' + (count ?? '--');
   const badge = document.getElementById('header-state');
   badge.textContent = presentation.label;
   badge.className = 'pill ' + presentation.color;
@@ -455,6 +474,7 @@ function render(data) {
   const reconciled = presentation.label === 'Completed' || c.active === false && !c.uncertain && state.status === 'checkpointing';
   if (c.error && !reconciled) app.append(el('div', c.error, 'notice warning'));
   if (data.state_error) app.append(el('div', data.state_error, 'warning'));
+  if (data.summary?.error) { const error = el('div', 'Recorded error: ' + data.summary.error, 'notice warning'); error.setAttribute('role', 'alert'); app.append(error); }
   if (data.empty) app.append(el('div', 'No run state or events found. Select a project and plan to START, or inspect available raw files in Logs.', 'empty'));
   if (c.logs && !data.exists && !data.state_error) app.append(el('div', 'Log directory is missing or unavailable.', 'warning'));
   if (state.pending_checkpoint) app.append(el('div', 'A checkpoint is pending reconciliation. No completion is inferred.', 'warning'));
@@ -463,16 +483,17 @@ function render(data) {
   (data.event_errors || []).forEach(error => app.append(el('div', error, 'warning')));
   if (page === 'overview') {
     const count = data.task_count ?? c.task_count;
-    if (count > 0 && completed) {
+    const completedCount = data.summary ? data.summary.completed : completed?.length;
+    if (count > 0 && Number.isInteger(completedCount) && completedCount <= count) {
       const progress = el('progress');
-      progress.setAttribute('max', count); progress.setAttribute('value', completed.length);
+      progress.setAttribute('max', count); progress.setAttribute('value', completedCount);
       progress.setAttribute('aria-label', 'Completed tasks');
       app.append(progress);
     }
     const current = panel('Current task');
     current.append(el('div', 'Current task: ' + (state.current_task || 'No task in progress'), 'value'));
     if (state.status === 'stopped') current.append(el('p', 'Run stopped. Review attempts in Tasks or raw evidence in Logs.', 'muted'));
-    if (count != null && completed) current.append(el('p', 'Tasks remaining: ' + Math.max(0, count - completed.length)));
+    if (count != null && Number.isInteger(completedCount) && completedCount <= count) current.append(el('p', 'Tasks remaining: ' + (count - completedCount)));
     if (history.length) current.append(detail('Latest attempt details', JSON.stringify(history[history.length - 1], null, 2), 'latest-attempt'));
     const diagnostics = el('details');
     diagnostics.open = expanded.has('run-details');
@@ -544,11 +565,12 @@ function navigate(name) {
   if (latest) render(latest);
 }
 async function refresh(clearMessage = true) {
-  if (!ready || busy) return;
+  if (!ready || busy || closed || document.hidden) return;
   if (refreshing) return refreshing;
   refreshing = (async () => {
-    try { const data = await window.pywebview.api.snapshot(); if (clearMessage) message(''); render(data); }
+    try { const data = await window.pywebview.api.snapshot(); if (closed || document.hidden) return; if (clearMessage) message(''); render(data); }
     catch (error) {
+      if (closed || document.hidden) return;
       latest = {...(latest || {}), controller: {...(latest?.controller || {}), active: null, uncertain: true, audit:{status:'Unknown', verified:false}, start_ready:false, audit_ready:false}};
       render(latest);
       message('Could not load status: ' + error, true);
@@ -647,7 +669,11 @@ Object.entries({'browse-project':'select_repo', 'browse-plan':'select_plan', 'op
 document.getElementById('audit-model').oninput = updateControls;
 updateControls();
 window.addEventListener('pywebviewready', () => { ready = true; refresh(); });
-setInterval(refresh, 4000);
+window.addEventListener('pagehide', () => { closed = true; });
+window.addEventListener('pageshow', () => { closed = false; refresh(false); });
+document.addEventListener?.('visibilitychange', () => { if (!document.hidden && !closed) { updateElapsed(); refresh(false); } });
+setInterval(() => { if (!closed && !document.hidden) updateElapsed(); }, 1000);
+setInterval(() => refresh(false), 4000);
 </script></body></html>'''
 
 

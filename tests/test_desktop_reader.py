@@ -10,6 +10,83 @@ from auto_coding.desktop_app import HTML
 
 
 class DesktopReaderTests(unittest.TestCase):
+    def test_cli_progress_clock_and_final_verification_evidence(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = {"task_ids": ["durable-b", "durable-a"], "start_time_utc": "2026-10-25T10:00:00Z"}
+            state = {"status": "running", "completed": ["durable-b"], "current_task": "durable-a"}
+            def snapshot():
+                (root / "run-manifest.json").write_text(json.dumps(manifest))
+                (root / "state.json").write_text(json.dumps(state))
+                return read_run(root)["summary"]
+            self.assertEqual(snapshot()["current"], 2)
+            state["completed"] = ["durable-b", "durable-a"]
+            self.assertEqual(snapshot()["current"], 2)  # checkpoint and retry keep their ID position
+            state.update(status="completed", current_task=None)
+            self.assertFalse(snapshot()["completion_confirmed"])
+            state["final_verification_result"] = {"status": "failed", "outcome": "test_failure"}
+            self.assertEqual(snapshot()["error"], "test_failure")
+            self.assertFalse(snapshot()["completion_confirmed"])
+            state["final_verification_result"] = {"status": "passed", "tests": [
+                {"exit_code": 0, "timed_out": False, "cleanup_confirmed": True, "output": "final-test.txt"}]}
+            self.assertFalse(snapshot()["completion_confirmed"], "Missing test evidence")
+            (root / "final-test.txt").write_text("Ran 1 test\nOK\n")
+            event = {"actor": "controller", "event": "run_completed", "outcome": "success",
+                     "timestamp_utc": "2026-10-25T11:01:01Z"}
+            (root / "events.jsonl").write_text(json.dumps(event) + "\n")
+            summary = snapshot()
+            self.assertTrue(summary["completion_confirmed"])
+            self.assertEqual(summary["current"], 2)
+            self.assertEqual(summary["duration_seconds"], 3661)
+            self.assertEqual(read_run(root)["summary"], summary, "Reopening uses persisted clock evidence")
+            with (root / "events.jsonl").open("a") as stream:
+                stream.write('{"event":')
+            self.assertFalse(snapshot()["completion_confirmed"], "A torn event cannot establish completion")
+
+    def test_missing_malformed_legacy_clocks_and_task_ids(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "state.json").write_text(json.dumps({"status": "completed", "created_utc": "yesterday",
+                                                       "completed": ["duplicate", "duplicate"]}))
+            summary = read_run(root)["summary"]
+            self.assertIsNone(summary["start_utc"])
+            self.assertIsNone(summary["duration_seconds"])
+            self.assertIsNone(summary["completed"])
+            self.assertFalse(summary["completion_confirmed"])
+            (root / "run-manifest.json").write_text('{"task_ids":["duplicate","duplicate"]}')
+            self.assertIsNone(read_run(root)["task_count"])
+            (root / "events.jsonl").write_text(json.dumps({"actor": "controller", "event": "run_started",
+                "timestamp_utc": "2026-10-25T12:00:00Z"}) + "\n" + json.dumps({"actor": "controller",
+                "event": "stopped", "timestamp_utc": "2026-10-25T11:00:00Z"}))
+            summary = read_run(root)["summary"]
+            self.assertEqual(summary["start_utc"], "2026-10-25T12:00:00+00:00")
+            self.assertIsNone(summary["duration_seconds"], "Clock reversal cannot create a negative duration")
+
+    def test_legacy_counts_resume_and_malformed_event_fields(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            state = {"status": "stopped", "completed": ["first"], "current_task": "second"}
+            (root / "state.json").write_text(json.dumps(state))
+            events = [
+                {"actor": "controller", "event": "run_started", "timestamp_utc": "2026-10-25T10:00:00Z"},
+                {"actor": "controller", "event": "plan_validated", "metadata": {"task_count": 3}},
+                {"actor": "controller", "event": "stopped", "timestamp_utc": "2026-10-25T11:00:00Z",
+                 "metadata": {"reason": "attempt limit"}}]
+            def snapshot():
+                (root / "events.jsonl").write_text("\n".join(json.dumps(e) for e in events))
+                return read_run(root)
+            data = snapshot()
+            self.assertEqual(data["task_count"], 3)
+            self.assertEqual(data["summary"]["current"], 2)
+            self.assertEqual(data["summary"]["duration_seconds"], 3600)
+            self.assertEqual(data["summary"]["error"], "attempt limit")
+            events.append({"actor": "controller", "event": "resume_started", "timestamp_utc": "2026-10-25T12:00:00Z"})
+            data = snapshot()
+            self.assertTrue(data["summary"]["execution_open"])
+            self.assertIsNone(data["summary"]["duration_seconds"], "Previous stop duration must not describe a resumed run")
+            events.append({"actor": "controller", "event": [], "metadata": [], "timestamp_utc": {}})
+            self.assertFalse(snapshot()["summary"]["completion_confirmed"])
+
     def test_populated_run_and_sequence_sort(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

@@ -2,10 +2,90 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 MAX_JSON = 4 * 1024 * 1024
 MAX_EVIDENCE = 1024 * 1024
+
+
+def _utc(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if stamp.utcoffset() is None or stamp.utcoffset().total_seconds() != 0:
+            return None
+        return stamp.astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def run_summary(data, manifest):
+    """Derive display evidence only; this never authorizes launch or recovery."""
+    state = data.get("state") or {}
+    events = [e for e in data["events"] if e.get("actor") == "controller"
+              and (not state.get("run_id") or e.get("run_id") == state["run_id"])]
+    if state.get("run_id") and manifest.get("run_id") and state["run_id"] != manifest["run_id"]:
+        data["event_errors"].append("Run manifest and state identities do not match.")
+    ids = manifest.get("task_ids")
+    completed = state.get("completed")
+    valid_completed = (isinstance(completed, list)
+                       and all(isinstance(i, str) and i for i in completed)
+                       and len(set(completed)) == len(completed))
+    current = state.get("current_task")
+    if data["task_count"] is None:
+        for event in events:
+            metadata = event.get("metadata")
+            count = metadata.get("task_count") if isinstance(metadata, dict) else None
+            if event.get("event") == "plan_validated" and type(count) is int and count > 0:
+                data["task_count"] = count
+    position = None
+    if ids is not None and valid_completed:
+        if completed != ids[:len(completed)]:
+            data["event_errors"].append("Completed task IDs do not match the run manifest.")
+            valid_completed = False
+        elif current in ids:
+            position = ids.index(current) + 1
+        elif current is None and completed == ids:
+            position = len(ids)
+    elif valid_completed and isinstance(current, str) and current:
+        position = completed.index(current) + 1 if current in completed else len(completed) + 1
+        if data["task_count"] is not None and position > data["task_count"]:
+            position = None
+            valid_completed = False
+    start = _utc(manifest.get("start_time_utc")) or _utc(state.get("created_utc"))
+    if start is None:
+        start = next((_utc(e.get("timestamp_utc")) for e in events
+                      if e.get("event") == "run_started" and _utc(e.get("timestamp_utc"))), None)
+    lifecycle = [e for e in events if e.get("event") in (
+        "run_started", "resume_started", "stopped", "run_completed",
+        "final_verification_started", "final_verification_finished")]
+    last = lifecycle[-1] if lifecycle else {}
+    terminal = (last.get("event") in ("stopped", "run_completed")
+                or last.get("event") == "final_verification_finished" and last.get("outcome") == "failed")
+    end = _utc(last.get("timestamp_utc")) if terminal else None
+    verification = state.get("final_verification_result")
+    verification = verification if isinstance(verification, dict) else {}
+    tests = verification.get("tests")
+    verified = (verification.get("status") == "passed" and isinstance(tests, list) and bool(tests)
+                and all(isinstance(t, dict) and t.get("exit_code") == 0
+                        and t.get("timed_out") is False and t.get("cleanup_confirmed") is True
+                        and isinstance(t.get("output"), str)
+                        and evidence_status(data["root"], t["output"]) == "available" for t in tests))
+    complete = (state.get("status") == "completed" and verified and ids is not None
+                and completed == ids and not state.get("pending_checkpoint")
+                and last.get("event") == "run_completed" and last.get("outcome") == "success"
+                and not data["state_error"] and not data["event_errors"])
+    metadata = last.get("metadata")
+    error = (verification.get("outcome") if verification.get("status") == "failed" else
+             metadata.get("reason") if last.get("event") == "stopped" and isinstance(metadata, dict) else None)
+    return {"current": position, "completed": len(completed) if valid_completed else None,
+            "completion_confirmed": complete, "verification_status": verification.get("status"),
+            "error": error, "execution_open": bool(lifecycle) and not terminal,
+            "start_utc": start.isoformat() if start else None,
+            "duration_seconds": (end - start).total_seconds() if start and end and end >= start else None,
+            "terminal_recorded": terminal}
 
 
 def _json_file(path: Path):
@@ -46,6 +126,7 @@ def evidence_status(log_root: str | Path, relative_path: str) -> str:
 def read_run(log_root: str | Path) -> dict:
     """Return a JSON-safe snapshot; malformed sources are reported as plain text."""
     root = Path(log_root).expanduser()
+    manifest_value = {}
     result = {"root": str(root), "exists": root.is_dir(), "state": None,
               "state_error": None, "events": [], "event_errors": [], "empty": True,
               "files": [], "task_count": None}
@@ -56,8 +137,11 @@ def read_run(log_root: str | Path) -> dict:
         manifest = root / "run-manifest.json"
         if manifest.exists() or manifest.is_symlink():
             value = _json_file(_confined_log_file(root, "run-manifest.json"))
-            if not isinstance(value, dict) or not isinstance(value.get("task_ids"), list):
+            if (not isinstance(value, dict) or not isinstance(value.get("task_ids"), list)
+                    or not all(isinstance(i, str) and i for i in value["task_ids"])
+                    or len(set(value["task_ids"])) != len(value["task_ids"])):
                 raise ValueError("manifest must contain task_ids")
+            manifest_value = value
             result["task_count"] = len(value["task_ids"])
     except (OSError, UnicodeError, ValueError) as exc:
         result["event_errors"].append(f"run-manifest.json is corrupt or unreadable: {exc}")
@@ -123,6 +207,7 @@ def read_run(log_root: str | Path) -> dict:
         except (OSError, UnicodeError, ValueError) as exc:
             result["event_errors"].append(f"events.jsonl could not be read: {exc}")
     result["empty"] = not result["state"] and not result["events"] and not result["event_errors"] and not result["state_error"]
+    result["summary"] = run_summary(result, manifest_value)
     return result
 
 

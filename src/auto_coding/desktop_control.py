@@ -485,16 +485,23 @@ class DesktopController:
         # A reopened launch with no valid persisted PID is neither confirmed
         # running nor confirmed stopped. Do not tell the dashboard it is idle:
         # use JSON null for active and surface an explicit actionable warning.
-        uncertain = self._launch_uncertain or self._selected_run_unknown()
+        recorded = read_run(self.logs) if self.logs else {}
+        state = recorded.get("state") or {}
+        metadata = self._read_metadata()
+        cli_unknown = (self.process is None and self._detached_pid is None and metadata is None
+                       and bool(state) and (state.get("status") not in ("stopped", "completed", "failed")
+                       or recorded.get("summary", {}).get("execution_open")
+                       or (isinstance(state.get("final_verification_result"), dict)
+                           and state["final_verification_result"].get("status") in ("prepared", "running"))))
+        uncertain = self._launch_uncertain or self._selected_run_unknown() or cli_unknown
         if uncertain and self.process is None and self._detached_pid is None:
             active = None
             if not self.error:
-                self.error = self._metadata_error or ("Run launch status is unknown: metadata says launching/running "
-                              "without a valid child PID. The runner may still be active. "
+                self.error = self._metadata_error or ("Run process status is unknown: no confirmed child activity is available. "
+                              "The runner may still be active. "
                               "Inspect the process and logs before starting or resuming.")
         else:
             active = self.process is not None or (self._detached_pid is not None and self._pid_active(self._detached_pid))
-        state = read_run(self.logs).get("state") if self.logs else None
         # A durable result cannot prove that an active/unknown child is idle.
         outcome = ("unknown" if uncertain or active is None else "active" if active else
                    (state or {}).get("status", "unavailable"))
@@ -523,6 +530,17 @@ class DesktopController:
         result = self.select_logs(logs)
         if not result["ok"]: return result
         self.repository = None
+        self.error = None
+        self._launch_uncertain = False
+        self._detached_pid = None
+        self.process_history = []
+        self.exit_code = None
+        # CLI logs use the same state and manifest, without desktop metadata.
+        # Recover the target for display; selecting the original plan remains
+        # necessary for resume authorization when its path was never persisted.
+        recorded = read_run(self.logs).get("state") or {}
+        self.repo = Path(recorded["repo"]) if isinstance(recorded.get("repo"), str) and recorded["repo"] else None
+        self.plan = None
         # CLI-produced audit directories have no desktop launch metadata. Their
         # identity supplies only the target; select the exact plan for validation.
         if (self.logs / "audit-evidence.json").is_file():
