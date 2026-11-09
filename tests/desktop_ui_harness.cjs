@@ -17,6 +17,8 @@ class Element {
 const nodes = new Map();
 const get = id => { if (!nodes.has(id)) nodes.set(id, new Element(id)); return nodes.get(id); };
 get('attempts').value = '3';
+get('audit-model').value = '';
+get('audit-goal').value = '';
 get('audit-result').textContent = 'Not audited';
 get('audit-result').className = 'pill muted';
 const document = {getElementById: get, createElement: tag => new Element(tag),
@@ -46,6 +48,7 @@ const api = {
   select_plan: async (...args) => { calls.push(['select_plan', ...args]); data.controller.plan = 'C:\\plans\\task.json'; data.controller.start_ready = true; return {ok:true}; },
   open_run: async (...args) => { calls.push(['open_run', ...args]); return {ok:true, cancelled:true}; },
   start: async (...args) => { calls.push(['start', ...args]); if (launchResult.ok) { data.controller.active = true; data.controller.logs = data.root = 'C:\\runs\\one'; data.exists = true; data.empty = false; } return launchResult; },
+  start_audit: async (...args) => { calls.push(['start_audit', ...args]); return launchResult; },
   resume: async (...args) => { calls.push(['resume', ...args]); data.controller.active = true; data.controller.resume_ready = false; return {ok:true}; },
   evidence: async name => { evidenceReads++; return {ok:true, text:'<img src=x onerror=bad()> original evidence: ' + name}; }
 };
@@ -141,6 +144,18 @@ const contents = () => get('app').textContent;
   }
   data.controller.start_ready = true; data.controller.preflight.errors = [];
   await poll();
+  assert(get('start-audit').disabled, 'Audit requires an explicit model');
+  get('audit-model').value = 'audit-model'; get('audit-model').oninput();
+  get('audit-goal').value = 'Complete the goal';
+  assert.equal(get('start-audit').disabled, false);
+  await click('start-audit');
+  assert.deepEqual(calls.at(-1), ['start_audit', 'audit-model', 'Complete the goal']);
+  assert(get('message').textContent.includes('Cancelled'));
+  data.controller.audit = {status:'REVISE', identity:{plan_sha256:'<img onerror=bad()>'}, report:{decision:'REVISE'}};
+  await poll();
+  assert.equal(get('audit-result').textContent, 'REVISE');
+  assert(get('audit-identity').textContent.includes('<img onerror=bad()>'));
+  delete data.controller.audit;
   const attempts = get('attempts');
   data.controller.resume_ready = true;
   await poll(); // Sync simulated status before asserting Resume is enabled.

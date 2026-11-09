@@ -160,7 +160,7 @@ def verify_resume(engine, state, manifest, repo, plan_sha, tasks):
         raise engine.PilotError(f"Saved plan audit validation failed: {exc}") from exc
 
 
-def audit(engine, plan, repo, logs, *, model, execute, timeout=300, goal="", final_verification_config=None,
+def audit_inputs(engine, plan, repo, *, model, timeout=300, goal="", final_verification_config=None,
           controller_tests=None):
     if not isinstance(model, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", model):
         raise engine.PilotError("Provide an explicit supported --audit-model")
@@ -185,6 +185,17 @@ def audit(engine, plan, repo, logs, *, model, execute, timeout=300, goal="", fin
     configuration = {"model": model, "reasoning": "high", "goal": goal, "prompt_version": VERSION,
                      "controller_tests": controller_tests is True,
                      "permissions": "b07-read-only-target-scratch-v1", "timeout": timeout}
+    return tasks, raw, identity, configuration
+
+
+def audit(engine, plan, repo, logs, *, model, execute, timeout=300, goal="", final_verification_config=None,
+          controller_tests=None):
+    tasks, raw, identity, configuration = audit_inputs(
+        engine, plan, repo, model=model, timeout=timeout, goal=goal,
+        final_verification_config=final_verification_config, controller_tests=controller_tests)
+    repo = Path(identity["target"]["repo"])
+    target, plan_sha = identity["target"], identity["plan_sha256"]
+    policy, controller_tests = identity["verification_policy"], configuration["controller_tests"]
     ledger = ledger_path(repo, identity)
     if ledger.exists():
         prior = read_json(ledger)
@@ -208,6 +219,9 @@ def audit(engine, plan, repo, logs, *, model, execute, timeout=300, goal="", fin
     try:
         engine.workflow_preflight(repo, logs, engine.git, check=engine.check_cli if production else None,
                                   probe=engine.probe_review_storage if production else None)
+        if production:
+            from auto_coding.reviewer_permissions import check_audit_model
+            check_audit_model(model, repo)
         schema_path, answer = logs / "audit-schema.json", logs / "audit-answer.json"
         engine.save_json(schema_path, schema([t["id"] for t in tasks]))
         base = engine.codex_argv(readonly=True, last_message=answer, schema=schema_path, model=model)

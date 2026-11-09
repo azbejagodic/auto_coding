@@ -428,4 +428,172 @@ class DesktopControlTests(unittest.TestCase):
         self.assertEqual(json.loads((logs / "desktop-run.json").read_text())["status"], "stopped")
 
 
+class DesktopAuditTests(unittest.TestCase):
+    def setUp(self):
+        # Reuse disposable Git and deterministic read-only auditor fixtures.
+        from test_plan_audit import PlanAuditTests
+        self.fixture = PlanAuditTests()
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        self.controller = DesktopController(self.fixture.root / "desktop-runs")
+        self.controller.select_repo(self.fixture.repo)
+        self.controller.select_plan(self.fixture.plan)
+
+    def launch(self):
+        with patch("auto_coding.desktop_control.check_audit_model"), patch(
+                "auto_coding.desktop_control.Popen", side_effect=FakeProcess) as spawn:
+            result = self.controller.start_audit("fake-audit-model", "Complete the goal")
+        self.assertTrue(result["ok"], result)
+        return spawn.call_args
+
+    def test_cli_argv_identity_external_storage_and_duplicate_click(self):
+        args, options = self.launch()
+        argv = args[0]
+        self.assertEqual(argv, [__import__('sys').executable, '-B', '-m', 'auto_coding.simple_run',
+            'audit', '--repo', str(self.fixture.repo), '--logs', str(self.controller.logs / 'audit'),
+            '--audit-model', 'fake-audit-model', '--audit-goal', 'Complete the goal',
+            '--timeout', '300', str(self.fixture.plan)])
+        self.assertFalse(options['shell'])
+        self.assertEqual(options['env']['PYTHONPATH'], str(Path(__file__).resolve().parents[1] / 'src'))
+        saved = json.loads((self.controller.logs / 'desktop-audit.json').read_text())
+        self.assertEqual(saved['identity'], self.fixture.identity())
+        self.assertEqual(saved['configuration']['reasoning'], 'high')
+        self.assertIs(saved['configuration']['controller_tests'], False)
+        self.assertFalse(self.controller.logs.is_relative_to(self.fixture.repo))
+        self.assertEqual(self.controller.audit_status()['status'], 'Running')
+        with patch('auto_coding.desktop_control.Popen') as spawn:
+            self.assertFalse(self.controller.start_audit('fake-audit-model')['ok'])
+            spawn.assert_not_called()
+        self.controller.process.code = 0
+        self.controller.poll()
+        self.assertEqual(self.controller.audit_status()['status'], 'Failed')
+        with patch('auto_coding.desktop_control.check_audit_model'), patch('auto_coding.desktop_control.Popen') as spawn:
+            result = self.controller.start_audit('fake-audit-model')
+            self.assertIn('already recorded', result['error'])
+            spawn.assert_not_called()
+        self.assertFalse(self.controller.resume()['ok'])
+
+    def test_crash_unknown_pid_and_failed_spawn_never_retry(self):
+        self.launch()
+        logs = self.controller.logs
+        with patch.object(DesktopController, '_pid_active', return_value=True):
+            live = DesktopController(self.controller.runs_dir)
+            live.reopen(logs)
+            self.assertEqual(live.audit_status()['status'], 'Running')
+        metadata = json.loads((logs / 'desktop-run.json').read_text())
+        metadata.pop('pid')
+        (logs / 'desktop-run.json').write_text(json.dumps(metadata))
+        reopened = DesktopController(self.controller.runs_dir)
+        self.assertTrue(reopened.reopen(logs)['ok'])
+        self.assertIsNone(reopened.job_status()['active'])
+        self.assertEqual(reopened.audit_status()['status'], 'Uncertain')
+        with patch('auto_coding.desktop_control.Popen') as spawn:
+            self.assertFalse(reopened.start_audit('fake-audit-model')['ok'])
+            spawn.assert_not_called()
+        self.controller.process.code = 1
+        self.controller.poll()
+
+    def test_constructed_command_executes_existing_cli_audit_only(self):
+        from auto_coding import simple_run as runner
+        import contextlib
+        import io
+        args, _ = self.launch()
+        # The fake launcher has claimed the reservation. Its confirmed exit
+        # lets this test execute the exact CLI argv in-process with a fake agent.
+        self.controller.process.code = 0
+        self.controller.poll()
+        original = runner.audit
+        def fake_agent(*args, **kwargs):
+            return original(*args, execute=self.fixture.execute, **kwargs)
+        before = self.fixture.files()
+        with patch.object(runner, 'audit', side_effect=fake_agent), patch.object(
+                runner.shutil, 'which', return_value='codex'), patch.object(runner, 'run') as implementation, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(runner.main(args[0][4:]), 0)
+            implementation.assert_not_called()
+        self.assertEqual(self.fixture.files(), before)
+        self.assertEqual(len(self.fixture.calls), 1)
+        self.assertEqual(self.controller.audit_status()['status'], 'APPROVE')
+        reopened = DesktopController(self.controller.runs_dir)
+        reopened.reopen(self.controller.logs)
+        self.assertEqual(reopened.audit_status()['status'], 'APPROVE')
+        self.controller.exit_code = 1
+        self.assertEqual(self.controller.audit_status()['status'], 'Failed')
+        self.controller.exit_code = 0
+        identity = self.controller.audit_status()['identity']
+        (self.fixture.repo / 'changed-source').write_text('changed after audit')
+        self.assertEqual(reopened.audit_status()['status'], 'Uncertain')
+        self.assertEqual(reopened.audit_status()['identity'], identity)
+
+    def test_failed_spawn_consumes_desktop_intent_and_preserves_diagnostics(self):
+        with patch('auto_coding.desktop_control.check_audit_model'), patch(
+                'auto_coding.desktop_control.Popen', side_effect=OSError('spawn failed')) as spawn:
+            self.assertFalse(self.controller.start_audit('fake-audit-model')['ok'])
+            logs = self.controller.logs
+            self.assertTrue((logs / 'desktop-audit.json').is_file())
+            self.assertTrue((logs / 'runner-output.txt').is_file())
+            self.assertFalse(self.controller.start_audit('fake-audit-model')['ok'])
+            spawn.assert_called_once()
+
+    def test_powershell_cli_reports_load_without_second_model_call(self):
+        from auto_coding import simple_run as runner
+        from auto_coding.desktop_app import Bridge
+        import contextlib
+        import io
+        for decision in ('APPROVE', 'REVISE', 'BLOCK'):
+            with self.subTest(decision=decision):
+                # Each input version receives its own one-shot identity.
+                self.fixture.document['tasks'][0]['prompt'] = 'Plan for ' + decision
+                self.fixture.plan.write_text(json.dumps(self.fixture.document))
+                self.fixture.report['decision'] = decision
+                self.fixture.report['recommended_changes'] = ['Revise scope'] if decision == 'REVISE' else []
+                self.fixture.report['blocking_issues'] = ['Dependency missing'] if decision == 'BLOCK' else []
+                directory = self.fixture.root / decision
+                original = runner.audit
+                def fake_agent(*args, **kwargs):
+                    return original(*args, execute=self.fixture.execute, **kwargs)
+                with patch.object(runner, 'audit', side_effect=fake_agent), patch.object(
+                        runner.shutil, 'which', return_value='codex'), contextlib.redirect_stdout(io.StringIO()):
+                    code = runner.main(['audit', '--repo', str(self.fixture.repo), '--logs', str(directory),
+                        '--audit-model', 'fake-audit-model', '--audit-goal', 'CLI goal', '--timeout', '300',
+                        str(self.fixture.plan)])
+                self.assertEqual(code, 0 if decision == 'APPROVE' else 1)
+                count = len(self.fixture.calls)
+                controller = DesktopController(self.controller.runs_dir)
+                controller.reopen(directory)
+                controller.select_plan(self.fixture.plan)
+                self.assertEqual(controller.audit_status()['status'], decision)
+                with patch('auto_coding.desktop_control.Popen') as spawn, patch(
+                        'auto_coding.desktop_control.check_audit_model') as check:
+                    self.assertTrue(controller.start_audit('fake-audit-model')['reused'])
+                    spawn.assert_not_called()
+                    check.assert_not_called()
+                self.assertEqual(len(self.fixture.calls), count)
+                bridge = Bridge(controller=controller)
+                self.assertEqual(bridge.job_status()['audit']['report']['decision'], decision)
+                (directory / 'audit-report.json').write_text('{}')
+                self.assertEqual(controller.audit_status()['status'], 'Uncertain')
+
+    def test_missing_model_auth_config_and_dirty_target_fail_before_spawn(self):
+        with patch('auto_coding.desktop_control.Popen') as spawn:
+            self.assertIn('audit-model', self.controller.start_audit('')['error'])
+            with patch('auto_coding.desktop_control.check_audit_model', side_effect=ValueError('Sign in first')):
+                self.assertIn('Sign in', self.controller.start_audit('fake-audit-model')['error'])
+            self.assertFalse(self.controller.runs_dir.exists())
+            (self.fixture.repo / 'dirty').write_text('dirty')
+            self.assertFalse(self.controller.start_audit('fake-audit-model')['ok'])
+            spawn.assert_not_called()
+
+    def test_uncertain_configuration_probe_preserves_process_boundary(self):
+        from auto_coding.repository_ownership import execution_lock
+        failure = OSError('Configuration process cleanup unknown')
+        failure.process_started = True
+        failure.cleanup_confirmed = False
+        with patch('auto_coding.desktop_control.check_audit_model', side_effect=failure), patch(
+                'auto_coding.desktop_control.Popen') as spawn:
+            self.assertFalse(self.controller.start_audit('fake-audit-model')['ok'])
+            self.assertTrue(self.controller.job_status()['uncertain'])
+            self.assertTrue(execution_lock(self.fixture.repo, '.process-uncertain.json').is_file())
+            spawn.assert_not_called()
+
+
 if __name__ == "__main__": unittest.main()

@@ -134,11 +134,14 @@ progress{width:100%;height:12px;accent-color:#72adf9}
 </div>
 </div>
 <div class="controls">
+<label for="audit-model">Audit model (High reasoning)</label><input id="audit-model" placeholder="Explicit model ID">
+<label for="audit-goal">Goal</label><input id="audit-goal" maxlength="4000">
 <button id="start-audit" disabled aria-describedby="audit-unavailable">Start Audit</button>
 <span>Result: <strong id="audit-result" class="pill muted" role="status" aria-live="polite" aria-atomic="true">Not audited</strong></span>
 <button id="download-audit" disabled aria-describedby="audit-unavailable">Download audit report/log</button>
 </div>
-<p id="audit-unavailable" class="muted">Desktop audit and report download are not wired yet. Use the existing local Python CLI to audit and authorize a JSON plan. Results will be Not audited, Running, Approved, Rejected or Blocked; no approval is inferred here.</p>
+<p id="audit-unavailable" class="muted">One read-only audit using the local authenticated Codex CLI. Select a JSON plan with focused checks and final verification, a clean feature branch, and an explicit model supporting High. Reopen existing audit logs to inspect results. Report download is not wired yet.</p>
+<pre id="audit-identity" tabindex="0" aria-label="Immutable audit identity and report"></pre>
 </section>
 <hr class="section-divider">
 <section aria-labelledby="run-title">
@@ -280,6 +283,12 @@ function message(text, error = false) {
 function updateControls() {
   const c = latest?.controller || {};
   const locked = busy || !ready || c.active !== false || c.uncertain;
+  document.getElementById('start-audit').disabled = locked || !c.start_ready || !document.getElementById('audit-model').value.trim();
+  document.getElementById('audit-model').disabled = locked;
+  document.getElementById('audit-goal').disabled = locked;
+  const audit = c.audit || {};
+  document.getElementById('audit-result').textContent = audit.status || 'Not audited';
+  document.getElementById('audit-identity').textContent = audit.identity ? JSON.stringify({identity:audit.identity, configuration:audit.configuration, report:audit.report, error:audit.error}, null, 2) : '';
   controls.forEach(id => { document.getElementById(id).disabled = locked; });
   ['github-branch', 'select-branch', 'new-branch', 'fetch-github', 'branch-base', 'branch-base-confirm', 'create-branch'].forEach(id => {
     document.getElementById(id).disabled = locked || !c.repository || c.preflight?.clean !== true;
@@ -547,7 +556,7 @@ async function refresh(clearMessage = true) {
 async function act(method) {
   if (busy || !ready) return;
   if (['start', 'resume'].includes(method) && !validateAttempts()) { updateControls(); return; }
-  const button = {'select_repo':'browse-project', 'select_plan':'browse-plan', 'open_run':'open-run', start:'start', resume:'resume'}[method];
+  const button = {'select_repo':'browse-project', 'select_plan':'browse-plan', 'open_run':'open-run', start:'start', resume:'resume', start_audit:'start-audit'}[method];
   if (document.getElementById(button).disabled) return;
   busy = true;
   updateControls();
@@ -556,6 +565,7 @@ async function act(method) {
   try {
     if (refreshing) await refreshing;
     const args = method === 'start' || method === 'resume' ? [Number(document.getElementById('attempts').value)] : [];
+    if (method === 'start_audit') args.push(document.getElementById('audit-model').value.trim(), document.getElementById('audit-goal').value);
     if (method === 'start' && document.getElementById('auto-push').checked === true) args.push(true);
     const result = await window.pywebview.api[method](...args);
     accepted = result.ok && !result.cancelled;
@@ -630,7 +640,8 @@ document.getElementById('push-approved').onclick = () => workspaceAction('push_a
 document.getElementById('refresh').onclick = refresh;
 document.getElementById('attempts').oninput = updateControls;
 ['overview', 'tasks', 'logs'].forEach(name => { document.getElementById('nav-' + name).onclick = () => navigate(name); });
-Object.entries({'browse-project':'select_repo', 'browse-plan':'select_plan', 'open-run':'open_run', start:'start', resume:'resume'}).forEach(([id, method]) => { document.getElementById(id).onclick = () => act(method); });
+Object.entries({'browse-project':'select_repo', 'browse-plan':'select_plan', 'open-run':'open_run', start:'start', resume:'resume', 'start-audit':'start_audit'}).forEach(([id, method]) => { document.getElementById(id).onclick = () => act(method); });
+document.getElementById('audit-model').oninput = updateControls;
 updateControls();
 window.addEventListener('pywebviewready', () => { ready = true; refresh(); });
 setInterval(refresh, 4000);
@@ -765,6 +776,8 @@ class Bridge:
         with self._lock:
             try:
                 status = dict(self._controller.job_status())
+                if hasattr(self._controller, "audit_status"):
+                    status["audit"] = self._controller.audit_status()
                 paths = self._controller.selected_paths()
                 errors = {}
                 for name in ("repo", "plan", "logs"):
@@ -862,6 +875,31 @@ class Bridge:
 
     def start(self, attempts=3, auto_push=False):
         return self._launch("start", attempts, auto_push)
+
+    def start_audit(self, model="", goal=""):
+        if not self._launch_lock.acquire(blocking=False):
+            return {"ok": False, "error": "A launch confirmation is already in progress."}
+        try:
+            with self._lock:
+                if self._dialogs is None:
+                    raise ValueError("Audit launch requires native confirmation; dialogs are unavailable.")
+                if not isinstance(model, str) or not model.strip():
+                    raise ValueError("Configure an explicit audit model supporting High reasoning first.")
+                paths = self._controller.selected_paths()
+                message = (f"Start one read-only plan audit?\nRepository: {paths['repo']}\nPlan: {paths['plan']}"
+                           f"\nAudit model: {model}\nReasoning: High\nGoal: {goal}"
+                           "\nNo implementation will start. Logs and the one-shot ledger stay outside the target."
+                           "\nClosing the window leaves the runner alive. Failed or uncertain calls cannot be repeated.")
+                if self._dialogs.confirm(message) is not True:
+                    return {"ok": False, "cancelled": True, "error": "Audit launch cancelled."}
+                result = self._controller.start_audit(model=model, goal=goal)
+                if self._controller.logs is not None:
+                    self._root = self._controller.logs
+                return result
+        except Exception as exc:
+            return self._failure(exc)
+        finally:
+            self._launch_lock.release()
 
     def resume(self, attempts=3):
         return self._launch("resume", attempts)

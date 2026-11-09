@@ -24,6 +24,8 @@ from auto_coding.repository_activity import repository_busy
 from auto_coding.launch_preflight import launch_preflight, validate_repository_root
 from auto_coding import run_lifecycle
 from auto_coding.run_launcher import launch_runner
+from auto_coding import plan_audit, simple_run
+from auto_coding.reviewer_permissions import check_audit_model
 
 
 class DesktopController:
@@ -161,6 +163,109 @@ class DesktopController:
         if check["errors"]: raise ValueError(" ".join(check["errors"]))
         if check["clean"] is not True: raise ValueError("Working tree has staged or unstaged changes. Commit or discard them, then use a feature branch.")
 
+    @serialized_launch
+    def start_audit(self, model: str, goal: str = "", timeout: int = 300) -> dict:
+        """Launch the CLI audit only. Its ledger remains the sole verdict authority."""
+        with self._lock:
+            try:
+                status = self.poll()
+                if status["active"] is not False or status["uncertain"]:
+                    raise ValueError("A job is active or uncertain; inspect its logs before launching an audit.")
+                self._validate()
+                tasks, _, identity, config = plan_audit.audit_inputs(
+                    simple_run, self.plan, self.repo, model=model, goal=goal, timeout=timeout,
+                    controller_tests=False)
+                ledger = plan_audit.ledger_path(self.repo, identity)
+                if ledger.exists():
+                    prior = plan_audit.read_json(ledger)
+                    if prior.get("status") != "completed":
+                        raise ValueError("This one-shot audit is consumed or uncertain; inspect saved diagnostics. It cannot be repeated.")
+                    directory = Path(prior["directory"])
+                    evidence, _ = plan_audit.load_evidence(simple_run, directory, self.repo,
+                        identity["plan_sha256"], [task["id"] for task in tasks])
+                    if evidence["identity"] != identity:
+                        raise ValueError("Existing audit identity differs from the selected inputs.")
+                    self.logs = directory
+                    return {"ok": True, "reused": True, "audit": self.audit_status()}
+                if self.runs_dir == self.repo or self.runs_dir.is_relative_to(self.repo):
+                    raise ValueError("Application run storage must be outside the target repository.")
+                if self.repo == Path(simple_run.__file__).resolve().parents[2]:
+                    raise ValueError("Select a separate target checkout; the live controller checkout cannot be audited.")
+                check_audit_model(model, self.repo)
+                self.runs_dir.mkdir(parents=True, exist_ok=True)
+                # Stable launch intent prevents a second child even if the parent
+                # crashes before the CLI reserves its authoritative audit ledger.
+                logs = self.runs_dir / ("run-audit-" + plan_audit.digest(identity))
+                try:
+                    logs.mkdir(exist_ok=False)
+                except FileExistsError:
+                    raise ValueError(f"Audit launch already recorded; reopen {logs}. No automatic retry is allowed.") from None
+                self.logs = logs
+                simple_run.save_json(logs / "desktop-audit.json", {"identity": identity,
+                    "configuration": config, "directory": str(logs / "audit")})
+                self.process_history = []
+                self.exit_code = None
+                return launch_runner(self, repo=self.repo, plan=self.plan, logs=logs, attempts=1,
+                    audit_options=dict(config, directory=logs / "audit"), popen=Popen,
+                    persist_metadata=self._metadata, reserve=reserve_job,
+                    cancel=cancel_reservation, fail=self._fail)
+            except (OSError, ValueError, KeyError, TypeError, PilotError) as exc:
+                if (getattr(exc, "cleanup_confirmed", None) is False
+                        or (getattr(exc, "process_started", None) is True
+                            and getattr(exc, "cleanup_confirmed", None) is not True)):
+                    from auto_coding.repository_ownership import preserve_process_uncertainty
+                    preserve_process_uncertainty(self.repo, self.logs or self.runs_dir)
+                    self._launch_uncertain = True
+                return self._fail(str(exc))
+
+    def audit_status(self) -> dict:
+        """Display verified CLI evidence; intent/exit code never imply approval."""
+        result = {"status": "Not audited", "identity": None, "report": None}
+        if self.logs is None:
+            return result
+        try:
+            directory = self.logs
+            intent = self.logs / "desktop-audit.json"
+            if intent.exists():
+                saved = plan_audit.read_json(intent)
+                result["identity"] = saved["identity"]
+                result["configuration"] = saved["configuration"]
+                directory = Path(saved["directory"]).resolve()
+                if directory != self.logs / "audit":
+                    raise ValueError("Audit directory differs from saved launch location")
+                result["status"] = "Uncertain"
+                if ((self.process is not None and self.process.poll() is None)
+                        or self._selected_run_active()):
+                    result["status"] = "Running"
+                elif self.exit_code is not None:
+                    result["status"] = "Failed"
+            evidence_path = directory / "audit-evidence.json"
+            if evidence_path.exists():
+                evidence = plan_audit.read_json(evidence_path)
+                identity = evidence["identity"]
+                if result["identity"] is not None and result["identity"] != identity:
+                    raise ValueError("Audit evidence identity differs from launch intent")
+                result["identity"] = identity
+                if self.repo is None or self.plan is None:
+                    raise ValueError("Select the original repository and plan to verify this audit")
+                tasks, fingerprint = load_tasks(self.plan)
+                evidence, report = plan_audit.load_evidence(simple_run, directory, self.repo,
+                    fingerprint, [task["id"] for task in tasks])
+                if report["decision"] == "APPROVE":
+                    plan_audit.authorize(simple_run, directory, self.repo, fingerprint, tasks,
+                        simple_run.requested_verification(self.plan, fingerprint, None), controller_tests=False)
+                result.update(status=report["decision"], report=report, directory=str(directory),
+                              configuration=evidence["configuration"])
+                if report["decision"] == "APPROVE" and self.exit_code not in (None, 0):
+                    result.update(status="Failed", report=None)
+                if (self._launch_uncertain or self._selected_run_unknown()
+                        or self.process is not None or self._selected_run_active()):
+                    result.update(status="Uncertain", report=None)
+            return result
+        except (OSError, ValueError, KeyError, TypeError, PilotError) as exc:
+            result.update(status="Uncertain", report=None, error=str(exc))
+            return result
+
     @staticmethod
     def _valid_pid(pid) -> bool:
         return run_lifecycle.valid_pid(pid)
@@ -253,6 +358,8 @@ class DesktopController:
     @serialized_launch
     def resume(self, attempts: int = 3) -> dict:
         with self._lock:
+            if self.logs and (self.logs / "desktop-audit.json").exists():
+                return self._fail("One-shot audits cannot be resumed or repeated. Inspect the audit report and diagnostics.")
             if self.process is not None and self.process.poll() is None:
                 return self._fail("A desktop run is already active.")
             try:
@@ -374,6 +481,14 @@ class DesktopController:
         result = self.select_logs(logs)
         if not result["ok"]: return result
         self.repository = None
+        # CLI-produced audit directories have no desktop launch metadata. Their
+        # identity supplies only the target; select the exact plan for validation.
+        if (self.logs / "audit-evidence.json").is_file():
+            try:
+                evidence = plan_audit.read_json(self.logs / "audit-evidence.json")
+                self.repo = Path(evidence["identity"]["target"]["repo"])
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                return self._fail(f"Cannot load audit evidence: {exc}")
         try:
             value = self._read_metadata()
             if self._metadata_error:

@@ -42,6 +42,24 @@ class FakeController:
 
 
 class DesktopBridgeTests(unittest.TestCase):
+    def test_audit_cancel_duplicate_confirmation_and_options(self):
+        self.controller.start_audit = Mock(return_value={"ok": True})
+        self.dialogs.confirm.return_value = False
+        self.assertTrue(self.bridge.start_audit('audit-model', 'goal')['cancelled'])
+        self.controller.start_audit.assert_not_called()
+        self.assertFalse(self.bridge.start_audit('')['ok'])
+        self.dialogs.confirm.return_value = True
+        self.assertTrue(self.bridge.start_audit('audit-model', 'goal')['ok'])
+        self.controller.start_audit.assert_called_once_with(model='audit-model', goal='goal')
+        self.assertIn('read-only', self.dialogs.confirm.call_args.args[0])
+        self.assertIn('High', self.dialogs.confirm.call_args.args[0])
+        self.bridge._launch_lock.acquire()
+        try:
+            self.assertFalse(self.bridge.start_audit('audit-model')['ok'])
+        finally:
+            self.bridge._launch_lock.release()
+        self.controller.start_audit.assert_called_once()
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -189,7 +207,7 @@ class DesktopBridgeTests(unittest.TestCase):
     def test_public_bridge_surface_contains_only_scoped_methods(self):
         self.assertEqual({name for name in dir(self.bridge) if not name.startswith("_")},
                          {"select_repo", "select_plan", "open_run", "selected_paths",
-                          "job_status", "start", "resume", "snapshot", "evidence",
+                          "job_status", "start", "start_audit", "resume", "snapshot", "evidence",
                           "connect_github", "github_repositories", "github_branches",
                           "create_github_branch", "checkout_github_branch", "fetch_github", "push_approved_commits"})
 

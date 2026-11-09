@@ -18,6 +18,44 @@ from test_final_verification import CODE_REVIEW_APPROVED, Executor, POLICY
 
 
 class PlanAuditTests(unittest.TestCase):
+    def test_audit_model_authentication_and_high_capability_are_fail_closed(self):
+        from types import SimpleNamespace
+        from auto_coding import reviewer_permissions as permissions
+        cases = [({'authenticated': False, 'supported': True}, 'authentication'),
+                 ({'authenticated': True, 'supported': False}, 'High reasoning'),
+                 ({'authenticated': True, 'supported': True}, None)]
+        for response, error in cases:
+            with self.subTest(response=response), patch.object(permissions.shutil, 'which', return_value='codex'), patch.object(
+                    permissions, 'bounded_run', return_value=SimpleNamespace(returncode=0, stdout=json.dumps(response))) as command:
+                if error:
+                    with self.assertRaisesRegex(ReviewerEnvironmentError, error):
+                        permissions.check_audit_model('fake-audit-model', self.repo)
+                else:
+                    permissions.check_audit_model('fake-audit-model', self.repo)
+                argv = command.call_args.args[0]
+                self.assertIn('account/read', argv[3])
+                self.assertIn('model/list', argv[3])
+                self.assertNotIn('thread/start', argv[3])
+                self.assertEqual(command.call_args.kwargs['timeout'], 40)
+        for result in (SimpleNamespace(returncode=1, stdout=''),
+                       SimpleNamespace(returncode=0, stdout='malformed response')):
+            with patch.object(permissions.shutil, 'which', return_value='codex'), patch.object(
+                    permissions, 'bounded_run', return_value=result):
+                with self.assertRaisesRegex(ReviewerEnvironmentError, 'configuration'):
+                    permissions.check_audit_model('fake-audit-model', self.repo)
+        self.assertEqual(self.calls, [])
+
+    def test_production_auth_failure_precedes_reservation_and_agent_call(self):
+        with patch.object(audit, 'unwrap', return_value=runner.call), patch.object(
+                runner, 'workflow_preflight'), patch(
+                'auto_coding.reviewer_permissions.check_audit_model',
+                side_effect=ReviewerEnvironmentError('Local audit authentication missing')):
+            with self.assertRaisesRegex(runner.PilotError, 'authentication missing'):
+                self.do_audit()
+        self.assertEqual(self.calls, [])
+        self.assertFalse(audit.ledger_path(self.repo, self.identity()).exists())
+        self.assertFalse((self.logs / 'audit-evidence.json').exists())
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

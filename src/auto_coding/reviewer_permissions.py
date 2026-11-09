@@ -38,7 +38,7 @@ def activated(environment):
 
 # This stdlib-only helper runs in the trusted engine directory, inside bounded_run's
 # owned process tree. Never import target code while inspecting configuration.
-_CONFIG_CLIENT = r'''
+_APP_SERVER_CLIENT = r'''
 import json, queue, subprocess, sys, threading, time
 command, cwd, profile = json.loads(sys.argv[1])
 process = subprocess.Popen(command, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -65,6 +65,9 @@ def request(value):
 request({"id":1,"method":"initialize","params":{"clientInfo":{"name":"auto_coding_review_preflight",
         "version":"1"},"capabilities":{"experimentalApi":True}}})
 process.stdin.write('{"method":"initialized","params":{}}\n'); process.stdin.flush()
+'''
+
+_CONFIG_CLIENT = _APP_SERVER_CLIENT + r'''
 value = request({"id":2,"method":"config/read","params":{"includeLayers":True,"cwd":cwd}})
 requirements = request({"id":3,"method":"configRequirements/read","params":{}})
 config = value["config"]
@@ -135,6 +138,50 @@ def check_cli(settings, name, repo, scratch, *, environment=None, filesystem=Non
         raise ReviewerEnvironmentError("Invalid Codex effective-configuration response") from exc
     validate_configuration(value, name, repo, scratch, filesystem=filesystem, backend=backend)
     return executable
+
+
+# Reuse the bounded, local app-server transport; export no account details or tokens.
+_AUDIT_MODEL_CLIENT = _APP_SERVER_CLIENT + r'''
+account = request({"id":2,"method":"account/read","params":{"refreshToken":False}})
+supported = False
+cursor = None
+for page in range(10):
+    models = request({"id":3+page,"method":"model/list","params":{"cursor":cursor,"limit":100}})
+    for model in models["data"]:
+        if model.get("model") == profile and any(
+                effort.get("reasoningEffort") == "high" for effort in model.get("supportedReasoningEfforts", [])):
+            supported = True
+    cursor = models.get("nextCursor")
+    if not cursor: break
+process.stdin.close(); process.wait(timeout=5)
+print(json.dumps({"authenticated":account.get("account") is not None,"supported":supported}))
+'''
+
+
+def check_audit_model(model, repo):
+    """Check local authentication and advertised High support without a model call."""
+    executable = shutil.which("codex")
+    if not executable:
+        raise ReviewerEnvironmentError("Audit requires an authenticated local Codex CLI")
+    trusted = str(Path(__file__).resolve().parents[1])
+    environment = os.environ.copy()
+    environment.pop("PYTHONHOME", None)
+    environment["PYTHONPATH"] = trusted
+    result = bounded_run([sys.executable, "-B", "-c", _AUDIT_MODEL_CLIENT,
+                          json.dumps([[executable, "app-server", "--strict-config"], str(repo), model])],
+                         cwd=trusted, env=environment, capture_output=True, text=True, timeout=40)
+    if result.returncode:
+        raise ReviewerEnvironmentError("Could not verify audit model/authentication configuration; check local Codex CLI configuration before launching")
+    try:
+        value = json.loads(result.stdout)
+        if value.get("authenticated") is not True:
+            raise ReviewerEnvironmentError("Audit requires local Codex CLI authentication; sign in before launching")
+        if value.get("supported") is not True:
+            raise ReviewerEnvironmentError("Configured audit model is unavailable or does not support High reasoning")
+    except (ValueError, TypeError, AttributeError) as exc:
+        if isinstance(exc, ReviewerEnvironmentError):
+            raise
+        raise ReviewerEnvironmentError("Could not verify audit model/authentication configuration; no agent launched") from exc
 
 
 @dataclass
