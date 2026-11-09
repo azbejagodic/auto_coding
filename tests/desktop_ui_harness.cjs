@@ -17,6 +17,8 @@ class Element {
 const nodes = new Map();
 const get = id => { if (!nodes.has(id)) nodes.set(id, new Element(id)); return nodes.get(id); };
 get('attempts').value = '3';
+get('audit-result').textContent = 'Not audited';
+get('audit-result').className = 'pill muted';
 const document = {getElementById: get, createElement: tag => new Element(tag),
   createTextNode: text => ({textContent: String(text)})};
 let data = {root:'', exists:false, empty:true, state:null, events:[], event_errors:[],
@@ -44,7 +46,7 @@ const api = {
   select_plan: async (...args) => { calls.push(['select_plan', ...args]); data.controller.plan = 'C:\\plans\\task.json'; data.controller.start_ready = true; return {ok:true}; },
   open_run: async (...args) => { calls.push(['open_run', ...args]); return {ok:true, cancelled:true}; },
   start: async (...args) => { calls.push(['start', ...args]); if (launchResult.ok) { data.controller.active = true; data.controller.logs = data.root = 'C:\\runs\\one'; data.exists = true; data.empty = false; } return launchResult; },
-  resume: async (...args) => { calls.push(['resume', ...args]); data.controller.active = true; return {ok:true}; },
+  resume: async (...args) => { calls.push(['resume', ...args]); data.controller.active = true; data.controller.resume_ready = false; return {ok:true}; },
   evidence: async name => { evidenceReads++; return {ok:true, text:'<img src=x onerror=bad()> original evidence: ' + name}; }
 };
 const listeners = {};
@@ -62,7 +64,7 @@ const contents = () => get('app').textContent;
   assert(!get('browse-project').disabled);
   assert(get('start').disabled);
   assert.equal(get('header-state').textContent, 'Idle');
-  assert(contents().includes('Select a project and plan, then Start.'));
+  assert(contents().includes('Audit and authorize new runs with the CLI.'));
   assert(!contents().includes('Ready for your first run'));
   assert.equal(get('run-setup').hidden, false);
   const initial = structuredClone(data);
@@ -130,7 +132,7 @@ const contents = () => get('app').textContent;
   release(); await choosing; pendingSelection = null;
   assert(get('project-path').textContent.includes('C:\\project with spaces'));
   await click('browse-plan');
-  assert(!get('start').disabled);
+  assert(get('start').disabled, 'Plan selection is not audit authorization');
   for (const error of ['Runs are blocked on main/master. Switch to a feature branch first.', 'Plan validation failed: malformed plan', 'Commit or discard changes before START.']) {
     data.controller.start_ready = false; data.controller.preflight.errors = [error];
     await poll();
@@ -154,15 +156,16 @@ const contents = () => get('app').textContent;
   for (const value of ['1', '3', '5', '10']) {
     attempts.value = value; attempts.oninput();
     assert.equal(attempts['aria-invalid'], 'false');
-    assert(!get('start').disabled && !get('resume').disabled);
+    assert(get('start').disabled && !get('resume').disabled);
     assert.equal(get('attempts-error').textContent, '');
     attempts.focus();
     data.controller.preflight.branch = 'feature/number-' + value;
     await poll();
     assert.equal(document.activeElement, attempts, 'Polling preserves keyboard focus on number input');
     assert.equal(attempts.value, value);
+    const beforeStart = calls.length;
     await click('start');
-    assert.deepEqual(calls.at(-1), ['start', Number(value)]);
+    assert.equal(calls.length, beforeStart, 'Disabled Start cannot reach the bridge');
     assert.equal(data.controller.active, false, 'Cancelled confirmation must not launch');
   }
   calls.length = 0;
@@ -171,19 +174,28 @@ const contents = () => get('app').textContent;
   await click('open-run');
   assert(get('message').textContent.includes('Cancelled'));
   assert(get('plan-path').textContent.includes('C:\\plans\\task.json'));
-  await click('start');
-  assert.deepEqual(calls.at(-1), ['start', 3]);
-  assert(get('message').textContent.includes('Cancelled'));
-  assert.equal(data.controller.active, false);
-  launchResult = {ok:true};
-  get('auto-push').checked = true;
-  await click('start');
-  assert.deepEqual(calls.at(-1), ['start', 3, true]);
-  assert.equal(get('auto-push').checked, false, 'A new run must explicitly opt in again');
+  const beforeStart = calls.length;
+  // Untrusted, unverified status fields must never manufacture approval.
+  for (const result of ['Not audited', 'Running', 'Approved', 'Rejected', 'Blocked']) {
+    data.controller.audit = {result, verified:true, authorized:true};
+    data.controller.start_ready = true;
+    await poll();
+    assert(get('start').disabled);
+    assert.equal(get('audit-result').className, 'pill muted');
+    assert.equal(get('audit-result').textContent, 'Not audited');
+    await click('start');
+    assert.equal(calls.length, beforeStart);
+  }
+  // Existing recovery still uses the same controller bridge.
+  data.controller.logs = data.root = 'C:\\runs\\one';
+  data.exists = true; data.empty = false;
+  data.controller.resume_ready = true;
+  await poll();
+  await click('resume');
+  assert.deepEqual(calls.at(-1), ['resume', 3]);
+  assert(!calls.some(call => call[0] === 'start'));
   assert(get('auto-push').disabled, 'Publication settings cannot change mid-run');
-  await click('start');
-  assert.equal(calls.filter(call => call[0] === 'start').length, 2);
-  assert(contents().includes('Running'));
+  assert.equal(get('run-status').textContent, 'Running');
   assert(get('browse-project').disabled && get('resume').disabled);
   data.state = {status:'running', current_task:'task-1', completed:[], history:[
     {task:'task-1', attempt:1, tests:[{index:1, exit_code:1, timed_out:false}],
@@ -194,6 +206,36 @@ const contents = () => get('app').textContent;
   data.event_errors = ['Line 2: corrupt event'];
   await poll();
   assert(contents().includes('Current task: task-1'));
+  assert.equal(get('run-status').textContent, 'Running');
+  assert.equal(get('run-task').textContent, '1 / --');
+  const savedTaskState = structuredClone(data.state);
+  for (const [current, completed, total, expected] of [
+    ['task-1', [], 4, '1 / 4'],
+    ['arbitrary-task-id', ['first', 'second'], 4, '3 / 4'],
+    ['arbitrary-task-id', ['first', 'second'], 4, '3 / 4'], // Retry retains position.
+    ['second', ['first', 'second'], 4, '2 / 4'], // Checkpoint already recorded.
+    ['last', ['first', 'second', 'third'], 4, '4 / 4'],
+    [null, [], 4, '-- / 4'],
+    [null, ['first', 'second', 'third', 'last'], 4, '-- / 4'],
+    ['unknown', undefined, 4, '-- / 4'],
+    ['unknown', 'invalid', 4, '-- / 4'],
+    ['unknown', ['duplicate', 'duplicate'], 4, '-- / 4'],
+    ['unknown', [null], 4, '-- / 4'],
+    ['overflow', ['first', 'second'], 2, '-- / 2'],
+  ]) {
+    data.state.current_task = current;
+    data.state.completed = completed;
+    data.task_count = total;
+    await poll();
+    assert.equal(get('run-task').textContent, expected);
+  }
+  delete data.task_count;
+  data.controller.task_count = 4;
+  data.state = savedTaskState;
+  await poll();
+  assert.equal(get('run-task').textContent, '1 / 4', 'Controller count fallback');
+  delete data.controller.task_count;
+  await poll();
   await click('nav-tasks');
   for (const text of ['Attempt 1', 'REJECTED', 'Original summary', 'Original feedback', 'Test 1: exit 1']) assert(contents().includes(text), text);
   assert(walk(get('app')).some(node => node.className === 'attempt rejected'));
@@ -234,16 +276,16 @@ const contents = () => get('app').textContent;
   assert.equal(evidenceReads, 1, 'Polling must not reload evidence');
   data.controller.active = false; data.controller.exit_code = 0;
   await poll();
-  assert(contents().includes('Unknown run state'));
+  assert.equal(get('run-status').textContent, 'Unknown run state');
   assert.notEqual(get('header-state').textContent, 'Completed');
   assert(get('resume').disabled);
   data.state.status = 'stopped'; data.controller.resume_ready = true;
   await poll();
-  assert(contents().includes('Stopped'));
+  assert.equal(get('run-status').textContent, 'Stopped');
   get('attempts').value = '5';
   await click('resume'); await click('resume');
   assert.deepEqual(calls.at(-1), ['resume', 5]);
-  assert.equal(calls.filter(call => call[0] === 'resume').length, 1);
+  assert.equal(calls.filter(call => call[0] === 'resume').length, 2);
   data.controller.active = false; data.controller.resume_ready = false;
   data.state.status = 'completed'; data.state.completed = ['task-1'];
   await poll();
@@ -251,7 +293,7 @@ const contents = () => get('app').textContent;
   data.controller.error = 'Runner stopped with exit code 1; inspect state.json and events.jsonl.';
   data.controller.process_history = [{exit_code:1, message:'Prior process failure'}];
   await poll();
-  assert(contents().includes('Completed'));
+  assert.equal(get('run-status').textContent, 'Completed');
   assert.equal(get('header-state').textContent, 'Completed');
   assert.equal(get('header-state').className, 'pill green');
   assert(!contents().includes('Runner stopped with exit code 1'));
@@ -280,7 +322,7 @@ const contents = () => get('app').textContent;
   assert.equal(get('message').textContent, '');
   data.state.status = 'checkpointing';
   await poll();
-  assert(contents().includes('Awaiting recovery'));
+  assert.equal(get('run-status').textContent, 'Awaiting recovery');
   assert.notEqual(get('header-state').textContent, 'Completed');
   assert(get('resume').disabled);
   data.state.status = 'completed';
@@ -288,14 +330,14 @@ const contents = () => get('app').textContent;
   get('message').textContent = 'Launch accepted. Old warning';
   await click('open-run');
   assert.equal(get('message').textContent, '');
-  assert(contents().includes('Completed'));
+  assert.equal(get('run-status').textContent, 'Completed');
   data.controller.active = true;
   await poll();
-  assert(contents().includes('Running'));
+  assert.equal(get('run-status').textContent, 'Running');
   assert.notEqual(get('header-state').textContent, 'Completed');
   data.controller.active = null; data.controller.uncertain = true; data.controller.error = 'Unknown launch; inspect logs';
   await poll();
-  assert(contents().includes('Unknown child status'));
+  assert.equal(get('run-status').textContent, 'Unknown child status');
   assert(contents().includes('Unknown launch; inspect logs'));
   assert(get('start').disabled && get('resume').disabled);
   data.root = data.controller.logs = 'C:\\legacy'; data.controller.active = false; data.controller.uncertain = false;

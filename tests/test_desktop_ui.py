@@ -72,7 +72,7 @@ class DesktopUITests(unittest.TestCase):
                       'overflow-wrap:anywhere', ':focus-visible',
                       'prefers-reduced-motion:reduce', 'grid-template-columns:minmax(0,1fr)',
                       'aria-label="Main navigation"', 'aria-labelledby="project-label"',
-                      'aria-labelledby="plan-label"', 'aria-describedby="preflight attempts-error"',
+                      'aria-labelledby="plan-label"', 'aria-describedby="start-reason preflight attempts-error"',
                       'id="project-path"', 'id="plan-path"', 'id="run-setup"',
                       'Project folder', 'Task plan', 'Run setup', 'Open Run',
                       "'Awaiting recovery'", "'Completed', color:'green'",
@@ -115,6 +115,49 @@ class DesktopUITests(unittest.TestCase):
         self.assertNotIn("Ready for your first run", HTML)
         self.assertNotIn("const steps", HTML)
         self.assertEqual(HTML.count('requires native confirmation.'), 1)
+
+    def test_audit_run_hierarchy_and_unwired_actions_fail_closed(self):
+        class Structure(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.stack = []
+                self.nodes = {}
+
+            def handle_starttag(self, tag, attrs):
+                attrs = dict(attrs)
+                if "id" in attrs:
+                    self.assert_unique(attrs["id"])
+                    self.nodes[attrs["id"]] = (attrs, tuple(self.stack))
+                if tag not in {"input", "hr", "meta", "br"}:
+                    self.stack.append(attrs.get("id", tag))
+
+            def assert_unique(self, name):
+                if name in self.nodes:
+                    raise AssertionError("Duplicate ID: " + name)
+
+            def handle_endtag(self, tag):
+                self.stack.pop()
+
+        markup = Structure()
+        markup.feed(HTML)
+        for name in ("start", "start-audit", "stop", "download-audit", "download-logs"):
+            attrs, _ = markup.nodes[name]
+            self.assertIn("disabled", attrs)
+            self.assertIn(attrs["aria-describedby"].split()[0], markup.nodes)
+        self.assertNotIn("advanced", markup.nodes["plan-path"][1])
+        for name in ("github-repo", "github-branch", "resume", "open-run",
+                     "push-approved", "preflight-details", "project-path"):
+            self.assertIn("advanced", markup.nodes[name][1])
+        self.assertNotIn("open", markup.nodes["advanced"][0])
+        self.assertEqual(markup.nodes["audit-result"][0]["class"], "pill muted")
+        self.assertEqual(markup.nodes["audit-result"][0]["aria-live"], "polite")
+        self.assertEqual(markup.nodes["message"][0]["role"], "alert")
+        self.assertLess(HTML.index('id="plan-path"'), HTML.index('<hr class="section-divider">'))
+        self.assertLess(HTML.index('<hr class="section-divider">'), HTML.index('id="start"'))
+        self.assertLess(HTML.index('id="start"'), HTML.index('id="run-status"'))
+        self.assertIn('Time <small>(HH:MM:SS)</small>', HTML)
+        self.assertIn('Elapsed time is unavailable', HTML)
+        self.assertIn('@media(max-width:700px)', HTML)
 
     def test_actual_ui_buttons_navigation_polling_and_state_transitions(self):
         node = shutil.which("node")

@@ -81,6 +81,13 @@ pre{font:14px/1.6 Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere
 .filters label{flex:1;min-width:180px}
 .filters input{display:block;width:100%;margin-top:8px;background:#0e1115}
 progress{width:100%;height:12px;accent-color:#72adf9}
+.section-divider{border:0;border-top:2px solid #475361;margin:24px 0}
+.run-summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;margin:20px 0 0}
+.run-summary dt{color:#b0bccb}
+.run-summary dd{margin:4px 0;font-size:22px;font-weight:650;overflow-wrap:anywhere}
+#advanced{border-top:1px solid #303946;margin-top:20px;padding-top:12px}
+.audit-section .controls{margin-top:12px}
+@media(max-width:700px){.shell{display:block}.side{position:static;width:auto;padding:12px}.brand{margin:0}.side nav{display:flex;gap:8px}.nav{width:auto;margin:4px 0;padding:8px}.main{margin-left:0;padding:12px}.top{align-items:flex-start}.field-line{flex-wrap:wrap}.selected-path{flex-basis:100%}.run-summary{grid-template-columns:1fr}.controls>*{max-width:100%}}
 .project-heading{overflow-wrap:anywhere;max-width:650px}
 #header-state{white-space:nowrap}
 #evidence-viewer:empty{display:none}
@@ -116,7 +123,41 @@ progress{width:100%;height:12px;accent-color:#72adf9}
 <button id="refresh" style="margin-top:12px">Refresh</button>
 </div>
 </header>
-<section class="panel" id="run-setup" aria-labelledby="setup-title">
+<section class="panel" id="run-setup" aria-label="Audit and run">
+<section class="audit-section" aria-labelledby="audit-title">
+<h2 id="audit-title">Audit</h2>
+<div class="field">
+<label id="plan-label">Task plan (JSON)</label>
+<div class="field-line">
+<div id="plan-path" class="selected-path" tabindex="0" role="textbox" aria-readonly="true" aria-labelledby="plan-label">No plan selected</div>
+<button id="browse-plan" aria-label="Browse task plan">Browse</button>
+</div>
+</div>
+<div class="controls">
+<button id="start-audit" disabled aria-describedby="audit-unavailable">Start Audit</button>
+<span>Result: <strong id="audit-result" class="pill muted" role="status" aria-live="polite" aria-atomic="true">Not audited</strong></span>
+<button id="download-audit" disabled aria-describedby="audit-unavailable">Download audit report/log</button>
+</div>
+<p id="audit-unavailable" class="muted">Desktop audit and report download are not wired yet. Use the existing local Python CLI to audit and authorize a JSON plan. Results will be Not audited, Running, Approved, Rejected or Blocked; no approval is inferred here.</p>
+</section>
+<hr class="section-divider">
+<section aria-labelledby="run-title">
+<h2 id="run-title">Run</h2>
+<div class="controls">
+<button id="start" disabled aria-describedby="start-reason preflight attempts-error">Start</button>
+<button id="stop" disabled aria-describedby="run-unavailable">Stop after task</button>
+<button id="download-logs" disabled aria-describedby="run-unavailable">Download Logs</button>
+</div>
+<p id="start-reason" class="muted">Start requires verified audit approval and durable authorization. The desktop cannot establish these yet; use the existing CLI for new runs.</p>
+<p id="run-unavailable" class="muted">Desktop stop and log download are not wired yet. Read recorded evidence in Logs.</p>
+<dl class="run-summary" aria-live="polite" aria-atomic="true">
+<div><dt>Status</dt><dd id="run-status">Idle</dd></div>
+<div><dt>Task current/total</dt><dd id="run-task">-- / --</dd></div>
+<div><dt>Time <small>(HH:MM:SS)</small></dt><dd id="run-time" aria-describedby="time-hint">--:--:--</dd></div>
+</dl>
+<p id="time-hint" class="muted">Elapsed time is unavailable in the current desktop snapshot.</p>
+</section>
+<details id="advanced"><summary>Advanced / Repository, recovery and diagnostics</summary>
 <h2 id="setup-title">Run setup</h2>
 <label for="github-repo">GitHub repository (OWNER/REPO or GitHub URL)</label>
 <div class="controls">
@@ -142,13 +183,6 @@ progress{width:100%;height:12px;accent-color:#72adf9}
 </div>
 <div class="setup-fields">
 <div class="field">
-<label id="plan-label">Task plan</label>
-<div class="field-line">
-<div id="plan-path" class="selected-path" tabindex="0" role="textbox" aria-readonly="true" aria-labelledby="plan-label">No plan selected</div>
-<button id="browse-plan" aria-label="Browse task plan">Browse</button>
-</div>
-</div>
-<div class="field">
 <label for="attempts">Attempts</label>
 <input id="attempts" type="number" min="1" max="10" step="1" value="3" required aria-describedby="attempts-hint attempts-error">
 <small id="attempts-hint" class="muted">1–10 per task</small>
@@ -156,7 +190,6 @@ progress{width:100%;height:12px;accent-color:#72adf9}
 </div>
 <div id="attempts-error" class="notice red" role="status" aria-live="polite"></div>
 <div class="controls">
-<button id="start" aria-describedby="preflight attempts-error">Start</button>
 <button id="resume" aria-describedby="resume-reason attempts-error">Resume</button>
 <button id="open-run">Open Run</button>
 <span id="resume-reason" class="muted">Open a matching stopped run to resume.</span>
@@ -176,7 +209,7 @@ progress{width:100%;height:12px;accent-color:#72adf9}
 </details>
 <div id="paths">
 </div>
-<div id="preflight" class="notice muted">
+<div id="preflight" class="notice muted" role="status" aria-live="polite">
 </div>
 <details id="launch-details">
 <summary>Details</summary>
@@ -185,8 +218,9 @@ progress{width:100%;height:12px;accent-color:#72adf9}
 <pre id="preflight-details" tabindex="0" aria-label="Preflight diagnostics"></pre>
 <div id="run-folder" class="path muted"></div>
 </details>
+</details>
 </section>
-<div id="message" class="notice" role="status" aria-live="polite">
+<div id="message" class="notice" role="alert" aria-live="polite">
 </div>
 <div id="evidence-viewer">
 </div>
@@ -257,7 +291,8 @@ function updateControls() {
   document.getElementById('push-approved').disabled = locked || !c.push?.eligible;
   document.getElementById('push-reason').textContent = c.push?.reason || 'Select a managed repository to publish approved local checkpoints.';
   const validAttempts = validateAttempts();
-  document.getElementById('start').disabled = locked || !c.start_ready || !validAttempts;
+  // No desktop authorization bridge exists yet. Preflight eligibility is not approval.
+  document.getElementById('start').disabled = true;
   document.getElementById('resume').disabled = locked || !c.resume_ready || !validAttempts;
   document.getElementById('resume').textContent = latest?.state?.publication?.outcome === 'pending' ? 'Retry Push' : 'Resume';
   document.getElementById('refresh').disabled = busy || !ready;
@@ -365,6 +400,21 @@ function render(data) {
   document.getElementById('resume-reason').textContent = c.resume_ready ? 'Continue the stopped run.' : c.active || c.uncertain ? 'Runner active or uncertain.' : 'Select a matching stopped run to resume.';
   document.getElementById('run-setup').hidden = page !== 'overview';
   const presentation = runPresentation(data);
+  document.getElementById('run-status').textContent = presentation.label;
+  const count = data.task_count ?? c.task_count;
+  const currentTask = data.state?.current_task;
+  const completedTasks = data.state?.completed;
+  let taskNumber = '--';
+  // Tasks execute in plan order. During checkpointing the current ID may
+  // already be recorded as completed; keep its position until it advances.
+  if (typeof currentTask === 'string' && currentTask && Array.isArray(completedTasks)
+      && completedTasks.every(id => typeof id === 'string' && id)
+      && new Set(completedTasks).size === completedTasks.length) {
+    const completedIndex = completedTasks.indexOf(currentTask);
+    const position = completedIndex >= 0 ? completedIndex + 1 : completedTasks.length + 1;
+    if (count == null || Number.isInteger(count) && position <= count) taskNumber = position;
+  }
+  document.getElementById('run-task').textContent = taskNumber + ' / ' + (count ?? '--');
   const badge = document.getElementById('header-state');
   badge.textContent = presentation.label;
   badge.className = 'pill ' + presentation.color;
@@ -379,7 +429,7 @@ function render(data) {
   if (!c.logs && !data.root) {
     const empty = el('section', undefined, 'empty');
     empty.append(el('p', page === 'overview'
-      ? c.start_ready ? 'Ready. Start to confirm your run.' : 'Select a project and plan, then Start. Open Run to inspect saved work.'
+      ? 'Select a project and JSON plan. Audit and authorize new runs with the CLI. Open Run to inspect saved work.'
       : page === 'tasks' ? 'No task history yet. Start or open a run.' : 'No run evidence yet. Start or open a run.'));
     if (page !== 'overview') { const setup = el('button', 'Go to run setup'); setup.onclick = () => navigate('overview'); empty.append(setup); }
     app.append(empty);
@@ -390,7 +440,6 @@ function render(data) {
   const events = data.events || [];
   const history = Array.isArray(state.history) ? state.history.filter(item => item && typeof item === 'object') : [];
   const completed = Array.isArray(state.completed) ? state.completed : null;
-  const status = presentation.label;
   const reconciled = presentation.label === 'Completed' || c.active === false && !c.uncertain && state.status === 'checkpointing';
   if (c.error && !reconciled) app.append(el('div', c.error, 'notice warning'));
   if (data.state_error) app.append(el('div', data.state_error, 'warning'));
@@ -401,14 +450,7 @@ function render(data) {
   if (state.publication?.outcome === 'pending') app.append(el('div', 'Approved locally, push pending. Resolve connectivity or permissions, then use Resume (Retry Push). The same SHA is retried before any further tasks; Codex is not rerun for the approved task. Remote divergence requires manual review.', 'warning'));
   (data.event_errors || []).forEach(error => app.append(el('div', error, 'warning')));
   if (page === 'overview') {
-    const summary = el('div', undefined, 'grid');
     const count = data.task_count ?? c.task_count;
-    [['Run status', status], ['Completed tasks', count != null ? (completed ? completed.length : '--') + ' / ' + count : c.logs ? 'Not recorded' : 'Select a plan'], ['Child process', c.active === true ? 'Running' : c.active === false ? 'Inactive' : 'Unknown']].forEach(([label,value]) => {
-      const card = el('div', undefined, 'card');
-      card.append(el('div', label, 'label'), el('div', value, 'value ' + (label === 'Run status' ? presentation.color : '')));
-      summary.append(card);
-    });
-    app.append(summary);
     if (count > 0 && completed) {
       const progress = el('progress');
       progress.setAttribute('max', count); progress.setAttribute('value', completed.length);
@@ -420,14 +462,18 @@ function render(data) {
     if (state.status === 'stopped') current.append(el('p', 'Run stopped. Review attempts in Tasks or raw evidence in Logs.', 'muted'));
     if (count != null && completed) current.append(el('p', 'Tasks remaining: ' + Math.max(0, count - completed.length)));
     if (history.length) current.append(detail('Latest attempt details', JSON.stringify(history[history.length - 1], null, 2), 'latest-attempt'));
-    app.append(current);
+    const diagnostics = el('details');
+    diagnostics.open = expanded.has('run-details');
+    diagnostics.ontoggle = () => { if (diagnostics.open) expanded.add('run-details'); else expanded.delete('run-details'); };
+    diagnostics.append(el('summary', 'Run details and recent activity'), current);
+    app.append(diagnostics);
     const recent = panel('Recent activity');
     events.slice(-5).reverse().forEach(event => {
       recent.append(el('p', [event.timestamp_utc || 'Time not recorded', event.actor, event.event, event.outcome].filter(Boolean).join(' | ')));
     });
     if (!events.length) recent.append(el('p', 'No events recorded yet. Full evidence is available in Logs.', 'muted'));
     const logs = el('button', 'View all activity'); logs.onclick = () => navigate('logs'); recent.append(logs);
-    app.append(recent);
+    diagnostics.append(recent);
   } else if (page === 'tasks') {
     const tasks = panel('Tasks and attempt history');
     tasks.append(el('div', 'Current task: ' + (state.current_task || 'No task in progress'), 'value'));
