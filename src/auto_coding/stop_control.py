@@ -66,7 +66,11 @@ def request(logs, expected):
             stream.flush()
             os.fsync(stream.fileno())
         try:
-            os.link(temporary, target)  # Atomic publication without overwriting evidence.
+            # Both operations publish atomically without overwriting existing evidence.
+            if os.name == "nt":
+                os.rename(temporary, target)
+            else:
+                os.link(temporary, target)
         except FileExistsError:
             pass
     finally:

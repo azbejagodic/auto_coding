@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from auto_coding import stop_control
 from auto_coding.desktop_control import DesktopController
 
 
@@ -649,6 +650,91 @@ class DesktopAuditTests(unittest.TestCase):
             self.assertTrue(self.controller.job_status()['uncertain'])
             self.assertTrue(execution_lock(self.fixture.repo, '.process-uncertain.json').is_file())
             spawn.assert_not_called()
+
+
+class StopPublicationTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.repo = self.root / "target"
+        self.repo.mkdir()
+        self.logs = self.root / "logs"
+        self.logs.mkdir()
+        state = {"run_id": "run-1", "repo": str(self.repo), "plan_sha256": "plan-sha", "status": "running"}
+        manifest = {"run_id": "run-1", "target_repo": str(self.repo), "plan_sha256": "plan-sha"}
+        (self.logs / "state.json").write_text(json.dumps(state))
+        (self.logs / "run-manifest.json").write_text(json.dumps(manifest))
+        self.binding = stop_control.identity(self.logs)
+        self.target = self.logs / "stop-request-00000000.json"
+        self.publisher_name = "rename" if stop_control.os.name == "nt" else "link"
+        self.publish = getattr(stop_control.os, self.publisher_name)
+
+    def assert_no_temporary_files(self):
+        self.assertEqual(list(self.logs.glob(".stop-*.tmp")), [])
+
+    def test_stop_publication_uses_native_atomic_operation_after_fsync(self):
+        other = "link" if self.publisher_name == "rename" else "rename"
+        def publish(temporary, target):
+            self.assertTrue(sync.called)
+            self.assertEqual(Path(temporary).parent, self.logs)
+            self.assertEqual(json.loads(Path(temporary).read_text()), self.binding)
+            self.assertFalse(Path(target).exists())
+            return self.publish(temporary, target)
+        with patch.object(stop_control.os, "fsync", wraps=stop_control.os.fsync) as sync, \
+                patch.object(stop_control.os, self.publisher_name, side_effect=publish) as publication, \
+                patch.object(stop_control.os, other, side_effect=AssertionError("Wrong platform publication operation")):
+            self.assertEqual(stop_control.request(self.logs, self.binding), self.binding)
+        sync.assert_called_once()
+        publication.assert_called_once()
+        self.assertEqual(stop_control.pending(self.logs), self.binding)
+        self.assert_no_temporary_files()
+
+    def test_stop_repeated_request_keeps_existing_evidence_without_republishing(self):
+        with patch.object(stop_control.os, self.publisher_name, wraps=self.publish) as publication:
+            self.assertEqual(stop_control.request(self.logs, self.binding), self.binding)
+            original = self.target.read_bytes()
+            self.assertEqual(stop_control.request(self.logs, self.binding), self.binding)
+        publication.assert_called_once()
+        self.assertEqual(self.target.read_bytes(), original)
+        self.assert_no_temporary_files()
+
+    def test_stop_conflicting_existing_evidence_is_never_overwritten(self):
+        original = json.dumps(dict(self.binding, run_id="another-run")).encode("utf-8")
+        self.target.write_bytes(original)
+        with patch.object(stop_control.os, self.publisher_name, side_effect=AssertionError("Must not publish")):
+            with self.assertRaisesRegex(ValueError, "another run"):
+                stop_control.request(self.logs, self.binding)
+        self.assertEqual(self.target.read_bytes(), original)
+        self.assert_no_temporary_files()
+
+    def test_stop_conflicting_race_preserves_evidence_and_cleans_temporary_file(self):
+        original = json.dumps(dict(self.binding, run_id="another-run")).encode("utf-8")
+        def publish(temporary, target):
+            Path(target).write_bytes(original)
+            return self.publish(temporary, target)
+        with patch.object(stop_control.os, self.publisher_name, side_effect=publish):
+            with self.assertRaisesRegex(ValueError, "another run"):
+                stop_control.request(self.logs, self.binding)
+        self.assertEqual(self.target.read_bytes(), original)
+        self.assert_no_temporary_files()
+
+    def test_stop_matching_race_is_idempotent_without_overwrite(self):
+        original = json.dumps(self.binding, indent=2).encode("utf-8")
+        def publish(temporary, target):
+            Path(target).write_bytes(original)
+            return self.publish(temporary, target)
+        with patch.object(stop_control.os, self.publisher_name, side_effect=publish):
+            self.assertEqual(stop_control.request(self.logs, self.binding), self.binding)
+        self.assertEqual(self.target.read_bytes(), original)
+        self.assert_no_temporary_files()
+
+    def test_stop_publication_failure_cleans_temporary_file_without_fallback(self):
+        with patch.object(stop_control.os, self.publisher_name, side_effect=PermissionError("publication denied")):
+            with self.assertRaisesRegex(PermissionError, "publication denied"):
+                stop_control.request(self.logs, self.binding)
+        self.assertFalse(self.target.exists())
+        self.assert_no_temporary_files()
 
 
 if __name__ == "__main__": unittest.main()
