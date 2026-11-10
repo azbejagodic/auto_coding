@@ -16,239 +16,123 @@ from auto_coding.simple_run import load_tasks
 
 HTML = r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Auto-Coding</title><style>
 *{box-sizing:border-box}
-body{margin:0;background:#0e1115;color:#f0f3f7;font:15px/1.5 "Segoe UI",system-ui,sans-serif}
-button,input,select{font:inherit}
-button,select,input{border:1px solid #475361;border-radius:10px;background:#222b36;color:#f0f3f7;padding:10px 16px}
-button{cursor:pointer;transition:background .15s}
-button:hover{background:#303e4f}
-button:disabled{color:#abb5c2;background:#1d232b;cursor:not-allowed}
-button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible,pre:focus-visible,.selected-path:focus-visible{outline:3px solid #74b6ff;outline-offset:3px}
+body{margin:0;min-height:100vh;display:grid;place-items:center;padding:18px 4px;background:#000;color:#c9c9c9;font:20px/1.5 "Segoe UI",Arial,sans-serif}
+button,input,select{font:inherit;color:inherit}
+button{border:1px solid #202020;border-radius:999px;padding:10px 24px;background:transparent;font-size:22px;font-weight:600;cursor:pointer;white-space:nowrap}
+button:hover:enabled{background:#191919}
+button:disabled{color:#aaa;cursor:not-allowed}
+button:focus-visible,input:focus-visible,select:focus-visible,[tabindex]:focus-visible{outline:3px solid #8bbcff;outline-offset:3px}
 [hidden]{display:none!important}
-.shell{display:flex;min-height:100vh}
-.side{position:fixed;inset:0 auto 0 0;width:210px;padding:24px 16px;background:#14181e;border-right:1px solid #2c333e;overflow:auto}
-.brand{font-size:21px;font-weight:700;margin:0 0 32px}
-.nav{display:block;width:100%;text-align:left;background:transparent;border:1px solid transparent;margin:8px 0;padding:12px 16px;color:#bdc7d4}
-.nav.active{background:#1e3149;border-color:#3d6490;color:#fff}
-.side p{font-size:14px;margin-top:24px}
-.main{margin-left:210px;padding:24px;flex:1;min-width:0;max-width:1700px}
-.top{display:flex;justify-content:space-between;gap:16px;align-items:center;margin-bottom:16px}
-.top>div:first-child{min-width:0}
-.top>div:last-child{flex-shrink:0}
-.top h1{font-size:26px;margin:4px 0}
-.muted{color:#b0bccb}
-.label{color:#b0bccb;font-size:13px;font-weight:600;letter-spacing:.06em;text-transform:uppercase}
-.panel,.card{background:#191f27;border:1px solid #303946;border-radius:16px;padding:16px}
-.panel{margin:0 0 16px}
-.panel h2{font-size:19px;margin:0 0 16px}
-.panel h3{font-size:16px;margin:0 0 12px}
-.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;margin:16px 0}
-.card{padding:16px}
-.value{font-size:22px;font-weight:650;margin-top:8px;overflow-wrap:anywhere}
-.blue{color:#81baff}
-.green{color:#7be4a5}
-.amber,.warning{color:#f5ca7b}
-.red{color:#ff9494}
-.warning{margin:12px 0}
-.setup-fields{display:grid;grid-template-columns:minmax(0,1fr) 110px;gap:16px}
-.field label{display:block;font-weight:600;margin-bottom:8px}
-#attempts{width:100%;padding:10px}
-#github-repo{flex:1;min-width:180px}
-#attempts[aria-invalid="true"]{border-color:#ff9494}
-.field-line{display:flex;align-items:flex-start;gap:8px}
-.selected-path{margin:0;min-height:46px;flex:1;min-width:0;white-space:pre-wrap;overflow-wrap:anywhere;user-select:text;color:#dbe4ef;padding:10px 12px;background:#0e1115;border-radius:8px}
-.controls{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin-top:16px}
-#start{background:#3578ce;border-color:#67a7f3;color:white;font-weight:650;min-width:130px}
-#start:hover:enabled{background:#4388df}
-#start:disabled{background:#253547;color:#b3c0d1;border-color:#475361}
-#resume{border-color:#6f9ac9;font-weight:650}
-.notice,.path{white-space:pre-wrap;overflow-wrap:anywhere}
-.notice p{margin:12px 0}
-.empty{padding:16px;background:#191f27;border:1px solid #303946;border-radius:16px}
-.empty p{margin:0}
-details{margin:12px 0}
-summary{cursor:pointer;color:#c0d4eb;padding:6px 0}
-pre{font:14px/1.6 Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere;background:#0e1115;border:1px solid #303946;border-radius:10px;padding:16px;max-height:320px;overflow:auto}
-.events{width:100%;border-collapse:collapse;table-layout:fixed}
-.events th{text-align:left;color:#b0bccb;font-size:13px}
-.events th,.events td{padding:12px 8px;border-bottom:1px solid #303946;vertical-align:top;overflow-wrap:anywhere}
-.events th:first-child{width:20%}
-.events th:last-child{width:32%}
-.table-scroll{overflow-x:auto}
-.evidence{display:inline-block;color:#99caff;background:transparent;text-align:left;padding:4px 8px;margin:4px 0;overflow-wrap:anywhere;max-width:100%}
-.tasks{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}
-.pill{background:#252f3b;border-radius:16px;padding:6px 12px}
-.attempt{border-left:4px solid #7b8b9e;margin-top:16px;padding:16px;background:#141a22;border-radius:12px}
-.attempt.approved{border-color:#7be4a5}
-.attempt.rejected{border-color:#ff9494}
-.filters{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px}
-.filters label{flex:1;min-width:180px}
-.filters input{display:block;width:100%;margin-top:8px;background:#0e1115}
-progress{width:100%;height:12px;accent-color:#72adf9}
-.section-divider{border:0;border-top:2px solid #475361;margin:24px 0}
-.run-summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;margin:20px 0 0}
-.run-summary dt{color:#b0bccb}
-.run-summary dd{margin:4px 0;font-size:22px;font-weight:650;overflow-wrap:anywhere}
-#advanced{border-top:1px solid #303946;margin-top:20px;padding-top:12px}
-.audit-section .controls{margin-top:12px}
-@media(max-width:700px){.shell{display:block}.side{position:static;width:auto;padding:12px}.brand{margin:0}.side nav{display:flex;gap:8px}.nav{width:auto;margin:4px 0;padding:8px}.main{margin-left:0;padding:12px}.top{align-items:flex-start}.field-line{flex-wrap:wrap}.selected-path{flex-basis:100%}.run-summary{grid-template-columns:1fr}.controls>*{max-width:100%}}
-.project-heading{overflow-wrap:anywhere;max-width:650px}
-#header-state{white-space:nowrap}
-#evidence-viewer:empty{display:none}
-@media(max-width:1100px){.setup-fields{grid-template-columns:minmax(0,1fr)}
-.field-line{align-items:center}
-.main{padding:20px}
-.grid{grid-template-columns:1fr 1fr}
-.grid .card:first-child{grid-column:1/-1}
-.events{font-size:14px}
-}
-@media(prefers-reduced-motion:reduce){button{transition:none}
-}
-
+.dashboard{width:min(100%,1000px);min-height:555px;border:1px solid #292929;border-radius:20px;padding:20px 18px 28px;background:#020202}
+h1{font-size:25px;line-height:1.5;margin:0 0 14px;color:#ddd}
+.file-row{display:flex;align-items:center;gap:12px}
+.selected-file{display:flex;align-items:center;gap:14px;flex:1;min-width:0;border:1px solid #303030;border-radius:14px;min-height:68px;padding:14px}
+#plan-path{overflow-wrap:anywhere;min-width:0;user-select:text}
+.icon{width:24px;height:24px;display:inline-block;vertical-align:middle;flex-shrink:0;margin-right:8px}
+.selected-file .icon{margin:0}
+.controls{display:flex;align-items:center;flex-wrap:wrap;gap:12px;margin-top:12px}
+.filled{background:#101010;border-color:#101010}
+.pill{border-radius:999px;font-weight:600;font-size:19px;padding:2px 12px;min-width:133px;text-align:center}
+.muted{color:#aaa}.green{color:#00c25a;background:#002512}.red{color:#ffb0b0}.amber{color:#e5ca92}
+.section-divider{border:0;border-top:1px solid #292929;margin:32px 0 36px}
+.unlock{display:flex;align-items:center;gap:12px;margin:0 0 26px}
+.indicator{display:inline-block;width:21px;height:21px;background:#666;border-radius:50%;flex-shrink:0}
+.indicator.green{background:#00bd56}
+.run-summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:20px;margin:22px 0 0}
+.run-summary dt{font-size:18px}.run-summary dd{margin:2px 0 0;font-size:25px;font-weight:650;color:#ddd;overflow-wrap:anywhere}
+.notice{font-size:15px;white-space:pre-wrap;overflow-wrap:anywhere;margin:8px 0 0}.notice:empty{display:none}
+.error-link{font-size:14px;padding:2px 10px;margin-top:6px}
+dialog{color:#ccc;background:#0b0b0b;border:1px solid #444;border-radius:16px;width:min(650px,calc(100% - 24px));max-height:85vh;overflow:auto;padding:24px}
+dialog::backdrop{background:#000b}dialog label{display:block;margin-top:12px}dialog input:not([type=checkbox]),dialog select{background:#161616;border:1px solid #555;border-radius:8px;padding:8px;width:100%}dialog button{font-size:15px;padding:8px 14px}dialog p{font-size:14px;overflow-wrap:anywhere}dialog .controls{gap:8px}
+@media(max-width:700px){body{font-size:16px;padding:12px 6px}.dashboard{padding:18px 14px;min-height:0}button{font-size:17px;padding:10px 16px}.pill{font-size:16px}.file-row{gap:8px}.selected-file{min-height:60px;padding:10px;gap:8px}.run-summary{gap:12px}.run-summary dd{font-size:21px}.section-divider{margin:26px 0}.unlock{margin-bottom:20px}}
+@media(max-width:400px){.file-row{flex-wrap:wrap}.selected-file{flex-basis:100%}.controls{gap:8px}}
+@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto}}
 </style></head><body>
-<div class="shell">
-<aside class="side">
-<div class="brand">Auto-Coding</div>
-<nav aria-label="Main navigation">
-<button class="nav active" id="nav-overview" aria-current="page">Overview</button>
-<button class="nav" id="nav-tasks">Tasks</button>
-<button class="nav" id="nav-logs">Logs</button>
-</nav>
-</aside>
-<main class="main">
-<header class="top">
-<div>
-<div class="label">Local developer workspace</div>
-<h1 id="page-title">Run overview</h1>
-<div class="muted project-heading" id="selected-project">No project selected</div>
-</div>
-<div>
-<div id="header-state" class="pill" role="status" aria-live="polite" aria-atomic="true">Idle</div>
-<button id="refresh" style="margin-top:12px">Refresh</button>
-</div>
-</header>
-<section class="panel" id="run-setup" aria-label="Audit and run">
-<section class="audit-section" aria-labelledby="audit-title">
-<h2 id="audit-title">Audit</h2>
-<div class="field">
-<label id="plan-label">Task plan (JSON)</label>
-<div class="field-line">
-<div id="plan-path" class="selected-path" tabindex="0" role="textbox" aria-readonly="true" aria-labelledby="plan-label">No plan selected</div>
-<button id="browse-plan" aria-label="Browse task plan">Browse</button>
-</div>
-</div>
-<div class="controls">
-<label for="audit-model">Audit model (High reasoning)</label><input id="audit-model" placeholder="Explicit model ID">
-<label for="audit-goal">Goal</label><input id="audit-goal" maxlength="4000">
-<button id="start-audit" disabled aria-describedby="audit-unavailable">Start Audit</button>
-<span>Result: <strong id="audit-result" class="pill muted" role="status" aria-live="polite" aria-atomic="true">Not audited</strong></span>
-<button id="download-audit" disabled aria-describedby="audit-unavailable">Download audit report/log</button>
-</div>
-<p id="audit-unavailable" class="muted">One read-only audit using the local authenticated Codex CLI. Select a JSON plan with focused checks and final verification, a clean feature branch, and an explicit model supporting High. Reopen existing audit logs to inspect results. Download is available after a verified audit report exists.</p>
-<pre id="audit-identity" tabindex="0" aria-label="Immutable audit identity and report"></pre>
+<main class="dashboard" aria-labelledby="audit-title">
+<section aria-labelledby="audit-title">
+<h1 id="audit-title">Plan Audit</h1>
+<div class="file-row"><div class="selected-file"><svg class="icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M14 2H6a2 2 0 0 0-2 2v16h16V8zM14 2v6h6M10 10l-3 4 3 4m4-8 3 4-3 4"/></svg><div id="plan-path" tabindex="0" role="textbox" aria-readonly="true" aria-label="Selected JSON file">Selected JSON file</div></div><button id="browse-plan" title="Browse JSON plan and configure selections">Browse</button></div>
+<div class="controls"><button id="start-audit" class="filled" disabled>Start Audit</button><span id="audit-result" class="pill muted" role="status" aria-live="polite">Idle</span><button id="download-audit" disabled title="Download the verified audit report/log; no fix artifact is generated">Download Fix / Log</button></div>
+<p id="audit-error" class="notice red" role="alert"></p>
 </section>
 <hr class="section-divider">
-<section aria-labelledby="run-title">
-<h2 id="run-title">Run</h2>
-<div class="controls">
-<button id="start" disabled aria-describedby="start-reason preflight attempts-error">Start</button>
-<button id="stop" disabled aria-describedby="run-unavailable">Stop after task</button>
-<button id="download-logs" disabled aria-describedby="run-unavailable">Download Logs</button>
-</div>
-<p id="start-reason" class="muted">Start requires verified audit approval for the exact selected plan and target, and native authorization.</p>
-<p id="run-unavailable" class="muted">Stop finishes the current task: executing A/B calls and safe checkpoint handling may finish first. Select a run to download its summary and evidence opened in this window.</p>
-<dl class="run-summary">
-<div><dt>Status</dt><dd id="run-status" role="status" aria-live="polite">Idle</dd></div>
-<div><dt>Task current/total</dt><dd id="run-task" role="status" aria-live="polite">-- / --</dd></div>
-<div><dt>Time <small>(HH:MM:SS)</small></dt><dd id="run-time" aria-describedby="time-hint">--:--:--</dd></div>
-</dl>
-<p id="time-hint" class="muted">Elapsed time is unavailable in the current desktop snapshot.</p>
+<section aria-label="Run controls and status">
+<p class="unlock"><span id="approval-indicator" class="indicator" aria-hidden="true"></span>Run controls unlock after approved audit</p>
+<div class="controls"><button id="start" class="filled" disabled aria-describedby="start-reason"><svg class="icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="m10 8 6 4-6 4z"/></svg><span id="start-label">Start</span></button><button id="stop" disabled title="Stop after current task" aria-label="Stop after current task"><svg class="icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="3"/></svg>Stop</button><button id="download-logs" disabled><svg class="icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v13m-5-5 5 5 5-5M3 15v5h18v-5"/></svg>Download Logs</button></div>
+<span id="start-reason" hidden>Start requires verified approval for the exact selected inputs.</span>
+<dl class="run-summary"><div><dt>Status</dt><dd id="run-status" role="status" aria-live="polite">Idle</dd></div><div><dt>Task</dt><dd id="run-task">-- / --</dd></div><div><dt>Time</dt><dd id="run-time">--:--:--</dd></div></dl>
+<p id="progress-error" class="notice red" role="alert"></p>
 </section>
-<details id="advanced"><summary>Advanced / Repository, recovery and diagnostics</summary>
-<h2 id="setup-title">Run setup</h2>
-<label for="github-repo">GitHub repository (OWNER/REPO or GitHub URL)</label>
-<div class="controls">
-<input id="github-repo" aria-label="GitHub repository" placeholder="OWNER/REPO">
-<button id="connect-github">Connect repository</button>
-<button id="list-github">My repositories</button>
-<select id="github-repositories" aria-label="Authenticated repositories" hidden></select>
-</div>
-<p id="github-state" class="muted">Enter a repository. GitHub CLI is optional; Git authentication is used for checkout.</p>
-<div class="controls">
-<select id="github-branch" aria-label="Feature branch"></select>
-<button id="select-branch">Select branch</button>
-<button id="new-branch">New Branch</button>
-<button id="fetch-github">Fetch branches</button>
-</div>
-<div id="branch-form" class="controls" hidden>
-<label for="branch-name">New feature branch</label>
-<input id="branch-name">
-<label for="branch-base">Remote base</label>
-<select id="branch-base" aria-describedby="branch-base-confirm-label"></select>
-<label id="branch-base-confirm-label" hidden><input id="branch-base-confirm" type="checkbox"> I confirm creating this feature branch from the selected alternate remote base instead of origin/main.</label>
-<button id="create-branch">Create branch</button><button id="cancel-branch">Cancel</button>
-</div>
-<div class="setup-fields">
-<div class="field">
-<label for="attempts">Attempts</label>
-<input id="attempts" type="number" min="1" max="10" step="1" value="3" required aria-describedby="attempts-hint attempts-error">
-<small id="attempts-hint" class="muted">1–10 per task</small>
-</div>
-</div>
-<div id="attempts-error" class="notice red" role="status" aria-live="polite"></div>
-<div class="controls">
-<button id="resume" aria-describedby="resume-reason attempts-error">Resume</button>
-<button id="open-run">Open Run</button>
-<span id="resume-reason" class="muted">Open a matching stopped run to resume.</span>
-</div>
-<div class="controls"><button id="push-approved">Push Approved Commits</button>
-<span id="push-reason" class="muted"></span></div>
-<label><input id="auto-push" type="checkbox"> Automatically push approved tasks</label>
-<p class="muted">Off by default for each new Start. Confirm at Start for this run. Resume keeps the run's saved setting. If publication fails, Resume is Retry Push for the same approved commit before further tasks.</p>
-<details id="local-project"><summary>Advanced / Local Project</summary>
-<div class="field">
-<label id="project-label">Project folder</label>
-<div class="field-line">
-<div id="project-path" class="selected-path" tabindex="0" role="textbox" aria-readonly="true" aria-labelledby="project-label">No project selected</div>
-<button id="browse-project" aria-label="Browse project folder">Browse</button>
-</div>
-</div>
-</details>
-<div id="paths">
-</div>
-<div id="preflight" class="notice muted" role="status" aria-live="polite">
-</div>
-<details id="launch-details">
-<summary>Details</summary>
-<p class="muted">Every launch requires native confirmation. START requires a clean feature branch. RESUME requires a stopped run and its original plan, repository and logs. Attempts is the total limit per task (1–10); increase it to continue an exhausted run. Checkpoints stay local unless automatic push is explicitly enabled for this run. No automatic merge or force-push. Model and reasoning settings come from your local Codex CLI.</p>
-<p class="muted">Local Codex CLI authentication is required. Closing this window leaves the runner alive. Reopen its logs to inspect progress.</p>
-<pre id="preflight-details" tabindex="0" aria-label="Preflight diagnostics"></pre>
-<div id="run-folder" class="path muted"></div>
-</details>
-</details>
-</section>
-<div id="message" class="notice" role="alert" aria-live="polite">
-</div>
-<div id="evidence-viewer">
-</div>
-<div id="app">
-</div>
+<p id="message" class="notice" role="status" aria-live="polite"></p>
+<button id="configure-error" class="error-link" hidden>Review configuration</button>
 </main>
-</div><script>
-const app = document.getElementById('app');
-const evidenceViewer = document.getElementById('evidence-viewer');
-
-function el(tag, txt, cls) {
-  const node = document.createElement(tag);
-  if (txt !== undefined) node.textContent = String(txt);
-  if (cls) node.className = cls;
-  return node;
+<dialog id="configuration" aria-label="Audit and run configuration">
+<p>Choose a target checkout and feature branch, or select saved run logs. Selection never launches work. Model and reasoning defaults for implementation and review remain in your local Codex CLI configuration.</p>
+<div class="controls"><button id="browse-project">Choose checkout</button><button id="open-run">Select saved run / audit logs</button></div><p id="project-path"></p><p id="run-folder"></p>
+<label for="export-evidence">Saved evidence to include in Download Logs</label><select id="export-evidence"></select><div class="controls"><button id="include-evidence" disabled>Include selected file in log export</button></div>
+<label for="audit-model">Audit model (High reasoning)</label><input id="audit-model" placeholder="Explicit model ID"><label for="audit-goal">Audit goal</label><input id="audit-goal" maxlength="4000">
+<label for="attempts">Attempts per task (1–10)</label><input id="attempts" type="number" min="1" max="10" step="1" value="3" required aria-describedby="attempts-error"><p id="attempts-error" class="notice red" role="status" aria-live="polite"></p>
+<label for="github-repo">Managed GitHub repository (optional)</label><input id="github-repo" placeholder="OWNER/REPO"><div class="controls"><button id="connect-github">Connect repository</button><button id="list-github">My repositories</button><select id="github-repositories" aria-label="Authenticated repositories" hidden></select></div><p id="github-state"></p>
+<div class="controls"><select id="github-branch" aria-label="Feature branch"></select><button id="select-branch">Select branch</button><button id="new-branch">New branch</button><button id="fetch-github">Fetch branches</button></div>
+<div id="branch-form" hidden><label for="branch-name">New feature branch</label><input id="branch-name"><label for="branch-base">Remote base</label><select id="branch-base"></select><label id="branch-base-confirm-label" hidden><input id="branch-base-confirm" type="checkbox"> I confirm this alternate remote base instead of origin/main.</label><div class="controls"><button id="create-branch">Create branch</button><button id="cancel-branch">Cancel</button></div></div>
+<label><input id="auto-push" type="checkbox"> Automatically push approved tasks</label><p>Off by default for a new Start. Resume preserves the saved authorization. No automatic merge or force-push.</p><div class="controls"><button id="push-approved">Push Approved Commits</button></div><p id="push-reason"></p>
+<p id="configuration-status" class="notice" role="status" aria-live="polite"></p><p>Every launch requires native confirmation. Local Codex CLI authentication is required. Closing this window leaves the runner alive. Download Fix / Log exports the verified audit report/log, not a generated fix.</p><div class="controls"><button id="configuration-done">Done</button></div>
+</dialog>
+<script>
+const get = id => document.getElementById(id);
+let latest = null, busy = false, ready = false, refreshing = null, closed = false;
+function el(tag, text) { const node = document.createElement(tag); if (text !== undefined) node.textContent = String(text); return node; }
+function message(text, error = false) {
+  get('message').textContent = text || '';
+  get('message').className = 'notice ' + (error ? 'red' : 'muted');
+  get('configuration-status').textContent = text || '';
 }
-function panel(title) {
-  const p = el('section', undefined, 'panel');
-  p.append(el('h2', title));
-  return p;
+function configure() { if (!busy && ready && !get('configuration').open) get('configuration').showModal(); }
+const controls = ['github-repo','connect-github','list-github','github-repositories','github-branch','select-branch','new-branch','fetch-github','branch-name','branch-base','branch-base-confirm','create-branch','cancel-branch','push-approved','browse-project','browse-plan','open-run','attempts','audit-model','audit-goal','auto-push'];
+function validateAttempts() {
+  const input = get('attempts'), value = input.value.trim(), number = Number(value);
+  const valid = /^\d+$/.test(value) && Number.isInteger(number) && number >= 1 && number <= 10;
+  input.setAttribute('aria-invalid', String(!valid));
+  get('attempts-error').textContent = valid ? '' : 'Cannot launch: attempts must be a whole number from 1 to 10.';
+  return valid;
 }
-let logQuery = '';
+function jsonPlan() { return typeof latest?.controller?.plan === 'string' && /\.json$/i.test(latest.controller.plan); }
+function resumable() { return jsonPlan() && latest?.controller?.resume_ready === true; }
+function approved() {
+  const c = latest?.controller || {}, a = c.audit || {};
+  return jsonPlan() && c.start_ready === true && a.status === 'APPROVE' && a.verified === true && a.start_approved === true;
+}
+function updateControls() {
+  const c = latest?.controller || {}, audit = c.audit || {};
+  const locked = busy || !ready || c.active !== false || c.uncertain;
+  controls.forEach(id => { get(id).disabled = locked; });
+  get('browse-plan').disabled = busy || !ready;
+  get('browse-plan').title = c.active !== false || c.uncertain
+    ? 'View configuration and saved evidence; selections are locked while running'
+    : 'Browse JSON plan and configure selections';
+  ['github-branch','select-branch','new-branch','fetch-github','branch-base','branch-base-confirm','create-branch'].forEach(id => { get(id).disabled = locked || !c.repository || c.preflight?.clean !== true; });
+  const base = get('branch-base').value;
+  get('branch-base-confirm-label').hidden = !base || base === 'main';
+  get('create-branch').disabled ||= !base || (base !== 'main' && !get('branch-base-confirm').checked);
+  get('push-approved').disabled = locked || !c.push?.eligible;
+  get('push-reason').textContent = c.push?.reason || 'Select a managed repository to publish approved local checkpoints.';
+  get('start-audit').disabled = locked || (c.plan && !jsonPlan()) || (c.repo && c.plan && !c.audit_ready);
+  get('download-audit').disabled = busy || !ready || !c.audit_export_available;
+  get('download-logs').disabled = busy || !ready || !latest?.exists;
+  get('export-evidence').disabled = busy || !ready || !latest?.exists;
+  get('include-evidence').disabled = busy || !ready || !latest?.exists || !get('export-evidence').value;
+  const verified = audit.status === 'APPROVE' && audit.verified === true;
+  get('audit-result').textContent = verified ? '\u2713 Approved' : audit.status === 'APPROVE' ? 'Unverified' : audit.status || 'Idle';
+  get('audit-result').className = 'pill ' + (verified ? 'green' : ['REVISE','REJECT','BLOCK','Infrastructure error'].includes(audit.status) ? 'red' : ['Running','Unknown'].includes(audit.status) ? 'amber' : 'muted');
+  get('approval-indicator').className = 'indicator' + (!locked && approved() ? ' green' : '');
+  get('audit-error').textContent = audit.error || (['REVISE','REJECT','BLOCK','Infrastructure error'].includes(audit.status) ? c.audit_reason || 'Audit did not approve this plan. Download the report for details.' : '');
+  get('start').disabled = locked || !validateAttempts() || !(resumable() || approved());
+  get('start-label').textContent = resumable() ? 'Resume' : 'Start';
+  get('start-reason').textContent = resumable() ? 'Resume uses persisted authorization and identity checks. Pending publication retries the same approved commit first.' : c.start_reason || 'Start requires verified approval for the exact selected inputs and native authorization.';
+  get('start').title = get('start-reason').textContent;
+  get('stop').disabled = busy || !ready || !c.stop_identity || c.stop_requested || latest?.state?.status === 'completed' || (c.active !== true && !c.uncertain);
+  get('stop').title = c.stop_requested ? 'Stop after current task: request saved' : 'Stop after current task';
+}
 function runPresentation(data) {
   const c = data.controller || {}, state = data.state || {};
   if (c.uncertain || (c.active !== false && c.active !== true)) return {label:'Unknown child status', color:'amber'};
@@ -261,14 +145,6 @@ function runPresentation(data) {
   if (c.logs || data.root) return {label:state.status ? 'Unknown run state' : 'Awaiting recorded state', color:'amber'};
   return {label:'Idle', color:'muted'};
 }
-let page = 'overview';
-let latest = null;
-let busy = false;
-let ready = false;
-let refreshing = null;
-let evidenceRoot = null;
-let renderKey = null;
-let closed = false;
 function updateElapsed(now = Date.now()) {
   const data = latest || {}, c = data.controller || {}, summary = data.summary || {};
   const start = Date.parse(summary.start_utc);
@@ -282,119 +158,24 @@ function updateElapsed(now = Date.now()) {
     : valid ? 'Persisted duration from recorded UTC events (includes pauses).'
     : 'Elapsed time is unavailable: no confirmed start and end, or process status is unknown.';
   if (document.getElementById('run-time').textContent !== text) document.getElementById('run-time').textContent = text;
-  if (document.getElementById('time-hint').textContent !== hint) document.getElementById('time-hint').textContent = hint;
-}
-const expanded = new Set();
-const controls = ['github-repo', 'connect-github', 'list-github', 'github-repositories', 'github-branch', 'select-branch', 'new-branch', 'fetch-github', 'branch-name', 'branch-base', 'branch-base-confirm', 'create-branch', 'cancel-branch', 'push-approved', 'browse-project', 'browse-plan', 'open-run', 'start', 'resume', 'attempts'];
-function detail(title, text, key) {
-  const box = el('details');
-  box.open = expanded.has(key);
-  box.ontoggle = () => { if (box.open) expanded.add(key); else expanded.delete(key); };
-  const content = el('pre', text);
-  content.setAttribute('tabindex', '0');
-  box.append(el('summary', title), content);
-  return box;
-}
-function message(text, error = false) {
-  const box = document.getElementById('message');
-  box.textContent = text || '';
-  box.className = 'notice ' + (error ? 'red' : 'blue');
-}
-function updateControls() {
-  const c = latest?.controller || {};
-  const locked = busy || !ready || c.active !== false || c.uncertain;
-  document.getElementById('start-audit').disabled = locked || !c.audit_ready || !document.getElementById('audit-model').value.trim();
-  document.getElementById('audit-model').disabled = locked;
-  document.getElementById('audit-goal').disabled = locked;
-  const audit = c.audit || {};
-  document.getElementById('download-audit').disabled = busy || !ready || !c.audit_export_available;
-  document.getElementById('download-logs').disabled = busy || !ready || !latest?.exists;
-  document.getElementById('audit-result').textContent = audit.status || 'Idle';
-  document.getElementById('audit-result').className = 'pill ' + (audit.status === 'APPROVE' && audit.verified === true ? 'green' : ['REVISE', 'REJECT', 'BLOCK', 'Infrastructure error'].includes(audit.status) ? 'red' : ['Running', 'Unknown'].includes(audit.status) ? 'amber' : 'muted');
-  document.getElementById('audit-identity').textContent = JSON.stringify({identity:audit.identity, configuration:audit.configuration, report:audit.report, error:audit.error}, null, 2);
-  document.getElementById('audit-unavailable').textContent = c.audit_reason || audit.error || 'One read-only audit per exact plan and target. Reopen saved logs to inspect results. Download is available after a verified audit report exists.';
-  controls.forEach(id => { document.getElementById(id).disabled = locked; });
-  ['github-branch', 'select-branch', 'new-branch', 'fetch-github', 'branch-base', 'branch-base-confirm', 'create-branch'].forEach(id => {
-    document.getElementById(id).disabled = locked || !c.repository || c.preflight?.clean !== true;
-  });
-  document.getElementById('auto-push').disabled = locked;
-  const base = document.getElementById('branch-base').value;
-  document.getElementById('branch-base-confirm-label').hidden = !base || base === 'main';
-  document.getElementById('create-branch').disabled ||= !base || (base !== 'main' && !document.getElementById('branch-base-confirm').checked);
-  document.getElementById('push-approved').disabled = locked || !c.push?.eligible;
-  document.getElementById('push-reason').textContent = c.push?.reason || 'Select a managed repository to publish approved local checkpoints.';
-  const validAttempts = validateAttempts();
-  document.getElementById('start').disabled = locked || !c.start_ready || audit.status !== 'APPROVE' || audit.verified !== true || audit.start_approved !== true || !validAttempts;
-  document.getElementById('start-reason').textContent = c.start_reason || 'Start requires verified audit approval for the exact selected inputs and native authorization.';
-  document.getElementById('resume').disabled = locked || !c.resume_ready || !validAttempts;
-  document.getElementById('resume').textContent = latest?.state?.publication?.outcome === 'pending' ? 'Retry Push' : 'Resume';
-  document.getElementById('stop').disabled = busy || !ready || !c.stop_identity || c.stop_requested || latest?.state?.status === 'completed' || (c.active !== true && !c.uncertain);
-  document.getElementById('stop').textContent = c.stop_requested ? 'Stop requested' : 'Stop after task';
-  document.getElementById('refresh').disabled = busy || !ready;
-}
-function validateAttempts() {
-  const input = document.getElementById('attempts');
-  const value = input.value.trim();
-  const number = Number(value);
-  const valid = /^\d+$/.test(value) && Number.isInteger(number) && number >= 1 && number <= 10;
-  input.setAttribute('aria-invalid', String(!valid));
-  document.getElementById('attempts-error').textContent = valid ? '' : 'Cannot launch: attempts must be a whole number from 1 to 10.';
-  return valid;
-}
-function filesInto(parent, files) {
-  if (!files.length) parent.append(el('span', 'None listed', 'muted'));
-  files.forEach(file => {
-    const available = file.status === 'available';
-    const info = el(available ? 'button' : 'span', file.path + ' (' + file.status + ')', available ? 'evidence' : 'warning');
-    if (available) {
-      info.onclick = () => showEvidence(file.path);
-    }
-    parent.append(el('span', file.label + ': '), info, document.createTextNode(' '));
-  });
-}
-function timelineInto(parent, events) {
-  if (!events.length) { parent.append(el('p', 'No events recorded. Legacy runs may have state and raw files only.', 'muted')); return; }
-  const table = el('table', undefined, 'events');
-  const header = el('thead');
-  const headings = el('tr');
-  ['UTC timestamp', 'Actor', 'Event', 'Outcome', 'Task', 'Attempt', 'Evidence / details'].forEach(label => headings.append(el('th', label)));
-  header.append(headings);
-  table.append(header);
-  const body = el('tbody');
-  events.forEach(event => {
-    const line = el('tr');
-    [event.timestamp_utc, event.actor, event.event, event.outcome, event.task_id, event.attempt].forEach(value => {
-      line.append(el('td', value === null || value === undefined || value === '' ? '--' : value));
-    });
-    const cell = el('td');
-    filesInto(cell, event._evidence_status || []);
-    cell.append(detail('Original event', JSON.stringify(event, null, 2), 'event-' + (event.seq ?? event._source_order)));
-    line.append(cell);
-    body.append(line);
-  });
-  table.append(body);
-  const scroll = el('div', undefined, 'table-scroll');
-  scroll.append(table);
-  parent.append(scroll);
+  document.getElementById('run-time').title = hint;
 }
 function render(data) {
-  const searchFocused = document.activeElement?.id === 'log-search';
-  const searchCursor = searchFocused ? document.activeElement.selectionStart : null;
   latest = data;
-  updateElapsed();
   const c = data.controller || {};
-  const key = page + JSON.stringify(data);
-  updateControls();
-  if (runPresentation(data).label === 'Completed' && document.getElementById('message').textContent.startsWith('Launch accepted.')) message('');
-  if (renderKey === key) return;
-  renderKey = key;
-  const paths = document.getElementById('paths');
-  paths.replaceChildren();
-  [['project-path', c.repo || 'No project selected'], ['plan-path', c.plan || 'No plan selected']].forEach(([id, value]) => {
-    const field = document.getElementById(id);
-    if (field.textContent !== value) field.textContent = value;
-  });
-  document.getElementById('selected-project').textContent = c.repository || c.repo || 'No project selected';
+  get('plan-path').textContent = c.plan || 'Selected JSON file';
+  get('project-path').textContent = c.repo || 'No checkout selected';
+  get('run-folder').textContent = c.logs ? 'Saved run: ' + c.logs : '';
+  const evidence = get('export-evidence');
+  const available = (data.files || []).filter(file => file.status === 'available');
+  const evidenceSignature = JSON.stringify([data.root, available.map(file => file.path)]);
+  if (evidence.datasetSignature !== evidenceSignature) {
+    evidence.replaceChildren();
+    const placeholder = el('option', 'Choose an evidence file'); placeholder.value = ''; evidence.append(placeholder);
+    available.forEach(file => { const option = el('option', file.path); option.value = file.path; evidence.append(option); });
+    evidence.value = '';
+    evidence.datasetSignature = evidenceSignature;
+  }
   const connection = document.getElementById('github-state');
   connection.textContent = c.repository ? c.repository + ' | GitHub origin verified locally | Branch: ' + (c.preflight?.branch || 'Detached HEAD') + ' | ' + (c.preflight?.clean === true ? 'Clean' : 'Changes or unavailable status') + (c.github?.error ? ' | ' + c.github.error : '') : 'No GitHub repository selected. Enter OWNER/REPO or a GitHub URL; GitHub CLI is optional.';
   const branches = document.getElementById('github-branch');
@@ -420,23 +201,6 @@ function render(data) {
     branches.datasetSignature = signature;
   }
   const git = c.preflight || {};
-  if (c.repo) paths.append(el('div', 'Branch: ' + (git.branch || 'Unavailable'), 'path muted'));
-  document.getElementById('run-folder').textContent = c.logs ? 'Run folder: ' + c.logs : '';
-  const errors = [...(git.errors || []), ...Object.entries(c.validation_errors || {}).map(([k,v]) => k + ': ' + v)];
-  if (c.selection_error) errors.push(c.selection_error);
-  if (git.resume_error) errors.push(git.resume_error);
-  if (git.start_error) errors.push(git.start_error);
-  const preflight = document.getElementById('preflight');
-  preflight.replaceChildren();
-  // Only actionable errors occupy the main view; the empty state supplies setup guidance.
-  if (errors.length) [...new Set(errors)].forEach(error => preflight.append(el('p', error, 'red')));
-  else if (c.uncertain || c.active === null) preflight.append(el('p', 'Child status is unknown. Inspect this run before launching more work.', 'warning'));
-  else if (c.repo && c.plan && !c.active && !c.resume_ready && git.clean !== true) preflight.append(el('p', 'START requires a clean working tree. Commit or discard project changes first.', 'warning'));
-  document.getElementById('preflight-details').textContent = JSON.stringify({branch:git.branch, clean:git.clean, start_ready:c.start_ready, resume_ready:c.resume_ready, diagnostics:errors}, null, 2);
-  document.getElementById('resume-reason').textContent = c.resume_ready ? 'Continue the stopped run.' : c.active || c.uncertain ? 'Runner active or uncertain.' : 'Select a matching stopped run to resume.';
-  document.getElementById('run-setup').hidden = page !== 'overview';
-  const presentation = runPresentation(data);
-  document.getElementById('run-status').textContent = presentation.label;
   const count = data.task_count ?? c.task_count;
   const currentTask = data.state?.current_task;
   const completedTasks = data.state?.completed;
@@ -451,124 +215,22 @@ function render(data) {
     if (count == null || Number.isInteger(count) && position <= count) taskNumber = position;
   }
   document.getElementById('run-task').textContent = taskNumber + ' / ' + (count ?? '--');
-  if (data.summary) document.getElementById('run-task').textContent = (data.summary.current ?? '--') + ' / ' + (count ?? '--');
-  const badge = document.getElementById('header-state');
-  badge.textContent = presentation.label;
-  badge.className = 'pill ' + presentation.color;
-  if (presentation.label === 'Completed' && document.getElementById('message').textContent.startsWith('Launch accepted.')) message('');
-  updateControls();
-  if (evidenceRoot !== data.root) {
-    evidenceViewer.replaceChildren();
-    expanded.clear();
-    evidenceRoot = data.root;
+  if (Number.isInteger(data.summary?.current) && data.summary.current >= 0
+      && (count == null || data.summary.current <= count)) {
+    document.getElementById('run-task').textContent = data.summary.current + ' / ' + (count ?? '--');
   }
-  app.replaceChildren();
-  if (!c.logs && !data.root) {
-    const empty = el('section', undefined, 'empty');
-    empty.append(el('p', page === 'overview'
-      ? 'Select a plan and repository, then audit and authorize a new run. Open Run to inspect saved work.'
-      : page === 'tasks' ? 'No task history yet. Start or open a run.' : 'No run evidence yet. Start or open a run.'));
-    if (page !== 'overview') { const setup = el('button', 'Go to run setup'); setup.onclick = () => navigate('overview'); empty.append(setup); }
-    app.append(empty);
-    if (c.error) app.append(el('div', c.error, 'warning'));
-    return;
-  }
-  const state = data.state || {};
-  const events = data.events || [];
-  const history = Array.isArray(state.history) ? state.history.filter(item => item && typeof item === 'object') : [];
-  const completed = Array.isArray(state.completed) ? state.completed : null;
-  const reconciled = presentation.label === 'Completed' || c.active === false && !c.uncertain && state.status === 'checkpointing';
-  if (c.error && !reconciled) app.append(el('div', c.error, 'notice warning'));
-  if (data.state_error) app.append(el('div', data.state_error, 'warning'));
-  if (data.summary?.error) { const error = el('div', 'Recorded error: ' + data.summary.error, 'notice warning'); error.setAttribute('role', 'alert'); app.append(error); }
-  if (data.empty) app.append(el('div', 'No run state or events found. Select a project and plan to START, or inspect available raw files in Logs.', 'empty'));
-  if (c.logs && !data.exists && !data.state_error) app.append(el('div', 'Log directory is missing or unavailable.', 'warning'));
-  if (state.pending_checkpoint) app.append(el('div', 'A checkpoint is pending reconciliation. No completion is inferred.', 'warning'));
-  if (state.auto_push) app.append(el('div', 'This run automatically pushes approved tasks to origin/' + state.auto_push.branch + '. Resume preserves this setting.', 'notice'));
-  if (state.publication?.outcome === 'pending') app.append(el('div', 'Approved locally, push pending. Resolve connectivity or permissions, then use Resume (Retry Push). The same SHA is retried before any further tasks; Codex is not rerun for the approved task. Remote divergence requires manual review.', 'warning'));
-  (data.event_errors || []).forEach(error => app.append(el('div', error, 'warning')));
-  if (page === 'overview') {
-    const count = data.task_count ?? c.task_count;
-    const completedCount = data.summary ? data.summary.completed : completed?.length;
-    if (count > 0 && Number.isInteger(completedCount) && completedCount <= count) {
-      const progress = el('progress');
-      progress.setAttribute('max', count); progress.setAttribute('value', completedCount);
-      progress.setAttribute('aria-label', 'Completed tasks');
-      app.append(progress);
-    }
-    const current = panel('Current task');
-    current.append(el('div', 'Current task: ' + (state.current_task || 'No task in progress'), 'value'));
-    if (state.status === 'stopped') current.append(el('p', 'Run stopped. Review attempts in Tasks or raw evidence in Logs.', 'muted'));
-    if (count != null && Number.isInteger(completedCount) && completedCount <= count) current.append(el('p', 'Tasks remaining: ' + (count - completedCount)));
-    if (history.length) current.append(detail('Latest attempt details', JSON.stringify(history[history.length - 1], null, 2), 'latest-attempt'));
-    const diagnostics = el('details');
-    diagnostics.open = expanded.has('run-details');
-    diagnostics.ontoggle = () => { if (diagnostics.open) expanded.add('run-details'); else expanded.delete('run-details'); };
-    diagnostics.append(el('summary', 'Run details and recent activity'), current);
-    app.append(diagnostics);
-    const recent = panel('Recent activity');
-    events.slice(-5).reverse().forEach(event => {
-      recent.append(el('p', [event.timestamp_utc || 'Time not recorded', event.actor, event.event, event.outcome].filter(Boolean).join(' | ')));
-    });
-    if (!events.length) recent.append(el('p', 'No events recorded yet. Full evidence is available in Logs.', 'muted'));
-    const logs = el('button', 'View all activity'); logs.onclick = () => navigate('logs'); recent.append(logs);
-    diagnostics.append(recent);
-  } else if (page === 'tasks') {
-    const tasks = panel('Tasks and attempt history');
-    tasks.append(el('div', 'Current task: ' + (state.current_task || 'No task in progress'), 'value'));
-    const row = el('div', undefined, 'tasks');
-    (completed || []).forEach(task => row.append(el('span', task, 'pill green')));
-    if (!completed?.length) row.append(el('span', 'No completed tasks recorded', 'muted'));
-    tasks.append(row);
-    if (!history.length) tasks.append(el('p', 'No completed attempts recorded yet. Live test/review activity appears in Logs.', 'muted'));
-    history.forEach((item, index) => {
-      const decision = item.review && item.review.decision;
-      const outcome = String(decision || '').toLowerCase();
-      const attempt = el('section', undefined, 'attempt ' + (outcome === 'approved' ? 'approved' : outcome === 'rejected' ? 'rejected' : ''));
-      const verdict = el('div', decision || 'Review not recorded', 'pill ' + (outcome === 'approved' ? 'green' : outcome === 'rejected' ? 'red' : 'muted'));
-      attempt.append(verdict);
-      if (item.commit) attempt.append(el('p', 'Local commit: ' + item.commit, 'path green'));
-      attempt.append(el('h3', (item.task || 'Unknown task') + ' | Attempt ' + (item.attempt ?? 'unknown') + ' | Codex B: ' + (decision || 'No verdict recorded')));
-      (Array.isArray(item.tests) ? item.tests : []).filter(test => test && typeof test === 'object').forEach(test => attempt.append(el('p', 'Test ' + test.index + ': exit ' + (test.exit_code ?? 'unknown') + ', timed out: ' + (test.timed_out ?? 'unknown'))));
-      if (item.feedback) attempt.append(detail('Feedback (original)', item.feedback, 'feedback-' + index));
-      if (item.error) attempt.append(detail('Error (original)', item.error, 'error-' + index));
-      if (item.review) attempt.append(detail('Codex B summary and verdict (original)', JSON.stringify(item.review, null, 2), 'verdict-' + index));
-      attempt.append(detail('Full attempt record', JSON.stringify(item, null, 2), 'attempt-' + index));
-      tasks.append(attempt);
-    });
-    app.append(tasks);
-  } else {
-    if (c.exit_code != null || c.error || c.process_history?.length) app.append(detail('Process history - prior exits and diagnostics', JSON.stringify({previous_child_exit_code:c.exit_code, diagnostic:c.error, history:c.process_history || [], note:'Historical process results do not replace the current durable run outcome.'}, null, 2), 'process-history'));
-    const timeline = panel('Durable event timeline');
-    const filters = el('div', undefined, 'filters');
-    const label = el('label', 'Search actor, outcome or event');
-    const search = el('input'); search.id = 'log-search'; search.setAttribute('type', 'search'); search.setAttribute('aria-label', 'Search actor, outcome or event');
-    search.value = logQuery;
-    label.append(search); filters.append(label); timeline.append(filters);
-    const results = el('div');
-    const draw = () => {
-      results.replaceChildren();
-      const query = logQuery.toLowerCase();
-      const filtered = events.filter(event => JSON.stringify(event).toLowerCase().includes(query));
-      results.append(el('p', filtered.length + ' of ' + events.length + ' events', 'muted'));
-      timelineInto(results, filtered);
-    };
-    search.oninput = () => { logQuery = search.value; draw(); };
-    draw(); timeline.append(results);
-    app.append(timeline);
-    const files = panel('Raw evidence files');
-    files.append(el('p', 'Select a file to read its original text below. Display is bounded to 1 MB per file.', 'muted'));
-    (data.files || []).forEach(file => { const row = el('p'); filesInto(row, [file]); files.append(row); });
-    if (!data.files?.length) files.append(el('p', 'No raw files listed.', 'muted'));
-    app.append(files);
-    if (searchFocused) { search.focus(); search.setSelectionRange(searchCursor, searchCursor); }
-  }
-}
-function navigate(name) {
-  page = name;
-  ['overview', 'tasks', 'logs'].forEach(view => { const nav = document.getElementById('nav-' + view); nav.className = 'nav' + (view === page ? ' active' : ''); nav.setAttribute('aria-current', view === page ? 'page' : 'false'); });
-  document.getElementById('page-title').textContent = {overview:'Run overview', tasks:'Tasks', logs:'Logs'}[page];
-  if (latest) render(latest);
+
+  get('run-status').textContent = runPresentation(data).label;
+  const reconciled = runPresentation(data).label === 'Completed'
+    || c.active === false && !c.uncertain && data.state?.status === 'checkpointing';
+  const errors = [...(c.repo || c.plan || c.logs ? git.errors || [] : []), ...Object.values(c.validation_errors || {}), c.selection_error, git.resume_error, git.start_error, reconciled ? null : c.error, data.summary?.error];
+  if (c.plan && !jsonPlan()) errors.push('Select a JSON plan (.json) using Browse.');
+  if (c.logs && data.state_error) errors.push(data.state_error);
+  if (c.logs && !data.exists) errors.push('Selected log directory is missing or unavailable.');
+  get('progress-error').textContent = [...new Set(errors.filter(Boolean))].join(' ');
+  get('configure-error').hidden = !errors.some(Boolean) && !c.audit?.error;
+  if (runPresentation(data).label === 'Completed' && get('message').textContent.startsWith('Launch accepted.')) message('');
+  updateControls(); updateElapsed();
 }
 async function refresh(clearMessage = true) {
   if (!ready || busy || closed || document.hidden) return;
@@ -586,57 +248,29 @@ async function refresh(clearMessage = true) {
 }
 async function act(method) {
   if (busy || !ready) return;
-  if (['start', 'resume'].includes(method) && !validateAttempts()) { updateControls(); return; }
-  const button = {'select_repo':'browse-project', 'select_plan':'browse-plan', 'open_run':'open-run', start:'start', resume:'resume', start_audit:'start-audit', stop_after_task:'stop', download_audit:'download-audit', download_logs:'download-logs'}[method];
-  if (document.getElementById(button).disabled) return;
-  busy = true;
-  updateControls();
-  let accepted = false;
-  message(method === 'start' || method === 'resume' ? 'Waiting for native launch confirmation...' : method === 'stop_after_task' ? 'Saving stop request...' : 'Waiting for selection...');
+  const launch = ['start','resume'].includes(method);
+  const button = {select_repo:'browse-project',select_plan:'browse-plan',open_run:'open-run',start:'start',resume:'start',start_audit:'start-audit',stop_after_task:'stop',download_audit:'download-audit',download_logs:'download-logs',evidence:'include-evidence'}[method];
+  if (get(button).disabled || launch && !validateAttempts()) return;
+  if (method === 'start_audit' && (!latest?.controller?.audit_ready || !get('audit-model').value.trim())) { configure(); message('Choose the target checkout, feature branch and explicit audit model before auditing.'); return; }
+  // A native selection or confirmation can race polling. Wait, then recheck authorization.
+  busy = true; updateControls();
   try {
     if (refreshing) await refreshing;
-    const args = method === 'start' || method === 'resume' ? [Number(document.getElementById('attempts').value)] : [];
+    if (launch && (latest?.controller?.active !== false || latest?.controller?.uncertain || (method === 'resume' ? !resumable() : !approved()))) throw Error('Selection or authorization changed. Review current status.');
+    const args = launch ? [Number(get('attempts').value)] : [];
     if (method === 'stop_after_task') args.push(latest?.controller?.stop_identity);
-    if (method === 'start_audit') args.push(document.getElementById('audit-model').value.trim(), document.getElementById('audit-goal').value);
-    if (method === 'start' && document.getElementById('auto-push').checked === true) args.push(true);
+    if (method === 'evidence') args.push(get('export-evidence').value);
+    if (method === 'start_audit') args.push(get('audit-model').value.trim(), get('audit-goal').value);
+    if (method === 'start' && get('auto-push').checked === true) args.push(true);
     const result = await window.pywebview.api[method](...args);
-    accepted = result.ok && !result.cancelled;
-    if (accepted && !method.startsWith('download_')) document.getElementById('auto-push').checked = false;
-    if (args.length && accepted) navigate('overview');
-    message(result.cancelled ? 'Cancelled. No work launched.' : result.error || result.message || result.warning || (method === 'stop_after_task' && result.ok ? 'Stop requested. Executing A/B calls and safe checkpoint handling may finish first.' : '') || (result.ok ? (args.length ? 'Launch accepted. Waiting for durable runner progress.' : 'Selection updated. No work launched.') : 'Action failed.'), !result.ok && !result.cancelled);
+    if (result.ok && !result.cancelled && !method.startsWith('download_') && method !== 'evidence') get('auto-push').checked = false;
+    message(result.cancelled ? 'Cancelled. No work launched.' : result.error || result.message || result.warning || (method === 'stop_after_task' && result.ok ? 'Stop requested. Current task and safe checkpoint handling finish first.' : result.ok ? launch ? 'Launch accepted. Waiting for durable runner progress.' : method === 'download_audit' ? 'Verified audit report/log exported. No fix artifact was generated.' : method === 'evidence' ? 'Selected evidence included in Download Logs. Changed files must be selected again.' : '' : result.text || 'Action failed.'), !result.ok);
   } catch (error) { message('Action failed: ' + error, true); }
   finally {
-    busy = false;
-    ready = false;
-    updateControls();
-    ready = true;
+    busy = false; ready = false; updateControls(); ready = true;
     await refresh(false);
-    if (accepted && ['start', 'resume', 'open_run'].includes(method)) message('');
   }
 }
-async function showEvidence(name) {
-  const box = panel('Raw evidence: ' + name);
-  const close = el('button', 'Close evidence');
-  close.onclick = () => evidenceViewer.replaceChildren();
-  box.append(close);
-  box.append(el('div', 'This file is displayed only because you selected it. Treat contents as potentially sensitive.', 'warning'));
-  const content = el('pre', 'Loading...');
-  content.setAttribute('tabindex', '0');
-  content.setAttribute('aria-label', 'Raw evidence text');
-  box.append(content);
-  // Keep selected evidence visible while the timeline periodically refreshes.
-  evidenceViewer.replaceChildren(box);
-  box.scrollIntoView?.({block:'nearest'});
-  content.focus?.({preventScroll:true});
-  try {
-    const result = await window.pywebview.api.evidence(name);
-    if (evidenceViewer.contains(content)) content.textContent = result.text;
-  } catch (error) {
-    if (evidenceViewer.contains(content)) content.textContent = 'Unable to read evidence: ' + error;
-  }
-}
-
-
 async function workspaceAction(method, args, button) {
   if (busy || !ready || document.getElementById(button).disabled) return;
   busy = true; updateControls();
@@ -652,7 +286,10 @@ async function workspaceAction(method, args, button) {
     if (result.ok && method === 'create_github_branch') document.getElementById('branch-form').hidden = true;
     message(result.error || result.message || (result.ok ? (method === 'push_approved_commits' ? 'Approved checkpoints remotely published. No merge to main.' : 'Selection updated. No work launched.') : 'Action failed.'), !result.ok);
   } catch (error) { message('Workspace action failed: ' + error, true); }
-  finally { busy = false; updateControls(); await refresh(false); }
+  finally {
+    busy = false; ready = false; updateControls(); ready = true;
+    await refresh(false);
+  }
 }
 document.getElementById('connect-github').onclick = () => workspaceAction('connect_github', [document.getElementById('github-repo').value.trim()], 'connect-github');
 document.getElementById('list-github').onclick = () => workspaceAction('github_repositories', [], 'list-github');
@@ -669,16 +306,25 @@ document.getElementById('branch-base-confirm').onchange = updateControls;
 document.getElementById('create-branch').onclick = () => workspaceAction('create_github_branch', [latest?.controller?.repository, document.getElementById('branch-name').value.trim(), document.getElementById('branch-base').value, document.getElementById('branch-base-confirm').checked === true], 'create-branch');
 document.getElementById('push-approved').onclick = () => workspaceAction('push_approved_commits', [], 'push-approved');
 
-document.getElementById('refresh').onclick = refresh;
-document.getElementById('attempts').oninput = updateControls;
-['overview', 'tasks', 'logs'].forEach(name => { document.getElementById('nav-' + name).onclick = () => navigate(name); });
-Object.entries({'browse-project':'select_repo', 'browse-plan':'select_plan', 'open-run':'open_run', start:'start', resume:'resume', stop:'stop_after_task', 'start-audit':'start_audit', 'download-audit':'download_audit', 'download-logs':'download_logs'}).forEach(([id, method]) => { document.getElementById(id).onclick = () => act(method); });
-document.getElementById('audit-model').oninput = updateControls;
+get('attempts').oninput = updateControls;
+get('audit-model').oninput = updateControls;
+get('export-evidence').onchange = updateControls;
+get('include-evidence').onclick = () => act('evidence');
+get('configuration-done').onclick = () => { if (!busy && validateAttempts()) get('configuration').close(); };
+get('configuration').addEventListener('cancel', event => { if (busy) event.preventDefault(); });
+get('configure-error').onclick = configure;
+get('browse-plan').onclick = async () => {
+  if (get('browse-plan').disabled) return;
+  if (latest?.controller?.active === false && !latest?.controller?.uncertain) await act('select_plan');
+  configure();
+};
+get('start').onclick = () => act(resumable() ? 'resume' : 'start');
+Object.entries({'browse-project':'select_repo','open-run':'open_run',stop:'stop_after_task','start-audit':'start_audit','download-audit':'download_audit','download-logs':'download_logs'}).forEach(([id,method]) => { get(id).onclick = () => act(method); });
 updateControls();
 window.addEventListener('pywebviewready', () => { ready = true; refresh(); });
 window.addEventListener('pagehide', () => { closed = true; });
 window.addEventListener('pageshow', () => { closed = false; refresh(false); });
-document.addEventListener?.('visibilitychange', () => { if (!document.hidden && !closed) { updateElapsed(); refresh(false); } });
+document.addEventListener('visibilitychange', () => { if (!document.hidden && !closed) { updateElapsed(); refresh(false); } });
 setInterval(() => { if (!closed && !document.hidden) updateElapsed(); }, 1000);
 setInterval(() => refresh(false), 4000);
 </script></body></html>'''
@@ -696,7 +342,7 @@ class NativeDialogs:
         dialog_type = getattr(enum, name) if enum is not None else getattr(self._webview, name + "_DIALOG")
         options = {"allow_multiple": False}
         if kind == "plan":
-            options["file_types"] = ("Task plans (*.txt;*.md;*.json)",)
+            options["file_types"] = ("JSON task plans (*.json)",)
         result = self._window.create_file_dialog(dialog_type, **options)
         return result[0] if result and not isinstance(result, str) else result
 
@@ -1108,7 +754,7 @@ def main(argv=None) -> int:
         return 2
     try:
         api = Bridge(args.logs)
-        window = webview.create_window("Auto-Coding - Run Dashboard", html=HTML, js_api=api, width=1280, height=800, min_size=(1000, 600))
+        window = webview.create_window("Auto-Coding - Run Dashboard", html=HTML, js_api=api, width=1280, height=800, min_size=(360, 400))
         api._dialogs = NativeDialogs(webview, window)
         webview.start()
         return 0

@@ -12,6 +12,7 @@ class Element {
   append(...items) { this.children.push(...items); }
   replaceChildren(...items) { this.children = items; this._text = ''; }
   setAttribute(name, value) { this[name] = value; }
+  addEventListener() {}
   contains(target) { return this === target || this.children.some(child => child.contains?.(target)); }
 }
 const nodes = new Map();
@@ -36,13 +37,12 @@ const flush = () => new Promise(resolve => setImmediate(resolve));
   snapshot = fixture.snapshots[1];
   await poll();
   await flush();
-  assert.equal(get('audit-result').textContent, 'APPROVE');
+  assert.equal(get('audit-result').textContent, '\u2713 Approved');
   assert.equal(get('audit-result').className, 'pill green');
   assert.equal(get('start').disabled, false);
   snapshot = fixture.snapshots[2];
   await poll();
   await flush();
-  assert.equal(get('header-state').textContent, 'Completed');
   assert.equal(get('run-status').textContent, 'Completed');
   assert.equal(get('run-task').textContent, '3 / 3');
   assert.equal(get('run-time').textContent, '00:00:40');

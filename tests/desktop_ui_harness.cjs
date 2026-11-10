@@ -12,6 +12,9 @@ class Element {
   setAttribute(name, value) { this[name] = value; }
   focus() { document.activeElement = this; }
   setSelectionRange(start, end) { this.selectionStart = start; this.selectionEnd = end; }
+  addEventListener() {}
+  showModal() { this.open = true; this.focus(); }
+  close() { this.open = false; }
   contains(target) { return this === target || this.children.some(child => child.contains?.(target)); }
 }
 const nodes = new Map();
@@ -66,398 +69,278 @@ const context = vm.createContext({document, window:{pywebview:{api}, addEventLis
 vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), context);
 const flush = async () => { await new Promise(resolve => setImmediate(resolve)); };
 const click = async id => { await get(id).onclick(); await flush(); };
-const walk = node => [node, ...(node.children || []).flatMap(walk)];
-const contents = () => get('app').textContent;
 (async () => {
   assert(get('start').disabled);
   await listeners.pywebviewready(); await flush();
-  assert(!get('browse-project').disabled);
+  assert.equal(get('run-status').textContent, 'Idle');
+  assert.equal(get('plan-path').textContent, 'Selected JSON file');
+  assert(get('start').disabled && get('download-audit').disabled && get('download-logs').disabled);
+  assert.equal(get('approval-indicator').className, 'indicator');
+  data.controller.preflight.errors = ['Select a Git repository root.'];
+  await poll();
+  assert.equal(get('progress-error').textContent, '');
+  assert(get('configure-error').hidden, 'Fresh launch has only the reference controls');
+  data.controller.preflight.errors = [];
+  // Native Browse and contextual settings; no launch on selection.
+  await click('browse-plan');
+  assert.equal(calls.at(-1)[0], 'select_plan');
+  assert.equal(get('configuration').open, true);
+  assert.equal(get('plan-path').textContent, 'C:\\plans\\task.json');
   assert(get('start').disabled);
-  assert.equal(get('header-state').textContent, 'Idle');
-  assert(contents().includes('Select a plan and repository, then audit and authorize a new run.'));
-  assert(!contents().includes('Ready for your first run'));
-  assert.equal(get('run-setup').hidden, false);
-  const initial = structuredClone(data);
-  // Slow native reads are shared; hidden/closed windows do no polling or clock work.
-  let releaseSnapshot;
-  pendingSnapshot = new Promise(resolve => { releaseSnapshot = resolve; });
-  const beforeSlow = snapshotReads;
-  const slow = poll(); const overlapping = poll();
-  assert.equal(snapshotReads, beforeSlow + 1);
-  releaseSnapshot(); await slow; await overlapping; pendingSnapshot = null;
-  document.hidden = true;
-  await poll(); tick();
-  assert.equal(snapshotReads, beforeSlow + 1);
-  document.hidden = false;
-  listeners.pagehide(); await poll(); tick();
-  assert.equal(snapshotReads, beforeSlow + 1);
-  listeners.pageshow(); await flush();
-  await click('list-github');
-  assert(get('message').textContent.includes('Enter OWNER/REPO manually'));
-  assert(get('github-repositories').hidden);
+  await click('browse-project');
+  assert.equal(calls.at(-1)[0], 'select_repo');
+  assert.equal(get('project-path').textContent, 'C:\\project with spaces');
+  await click('open-run'); assert.equal(calls.at(-1)[0], 'open_run');
+  assert(get('message').textContent.includes('Cancelled'));
+  await click('configuration-done'); assert.equal(get('configuration').open, false);
+
+  // Keep existing managed checkout and branch operations available contextually.
+  await click('list-github'); assert(get('github-repositories').hidden);
   get('github-repo').value = 'bad/repo'; await click('connect-github');
   assert(get('message').textContent.includes('<img onerror=bad()>'));
-  get('github-repo').value = 'https:' + '//github.com/Owner/Repo.git';
-  await click('connect-github');
-  assert.deepEqual(calls.at(-1), ['connect_github', 'https:' + '//github.com/Owner/Repo.git']);
-  assert(get('selected-project').textContent.includes('owner/repo'));
-  assert(get('github-state').textContent.includes('main | Clean'));
-  assert(get('start').disabled && get('push-approved').disabled);
+  get('github-repo').value = 'owner/repo'; await click('connect-github');
   get('github-branch').value = 'feature/remote'; await click('select-branch');
   assert.deepEqual(calls.at(-1), ['checkout_github_branch', 'owner/repo', 'feature/remote']);
-  await click('new-branch'); get('branch-name').value = 'feature/cancelled';
-  const beforeCancel = calls.length; await click('cancel-branch');
-  assert.equal(calls.length, beforeCancel);
-  assert(get('branch-form').hidden);
-  await click('new-branch'); get('branch-name').value = 'feature/new'; await click('create-branch');
-  assert.deepEqual(calls.at(-1), ['create_github_branch', 'owner/repo', 'feature/new', 'main', false]);
-  assert(get('branch-form').hidden);
-  // A master-only remote still has a dashboard route to a feature branch.
-  data.controller.github.remote = ['origin/master'];
-  data.controller.github.local = ['master'];
-  data.controller.preflight.branch = 'master'; await poll();
-  await click('new-branch'); get('branch-name').value = 'feature/from-master';
-  assert.equal(get('branch-base').value, 'master');
-  assert(!get('branch-base-confirm-label').hidden);
+  await click('new-branch'); get('branch-name').value = 'feature/test';
+  get('branch-base').value = 'master'; get('branch-base').onchange();
   assert(get('create-branch').disabled);
-  const beforeUnconfirmed = calls.length; await click('create-branch');
-  assert.equal(calls.length, beforeUnconfirmed);
-  get('branch-base-confirm').checked = true; get('branch-base-confirm').onchange();
-  assert(!get('create-branch').disabled);
-  get('branch-base').onchange();
-  assert(get('create-branch').disabled, 'Changing base resets explicit confirmation');
   get('branch-base-confirm').checked = true; get('branch-base-confirm').onchange();
   await click('create-branch');
-  assert.deepEqual(calls.at(-1), ['create_github_branch', 'owner/repo', 'feature/from-master', 'master', true]);
-  await click('new-branch');
-  assert(get('create-branch').disabled, 'Every alternate-base creation needs confirmation');
+  assert.deepEqual(calls.at(-1), ['create_github_branch', 'owner/repo', 'feature/test', 'master', true]);
+  await click('new-branch'); assert(get('create-branch').disabled, 'Alternate base consent resets for each creation');
+  const beforeCancel = calls.length; await click('cancel-branch');
+  assert.equal(calls.length, beforeCancel); assert(get('branch-form').hidden);
+  data.controller.github.remote = ['origin/master'];
+  data.controller.github.local = ['master']; data.controller.preflight.branch = 'master';
+  await poll(); await click('new-branch');
+  assert.equal(get('branch-base').value, 'master');
+  assert(!get('branch-base-confirm-label').hidden && get('create-branch').disabled);
+  get('branch-base-confirm').checked = true; get('branch-base-confirm').onchange();
+  get('branch-base').onchange(); assert(get('create-branch').disabled, 'Changing base clears consent');
   await click('cancel-branch');
-  assert(!calls.some(call => ['start', 'resume'].includes(call[0])));
   data.controller.preflight.clean = false; await poll();
   assert(get('new-branch').disabled && get('select-branch').disabled && get('push-approved').disabled);
   data.controller.preflight.clean = true; data.controller.active = true; await poll();
   assert(get('connect-github').disabled && get('select-branch').disabled);
-  data.controller.active = false; data.controller.push = {eligible:true, reason:'Approved checkpoints'}; await poll();
-  await click('push-approved');
+  data.controller.active = false; data.controller.push = {eligible:true, reason:'Approved checkpoints'};
+  await poll(); await click('push-approved');
   assert.deepEqual(calls.at(-1), ['push_approved_commits']);
   assert(get('message').textContent.includes('Remote branch changed'));
-  data = initial; calls.length = 0; await poll();
-  await click('nav-tasks');
-  assert(get('run-setup').hidden);
-  assert(contents().includes('No task history yet.'));
-  assert.equal(get('nav-tasks')['aria-current'], 'page');
-  await click('nav-overview');
-  let release;
-  pendingSelection = new Promise(resolve => { release = resolve; });
-  const choosing = get('browse-project').onclick();
-  await flush();
+  let releaseSelection;
+  pendingSelection = new Promise(resolve => { releaseSelection = resolve; });
+  const selecting = click('browse-project'); await flush();
+  const beforeSelectionRepeat = calls.length;
   await click('browse-project'); await click('start'); await poll();
-  assert.equal(calls.length, 1, 'Repeated selection or launch while selecting');
-  release(); await choosing; pendingSelection = null;
-  assert(get('project-path').textContent.includes('C:\\project with spaces'));
-  await click('browse-plan');
-  assert(get('start').disabled, 'Plan selection is not audit authorization');
-  for (const error of ['Runs are blocked on main/master. Switch to a feature branch first.', 'Plan validation failed: malformed plan', 'Commit or discard changes before START.']) {
+  assert.equal(calls.length, beforeSelectionRepeat, 'Repeated selections and launch stay blocked during native selection');
+  releaseSelection(); await selecting; pendingSelection = null;
+  for (const error of ['Runs are blocked on main/master. Switch to a feature branch first.',
+    'Plan validation failed: malformed plan', 'Commit or discard changes before START.']) {
     data.controller.start_ready = false; data.controller.preflight.errors = [error];
-    await poll();
-    assert(get('start').disabled);
-    assert(get('preflight').textContent.includes(error));
+    await poll(); assert(get('start').disabled); assert(get('progress-error').textContent.includes(error));
   }
-  data.controller.start_ready = false; data.controller.audit_ready = true; data.controller.preflight.errors = [];
-  await poll();
-  assert(get('start-audit').disabled, 'Audit requires an explicit model');
-  get('audit-model').value = 'audit-model'; get('audit-model').oninput();
-  get('audit-goal').value = 'Complete the goal';
-  assert.equal(get('start-audit').disabled, false);
-  await click('start-audit');
-  assert.deepEqual(calls.at(-1), ['start_audit', 'audit-model', 'Complete the goal']);
-  assert(get('message').textContent.includes('Cancelled'));
-  data.controller.audit = {status:'REVISE', identity:{plan_sha256:'<img onerror=bad()>'}, report:{decision:'REVISE'}};
-  await poll();
-  assert.equal(get('audit-result').textContent, 'REVISE');
-  assert(get('audit-identity').textContent.includes('<img onerror=bad()>'));
-  delete data.controller.audit;
-  const attempts = get('attempts');
-  data.controller.resume_ready = true;
-  await poll(); // Sync simulated status before asserting Resume is enabled.
-  for (const value of ['0', '11', '2.5', '', '-1', 'NaN', '3.0', 'Infinity']) {
-    attempts.value = value; attempts.oninput();
-    assert.equal(attempts['aria-invalid'], 'true', value);
-    assert(get('start').disabled && get('resume').disabled, value);
-    assert(get('attempts-error').textContent.includes('whole number from 1 to 10'));
-    const before = calls.length;
-    await click('start'); await click('resume');
-    assert.equal(calls.length, before, 'Invalid entry must not reach native confirmation');
+  data.controller.preflight.errors = [];
+
+  data.controller.audit_ready = true;
+  await poll(); await click('start-audit');
+  assert.equal(get('configuration').open, true, 'Missing model opens configuration');
+  assert(!calls.some(call => call[0] === 'start_audit'));
+  get('audit-model').value = 'explicit-auditor'; get('audit-model').oninput();
+  get('audit-goal').value = 'Exact goal';
+  await click('configuration-done');
+  let releaseAudit;
+  api.start_audit = async (...args) => { calls.push(['start_audit', ...args]); await new Promise(resolve => { releaseAudit = resolve; }); return {ok:true}; };
+  const auditing = click('start-audit'); await flush();
+  const auditCalls = calls.length;
+  await click('start-audit'); assert.equal(calls.length, auditCalls, 'No concurrent audit');
+  assert(get('start').disabled && get('browse-plan').disabled);
+  releaseAudit(); await auditing;
+  assert.deepEqual(calls.at(-1), ['start_audit', 'explicit-auditor', 'Exact goal']);
+  // A completed bridge action must stay disabled until its resulting snapshot arrives.
+  let releaseAfterAction;
+  pendingSnapshot = new Promise(resolve => { releaseAfterAction = resolve; });
+  api.start_audit = async (...args) => { calls.push(['start_audit', ...args]); return {ok:true}; };
+  const settlingAudit = click('start-audit'); await flush();
+  const beforeDuplicate = calls.length;
+  assert(get('start-audit').disabled);
+  await click('start-audit'); assert.equal(calls.length, beforeDuplicate);
+  releaseAfterAction(); await settlingAudit; pendingSnapshot = null;
+
+  const approved = {status:'APPROVE', verified:true, start_approved:true, identity:{plan_sha256:'exact'}};
+  // No UI-local approval, alternate field names, or partial backend flags unlock Start.
+  for (const audit of [undefined, {result:'Approved', verified:true}, {status:'APPROVE'},
+    {status:'APPROVE', verified:true}, {status:'APPROVE', start_approved:true},
+    {status:'APPROVE', verified:false, start_approved:true}]) {
+    data.controller.audit = audit; data.controller.start_ready = true;
+    await poll(); assert(get('start').disabled);
+    assert.equal(get('approval-indicator').className, 'indicator');
+    const before = calls.length; await click('start'); assert.equal(calls.length, before);
   }
-  for (const value of ['1', '3', '5', '10']) {
-    attempts.value = value; attempts.oninput();
-    assert.equal(attempts['aria-invalid'], 'false');
-    assert(get('start').disabled && !get('resume').disabled);
-    assert.equal(get('attempts-error').textContent, '');
-    attempts.focus();
-    data.controller.preflight.branch = 'feature/number-' + value;
-    await poll();
-    assert.equal(document.activeElement, attempts, 'Polling preserves keyboard focus on number input');
-    assert.equal(attempts.value, value);
-    const beforeStart = calls.length;
-    await click('start');
-    assert.equal(calls.length, beforeStart, 'Disabled Start cannot reach the bridge');
-    assert.equal(data.controller.active, false, 'Cancelled confirmation must not launch');
-  }
-  calls.length = 0;
-  data.controller.resume_ready = false;
-  attempts.value = '3'; attempts.oninput();
-  await click('open-run');
-  assert(get('message').textContent.includes('Cancelled'));
-  assert(get('plan-path').textContent.includes('C:\\plans\\task.json'));
-  const beforeStart = calls.length;
-  // Untrusted, unverified status fields must never manufacture approval.
-  for (const result of ['Not audited', 'Running', 'Approved', 'Rejected', 'Blocked']) {
-    data.controller.audit = {result, verified:true, authorized:true};
-    data.controller.start_ready = true;
-    await poll();
-    assert(get('start').disabled);
-    assert.equal(get('audit-result').className, 'pill muted');
-    assert.equal(get('audit-result').textContent, 'Idle');
-    await click('start');
-    assert.equal(calls.length, beforeStart);
-  }
-  // Only the verified backend verdict can open the Start gate. Busy remains separate.
-  data.controller.audit = {status:'APPROVE', verified:true, start_approved:true, identity:{plan_sha256:'exact'}};
-  data.controller.start_ready = false;
-  data.controller.start_reason = 'Run busy. Wait for the earlier run.';
-  await poll();
-  assert.equal(get('audit-result').className, 'pill green');
-  assert(get('start').disabled);
-  assert(get('start-reason').textContent.includes('Run busy'));
-  data.controller.start_ready = true;
-  await poll();
-  assert(!get('start').disabled, 'Unchanged approval becomes usable when busy run ends');
-  await click('start');
-  assert.deepEqual(calls.at(-1), ['start', 3]);
-  for (const status of ['Unknown', 'REVISE', 'BLOCK', 'Infrastructure error', 'Running', 'Idle', 'APPROVE']) {
-    data.controller.audit = {status, verified:false, start_approved:false, error:'Revise exact bytes <img onerror=bad()>'};
-    data.controller.start_ready = false;
-    await poll();
-    assert(get('start').disabled);
+  for (const status of ['Idle','Running','REVISE','REJECT','BLOCK','Infrastructure error','Unknown']) {
+    data.controller.audit = {status, verified:false, error:'Reason <img onerror=bad()>'};
+    data.controller.start_ready = false; data.controller.audit_ready = status !== 'Running';
+    if (status === 'Running') data.controller.active = true;
+    await poll(); assert(get('start').disabled);
     assert.notEqual(get('audit-result').className, 'pill green');
-    assert(get('audit-identity').textContent.includes('<img onerror=bad()>'));
+    assert(get('audit-error').textContent.includes('<img onerror=bad()>'));
+    if (status === 'Running') assert(get('start-audit').disabled);
+    data.controller.active = false;
   }
-  // A failed poll must also clear the previously green result immediately.
-  data.controller.audit = {status:'APPROVE', verified:true, start_approved:true};
+  data.controller.audit = approved; data.controller.start_ready = false;
+  await poll(); assert(get('start').disabled);
+  assert.equal(get('audit-result').textContent, '\u2713 Approved');
+  assert.equal(get('approval-indicator').className, 'indicator');
   data.controller.start_ready = true;
-  await poll(); failStatus = true; await poll();
-  assert(get('start').disabled);
-  assert.notEqual(get('audit-result').className, 'pill green');
-  failStatus = false;
-  data.controller.audit = {status:'Idle'};
-  data.controller.start_ready = false;
-  calls.length = 0;
-  // Existing recovery still uses the same controller bridge.
-  data.controller.logs = data.root = 'C:\\runs\\one';
-  data.exists = true; data.empty = false;
-  data.controller.resume_ready = true;
+  await poll(); assert(!get('start').disabled);
+  assert.equal(get('approval-indicator').className, 'indicator green');
+  // Wrong file types and controller plan errors fail closed even with stale approval flags.
+  data.controller.plan = 'C:\\plans\\wrong.md';
+  await poll(); assert(get('start').disabled && get('start-audit').disabled);
+  assert(get('progress-error').textContent.includes('Select a JSON plan'));
+  data.controller.plan = 'C:\\plans\\invalid.json';
+  data.controller.validation_errors = {plan:'Invalid JSON <script>bad()</script>'};
+  data.controller.start_ready = data.controller.audit_ready = false;
+  await poll(); assert(get('start').disabled && get('start-audit').disabled);
+  assert(get('progress-error').textContent.includes('<script>bad()</script>'));
+  delete data.controller.validation_errors;
+  data.controller.plan = 'C:\\plans\\task.json';
+  data.controller.start_ready = data.controller.audit_ready = true;
   await poll();
-  await click('resume');
-  assert.deepEqual(calls.at(-1), ['resume', 3]);
-  assert(!calls.some(call => call[0] === 'start'));
-  assert(get('auto-push').disabled, 'Publication settings cannot change mid-run');
+  const attempts = get('attempts');
+  for (const value of ['0','11','2.5','','-1','NaN','3.0','Infinity']) {
+    attempts.value = value; attempts.oninput();
+    assert.equal(attempts['aria-invalid'], 'true'); assert(get('start').disabled);
+    const before = calls.length; await click('start'); assert.equal(calls.length, before);
+  }
+  for (const value of ['1','3','5','10']) {
+    attempts.value = value; attempts.oninput();
+    assert.equal(attempts['aria-invalid'], 'false'); assert(!get('start').disabled);
+    assert.equal(get('attempts-error').textContent, '');
+  }
+  attempts.value = '3'; attempts.oninput();
+  attempts.focus(); await poll();
+  assert.equal(document.activeElement, attempts, 'Polling preserves keyboard focus');
+  assert.equal(attempts.value, '3');
+  await click('start'); assert.deepEqual(calls.at(-1), ['start', 3]);
+  assert(get('message').textContent.includes('Cancelled'));
+  failStatus = true; await poll();
+  assert(get('start').disabled); assert.notEqual(get('audit-result').className, 'pill green');
+  assert.equal(get('approval-indicator').className, 'indicator');
+  assert(get('message').textContent.includes('status unavailable'));
+  failStatus = false; await poll();
+
+  // Exports only use the bridge; report availability never implies authorization.
+  api.download_audit = async () => { calls.push(['download_audit']); return {ok:true, message:'Download saved: audit-report.json'}; };
+  api.download_logs = async () => { calls.push(['download_logs']); return {ok:false, error:'Save exports outside the target checkout'}; };
+  data.controller.audit_export_available = true;
+  data.exists = true; data.root = data.controller.logs = 'C:\\runs\\one';
+  data.files = [{path:'review.json', status:'available'}, {path:'gone.txt', status:'missing'}];
+  await poll();
+  assert(get('include-evidence').disabled);
+  assert.equal(get('export-evidence').children.length, 2, 'Only available evidence is offered');
+  get('export-evidence').value = 'review.json'; get('export-evidence').onchange();
+  get('auto-push').checked = true;
+  await click('include-evidence');
+  assert.equal(evidenceReads, 1);
+  assert.equal(get('auto-push').checked, true, 'Evidence selection preserves explicit publication preference');
+  get('auto-push').checked = false;
+  assert(get('message').textContent.includes('included in Download Logs'));
+  assert(!get('message').textContent.includes('<img'), 'Raw evidence is exported, never rendered');
+  data.files.push({path:'another.json', status:'available'});
+  await poll(); assert(get('include-evidence').disabled, 'Changed evidence list resets selection');
+  api.evidence = async () => ({ok:false, text:'Evidence changed or missing.'});
+  get('export-evidence').value = 'another.json'; get('export-evidence').onchange();
+  await click('include-evidence'); assert(get('message').textContent.includes('Evidence changed or missing'));
+  await poll(); await click('download-audit');
+  assert.deepEqual(calls.at(-1), ['download_audit']);
+  assert(get('message').textContent.includes('audit-report.json'));
+  await click('download-logs'); assert.deepEqual(calls.at(-1), ['download_logs']);
+  assert(get('message').textContent.includes('outside the target'));
+
+  // Saved recovery reuses Start's position and only the controller's strict readiness.
+  data.state = {status:'stopped', repo:'untrusted', plan_sha256:'wrong'};
+  data.controller.start_ready = false; data.controller.resume_ready = false;
+  await poll(); assert(get('start').disabled); assert.equal(get('start-label').textContent, 'Start');
+  data.controller.resume_ready = true;
+  await poll(); assert.equal(get('start-label').textContent, 'Resume');
+  attempts.value = '5'; attempts.oninput();
+  await click('start'); assert.deepEqual(calls.at(-1), ['resume', 5]);
   assert.equal(get('run-status').textContent, 'Running');
+  assert(get('auto-push').disabled);
+  const beforeActiveBrowse = calls.length;
+  await click('browse-plan');
+  assert.equal(get('configuration').open, true);
+  assert.equal(calls.length, beforeActiveBrowse, 'Active-run Browse opens evidence settings without changing selections');
+  assert(get('browse-project').disabled && get('open-run').disabled);
+  await click('configuration-done');
+  delete data.controller.stop_identity; await poll(); assert(get('stop').disabled);
   data.controller.stop_identity = {run_id:'cli-run', generation:0};
   data.controller.stop_requested = false;
-  await poll();
-  assert.equal(get('stop').textContent, 'Stop after task');
-  assert.equal(get('stop').disabled, false);
+  await poll(); assert(!get('stop').disabled);
   await click('stop');
   assert.equal(calls.at(-1)[0], 'stop_after_task');
-  assert.equal(calls.at(-1)[1].run_id, 'cli-run');
+  assert.deepEqual(calls.at(-1)[1], data.controller.stop_identity);
+  assert(get('stop').disabled); assert(get('stop').title.includes('Stop after current task'));
   assert(get('message').textContent.includes('Stop requested'));
-  await poll();
-  assert.equal(get('stop').textContent, 'Stop requested');
-  assert.equal(get('stop').disabled, true);
-  data.controller.stop_requested = false;
-  delete data.controller.stop_identity;
-
-  assert(get('browse-project').disabled && get('resume').disabled);
-  data.state = {status:'running', current_task:'task-1', completed:[], history:[
-    {task:'task-1', attempt:1, tests:[{index:1, exit_code:1, timed_out:false}],
-      review:{decision:'REJECTED', issues:['real blocker'], summary:'Original summary'}, feedback:'Original feedback <script>bad()</script>', commit:'abc123'}]};
-  data.events = [{seq:1, timestamp_utc:'2026-10-25T11:00:00Z', actor:'Codex B', event:'review_finished', outcome:'rejected', task_id:'task-1', attempt:1,
-    _evidence_status:[{label:'verdict', path:'review.json', status:'available'}, {label:'test', path:'gone.txt', status:'missing'}],
-    metadata:{reason:'<script>bad()</script>'}}];
-  data.event_errors = ['Line 2: corrupt event'];
-  await poll();
-  assert(contents().includes('Current task: task-1'));
-  assert.equal(get('run-status').textContent, 'Running');
-  assert.equal(get('run-task').textContent, '1 / --');
-  const savedTaskState = structuredClone(data.state);
-  for (const [current, completed, total, expected] of [
-    ['task-1', [], 4, '1 / 4'],
-    ['arbitrary-task-id', ['first', 'second'], 4, '3 / 4'],
-    ['arbitrary-task-id', ['first', 'second'], 4, '3 / 4'], // Retry retains position.
-    ['second', ['first', 'second'], 4, '2 / 4'], // Checkpoint already recorded.
-    ['last', ['first', 'second', 'third'], 4, '4 / 4'],
-    [null, [], 4, '-- / 4'],
-    [null, ['first', 'second', 'third', 'last'], 4, '-- / 4'],
-    ['unknown', undefined, 4, '-- / 4'],
-    ['unknown', 'invalid', 4, '-- / 4'],
-    ['unknown', ['duplicate', 'duplicate'], 4, '-- / 4'],
-    ['unknown', [null], 4, '-- / 4'],
-    ['overflow', ['first', 'second'], 2, '-- / 2'],
-  ]) {
-    data.state.current_task = current;
-    data.state.completed = completed;
-    data.task_count = total;
-    await poll();
-    assert.equal(get('run-task').textContent, expected);
-  }
-  delete data.task_count;
-  data.controller.task_count = 4;
-  data.state = savedTaskState;
-  await poll();
-  assert.equal(get('run-task').textContent, '1 / 4', 'Controller count fallback');
-  delete data.controller.task_count;
-  await poll();
-  await click('nav-tasks');
-  for (const text of ['Attempt 1', 'REJECTED', 'Original summary', 'Original feedback', 'Test 1: exit 1']) assert(contents().includes(text), text);
-  assert(walk(get('app')).some(node => node.className === 'attempt rejected'));
-  assert(contents().includes('Local commit: abc123'));
-  assert(contents().includes('<script>bad()</script>'));
-  const feedback = walk(get('app')).find(node => node.tag === 'details' && node.textContent.includes('Feedback (original)'));
-  assert.equal(feedback.open, false);
-  feedback.open = true; feedback.ontoggle();
-  data.events.push({...data.events[0], seq:2});
-  await poll();
-  assert(walk(get('app')).some(node => node.tag === 'details' && node.open && node.textContent.includes('Feedback (original)')));
-  await click('nav-logs');
-  for (const text of ['Codex B', 'rejected', '2026-10-25T11:00:00Z', 'gone.txt (missing)', 'Line 2: corrupt event', '<script>bad()</script>']) assert(contents().includes(text), text);
-  const search = walk(get('app')).find(node => node.tag === 'input');
-  search.value = 'no matching actor'; search.oninput();
-  assert(contents().includes('0 of 2 events'));
-  assert(!contents().includes('review_finished'));
-  search.value = 'rejected'; search.oninput();
-  assert(contents().includes('2 of 2 events'));
-  search.value = ''; search.oninput();
-  search.focus(); search.setSelectionRange(0, 0);
-  data.events.push({...data.events[0], seq:3});
-  await poll();
-  assert.equal(document.activeElement.id, 'log-search');
-  assert.equal(document.activeElement.selectionStart, 0);
-  const unchangedSearch = document.activeElement;
-  await poll();
-  assert.equal(document.activeElement, unchangedSearch, 'Unchanged polling preserves input DOM');
-  document.activeElement = null;
-  const missing = walk(get('app')).find(node => node.textContent === 'gone.txt (missing)');
-  assert.equal(typeof missing.onclick, 'undefined');
-  const link = walk(get('app')).find(node => node.textContent === 'review.json (available)');
-  await link.onclick(); await flush();
-  const viewer = get('evidence-viewer').children[0];
-  assert(get('evidence-viewer').textContent.includes('<img src=x onerror=bad()>'));
-  await poll(); await click('nav-overview'); await poll();
-  assert.equal(get('evidence-viewer').children[0], viewer);
-  assert.equal(evidenceReads, 1, 'Polling must not reload evidence');
-  data.controller.active = false; data.controller.exit_code = 0;
-  await poll();
-  assert.equal(get('run-status').textContent, 'Unknown run state');
-  assert.notEqual(get('header-state').textContent, 'Completed');
-  assert(get('resume').disabled);
-  data.state.status = 'stopped'; data.controller.resume_ready = true;
-  await poll();
-  assert.equal(get('run-status').textContent, 'Stopped');
-  get('attempts').value = '5';
-  await click('resume'); await click('resume');
-  assert.deepEqual(calls.at(-1), ['resume', 5]);
-  assert.equal(calls.filter(call => call[0] === 'resume').length, 2);
-  data.controller.active = false; data.controller.resume_ready = false;
-  data.state.status = 'completed'; data.state.completed = ['task-1'];
-  await poll();
-  assert.notEqual(get('run-status').textContent, 'Completed', 'Task approval alone is not batch completion');
-  data.summary = {completion_confirmed:true, verification_status:'passed', current:1,
-    start_utc:'2026-10-25T10:00:00Z', duration_seconds:3661};
-  await poll();
-  data.controller.exit_code = 1;
-  data.controller.error = 'Runner stopped with exit code 1; inspect state.json and events.jsonl.';
-  data.controller.process_history = [{exit_code:1, message:'Prior process failure'}];
-  await poll();
-  assert.equal(get('run-status').textContent, 'Completed');
-  assert.equal(get('header-state').textContent, 'Completed');
-  assert.equal(get('header-state').className, 'pill green');
-  assert.equal(get('run-time').textContent, '01:01:01');
-  assert(get('time-hint').textContent.includes('Persisted duration'));
-  now += 5000; tick(); assert.equal(get('run-time').textContent, '01:01:01');
-  data.summary.verification_status = 'failed'; data.summary.completion_confirmed = false;
-  data.summary.error = 'test_failure <script>bad()</script>';
-  await poll();
-  assert.equal(get('run-status').textContent, 'Failed');
-  assert(contents().includes('test_failure <script>bad()</script>'));
-  data.summary.verification_status = 'passed'; data.summary.completion_confirmed = true; delete data.summary.error;
-  await poll();
-  assert(!contents().includes('Runner stopped with exit code 1'));
-  await click('nav-logs');
-  assert(contents().includes('Runner stopped with exit code 1'));
-  assert(contents().includes('Prior process failure'));
-  await click('nav-overview');
-  get('message').textContent = 'Launch accepted. Waiting for durable runner progress.';
-  await poll();
-  assert.equal(get('message').textContent, '');
-  data.state.history.push({task:'task-1', attempt:2, review:{decision:'APPROVED'}});
-  await poll(); await click('nav-tasks');
-  assert(walk(get('app')).some(node => node.className === 'attempt approved'));
-  assert(walk(get('app')).some(node => node.className === 'attempt rejected'));
-  await click('nav-overview');
-  const primary = walk(get('app')).filter(node => node.className === 'notice warning');
-  assert.equal(primary.length, 0, 'No mixed success/failure headline');
-  await click('nav-logs');
-  const processHistory = walk(get('app')).find(node => node.tag === 'details' && node.textContent.includes('Process history'));
-  assert.equal(processHistory.open, false);
-  assert(processHistory.textContent.includes('exit code 1'));
-  assert(processHistory.textContent.includes('previous_child_exit_code'));
-  await click('nav-overview');
-  get('message').textContent = 'Old launch warning';
-  await click('refresh');
-  assert.equal(get('message').textContent, '');
-  data.state.status = 'checkpointing';
-  await poll();
-  assert.equal(get('run-status').textContent, 'Awaiting recovery');
-  assert.notEqual(get('header-state').textContent, 'Completed');
-  assert(get('resume').disabled);
-  data.state.status = 'completed';
-  api.open_run = async () => ({ok:true});
-  get('message').textContent = 'Launch accepted. Old warning';
-  await click('open-run');
-  assert.equal(get('message').textContent, '');
-  assert.equal(get('run-status').textContent, 'Completed');
-  data.controller.active = true;
-  await poll();
-  assert.equal(get('run-status').textContent, 'Running');
-  assert.equal(get('run-time').textContent, '02:00:05');
-  assert(get('time-hint').textContent.includes('Live wall time'));
+  data.state = {status:'running', current_task:'third', completed:['first','second']};
+  data.task_count = 8;
+  data.summary = {start_utc:'2026-10-25T10:00:00Z'};
+  await poll(); assert.equal(get('run-task').textContent, '3 / 8');
+  assert.equal(get('run-time').textContent, '02:00:00');
   const beforeTick = snapshotReads; now += 1000; tick();
-  assert.equal(get('run-time').textContent, '02:00:06');
-  assert.equal(snapshotReads, beforeTick, 'Clock never calls the bridge');
-  data.state.status = 'stopping'; await poll(); assert.equal(get('run-status').textContent, 'Stopping');
-  assert.notEqual(get('header-state').textContent, 'Completed');
-  data.controller.active = null; data.controller.uncertain = true; data.controller.error = 'Unknown launch; inspect logs';
-  await poll();
-  assert.equal(get('run-status').textContent, 'Unknown child status');
-  assert(contents().includes('Unknown launch; inspect logs'));
-  assert(get('start').disabled && get('resume').disabled);
-  data.root = data.controller.logs = 'C:\\legacy'; data.controller.active = false; data.controller.uncertain = false;
-  data.state = null; data.events = []; data.state_error = 'state.json is corrupt or unreadable';
+  assert.equal(get('run-time').textContent, '02:00:01'); assert.equal(snapshotReads, beforeTick);
   delete data.summary;
-  data.files = [{label:'File', path:'legacy.txt', status:'available'}];
-  await poll(); await click('nav-logs');
-  assert(contents().includes('No events recorded'));
-  assert(contents().includes('state.json is corrupt'));
-  assert(contents().includes('legacy.txt (available)'));
-  assert.equal(get('evidence-viewer').children.length, 0, 'Changing runs must clear old evidence');
-  api.evidence = async () => ({ok:false, text:'Evidence file is missing.'});
-  await walk(get('app')).find(node => node.textContent === 'legacy.txt (available)').onclick();
-  assert(get('evidence-viewer').textContent.includes('Evidence file is missing.'));
-  failStatus = true; await poll();
-  assert(get('start').disabled && get('resume').disabled);
-  assert(get('message').textContent.includes('status unavailable'));
-  assert.equal(get('header-state').textContent, 'Unknown child status');
-  assert(snapshotReads > 5);
-  console.log('Dashboard button, navigation, polling, evidence and state contracts passed');
+  for (const [current, completed, total, expected] of [
+    ['first', [], 4, '1 / 4'], ['second', ['first','second'], 4, '2 / 4'],
+    [null, [], 4, '-- / 4'], ['x', undefined, 4, '-- / 4'],
+    ['x', ['dup','dup'], 4, '-- / 4'], ['x', [null], 4, '-- / 4'],
+    ['overflow', ['first','second'], 2, '-- / 2']]) {
+    data.state.current_task = current; data.state.completed = completed; data.task_count = total;
+    await poll(); assert.equal(get('run-task').textContent, expected);
+  }
+  delete data.task_count; data.controller.task_count = 4;
+  data.state.current_task = 'third'; data.state.completed = ['first','second'];
+  await poll(); assert.equal(get('run-task').textContent, '3 / 4', 'Controller task-count fallback');
+  delete data.controller.task_count;
+  data.state.status = 'stopping'; await poll(); assert.equal(get('run-status').textContent, 'Stopping');
+  data.controller.active = false; data.controller.resume_ready = false;
+  data.state.status = 'completed';
+  await poll(); assert.notEqual(get('run-status').textContent, 'Completed');
+  data.summary = {completion_confirmed:true, verification_status:'passed', current:2, duration_seconds:3661};
+  await poll(); assert.equal(get('run-status').textContent, 'Completed');
+  data.controller.error = 'Previous child exited with code 1';
+  await poll(); assert.equal(get('run-status').textContent, 'Completed');
+  assert(!get('progress-error').textContent.includes('Previous child'));
+  assert.equal(get('run-time').textContent, '01:01:01');
+  now += 1000; tick(); assert.equal(get('run-time').textContent, '01:01:01');
+  data.summary.completion_confirmed = false; data.summary.verification_status = 'failed';
+  data.summary.error = 'Final check failed <script>bad()</script>';
+  await poll(); assert.equal(get('run-status').textContent, 'Failed');
+  assert(get('progress-error').textContent.includes('<script>bad()</script>'));
+  data.controller.active = null; data.controller.uncertain = true;
+  await poll(); assert.equal(get('run-status').textContent, 'Unknown child status');
+  assert(get('start').disabled);
+  data.controller.active = false; data.controller.uncertain = false;
+  data.state.status = 'stopped'; await poll();
+  assert.equal(get('run-status').textContent, 'Failed', 'Final verification failure takes precedence over stopped state');
+  delete data.summary;
+  data.state.status = 'checkpointing'; await poll();
+  assert.equal(get('run-status').textContent, 'Awaiting recovery'); assert(get('start').disabled);
+  data.state.status = 'stopped';
+  await poll(); assert.equal(get('run-status').textContent, 'Stopped');
+  data.state = null; data.state_error = 'state.json is corrupt or unreadable';
+  await poll(); assert(get('progress-error').textContent.includes('state.json is corrupt'));
+  data.exists = false; await poll(); assert(get('download-logs').disabled);
+  assert(get('progress-error').textContent.includes('missing or unavailable'));
+  // Coalesce reads; background/closed windows do not poll or tick.
+  let releaseSnapshot;
+  pendingSnapshot = new Promise(resolve => { releaseSnapshot = resolve; });
+  const beforeSlow = snapshotReads; const slow = poll(), overlapping = poll();
+  assert.equal(snapshotReads, beforeSlow + 1);
+  releaseSnapshot(); await slow; await overlapping; pendingSnapshot = null;
+  document.hidden = true; const beforeHidden = snapshotReads;
+  await poll(); tick(); assert.equal(snapshotReads, beforeHidden);
+  document.hidden = false; listeners.pagehide(); await poll(); tick();
+  assert.equal(snapshotReads, beforeHidden);
+  listeners.pageshow(); await flush(); assert(snapshotReads > beforeHidden);
+  console.log('Dashboard selection, audit, authorization, recovery, export and state contracts passed');
 })().catch(error => { console.error(error); process.exitCode = 1; });

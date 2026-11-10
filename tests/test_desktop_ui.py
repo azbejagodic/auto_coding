@@ -31,135 +31,78 @@ entry.loaded = true;
 
 
 class DesktopUITests(unittest.TestCase):
-    def test_controls_are_visible_and_scoped_to_bridge(self):
-        class Controls(HTMLParser):
-            def __init__(self):
-                super().__init__()
-                self.ids = {}
-
-            def handle_starttag(self, tag, attrs):
-                attrs = dict(attrs)
-                if "id" in attrs:
-                    self.ids[attrs["id"]] = tag
-
-        parser = Controls()
-        parser.feed(HTML)
-        for name in ("browse-project", "browse-plan", "open-run", "start", "resume",
-                     "connect-github", "list-github", "select-branch", "new-branch",
-                     "create-branch", "cancel-branch", "fetch-github", "push-approved",
-                     "nav-overview", "nav-tasks", "nav-logs"):
-            self.assertEqual(parser.ids[name], "button")
-        self.assertEqual(parser.ids["github-repo"], "input")
-        self.assertEqual(parser.ids["auto-push"], "input")
-        self.assertIn('id="auto-push" type="checkbox"> Automatically push approved tasks', HTML)
-        self.assertEqual(parser.ids["github-branch"], "select")
-        self.assertEqual(parser.ids["branch-base"], "select")
-        self.assertEqual(parser.ids["branch-base-confirm"], "input")
-        self.assertIn('Advanced / Local Project', HTML)
-        self.assertIn('Push Approved Commits', HTML)
-        self.assertNotIn('Merge to main</button>', HTML)
-        self.assertEqual(parser.ids["attempts"], "input")
-        for method in ("select_repo", "select_plan", "open_run", "start", "resume"):
-            self.assertIn(method, HTML)
-        self.assertIn('min="1" max="10" step="1" value="3" required', HTML)
-        self.assertIn("Local Codex CLI authentication is required", HTML)
-        self.assertIn("Closing this window leaves the runner alive", HTML)
-        self.assertNotIn("innerHTML", HTML)
-        self.assertNotIn("Read-only viewer", HTML)
-
-    def test_layout_accessibility_and_text_safety_contract(self):
-        for token in ('width:210px', 'margin-left:210px', 'font:15px/1.5',
-                      'overflow-wrap:anywhere', ':focus-visible',
-                      'prefers-reduced-motion:reduce', 'grid-template-columns:minmax(0,1fr)',
-                      'aria-label="Main navigation"', 'aria-labelledby="project-label"',
-                      'aria-labelledby="plan-label"', 'aria-describedby="start-reason preflight attempts-error"',
-                      'id="project-path"', 'id="plan-path"', 'id="run-setup"',
-                      'Project folder', 'Task plan', 'Run setup', 'Open Run',
-                      "'Awaiting recovery'", "'Completed', color:'green'",
-                      "'Idle', color:'muted'", "'Unknown run state'",
-                      'Search actor, outcome or event', '1 MB per file',
-                      "content.setAttribute('tabindex', '0')"):
-            self.assertIn(token, HTML)
-        for unsafe in ('innerHTML', 'outerHTML', 'insertAdjacentHTML', '<script src=',
-                       'https://', 'Unknown / Unknown'):
-            self.assertNotIn(unsafe, HTML)
-
-    def test_numeric_keyboard_and_compact_overview_contract(self):
+    def test_single_panel_reference_structure(self):
         class Markup(HTMLParser):
             def __init__(self):
                 super().__init__()
-                self.nodes = {}
-                self.labels = []
+                self.stack, self.nodes, self.tags, self.text = [], {}, [], []
 
             def handle_starttag(self, tag, attrs):
                 attrs = dict(attrs)
+                self.tags.append(tag)
                 if "id" in attrs:
-                    self.nodes[attrs["id"]] = (tag, attrs)
-                if tag == "label":
-                    self.labels.append(attrs)
+                    if attrs["id"] in self.nodes:
+                        raise AssertionError("Duplicate ID")
+                    self.nodes[attrs["id"]] = (tag, attrs, tuple(self.stack))
+                if tag not in {"input", "hr", "meta", "br", "path", "circle", "rect"}:
+                    self.stack.append(attrs.get("id", tag))
+
+            def handle_endtag(self, tag):
+                if tag not in {"path", "circle", "rect"}:
+                    self.stack.pop()
+
+            def handle_data(self, data):
+                if "script" not in self.stack and "style" not in self.stack:
+                    self.text.append(data)
 
         markup = Markup()
         markup.feed(HTML)
-        number = markup.nodes["attempts"][1]
-        self.assertEqual(number["type"], "number")
-        self.assertIn({"for": "attempts"}, markup.labels)
-        self.assertEqual(number["aria-describedby"], "attempts-hint attempts-error")
-        for name in ("attempts", "start", "resume", "nav-overview", "nav-tasks", "nav-logs"):
-            tag, attrs = markup.nodes[name]
-            self.assertIn(tag, ("input", "button"))  # Native Tab/Enter/Space semantics.
-            self.assertNotIn("tabindex", attrs)  # No positive or negative tab-order overrides.
-        for name in ("header-state", "attempts-error"):
-            self.assertEqual(markup.nodes[name][1]["role"], "status")
-            self.assertEqual(markup.nodes[name][1]["aria-live"], "polite")
-        self.assertNotIn('open', markup.nodes["launch-details"][1])
-        self.assertNotIn("Ready for your first run", HTML)
-        self.assertNotIn("const steps", HTML)
-        self.assertEqual(HTML.count('requires native confirmation.'), 1)
+        self.assertEqual(markup.tags.count("main"), 1)
+        self.assertEqual(markup.tags.count("h1"), 1)
+        for tag in ("aside", "nav", "details", "h2", "h3", "pre", "table", "progress"):
+            self.assertNotIn(tag, markup.tags)
+        for obsolete in ("nav-overview", "nav-tasks", "nav-logs", "advanced", "app",
+                         "evidence-viewer", "resume", "header-state", "refresh"):
+            self.assertNotIn(obsolete, markup.nodes)
+        for name in ("browse-plan", "start-audit", "download-audit", "start", "stop", "download-logs"):
+            tag, attrs, ancestors = markup.nodes[name]
+            self.assertEqual(tag, "button")
+            self.assertNotIn("configuration", ancestors)
+            if name != "browse-plan":
+                self.assertIn("disabled", attrs)
+        for name in ("browse-project", "open-run", "export-evidence", "include-evidence", "audit-model", "audit-goal", "attempts",
+                     "github-branch", "auto-push", "push-approved"):
+            self.assertIn("configuration", markup.nodes[name][2])
+        self.assertNotIn("open", markup.nodes["configuration"][1])
+        self.assertEqual(markup.nodes["configuration"][0], "dialog")
+        labels = " ".join(markup.text)
+        for text in ("Plan Audit", "Selected JSON file", "Browse", "Start Audit", "Download Fix / Log",
+                     "Run controls unlock after approved audit", "Start", "Stop", "Download Logs",
+                     "Status", "Task", "Time"):
+            self.assertIn(text, labels)
+        for text in ("simplified layout preview", "Overview", "Task current/total", "Run setup"):
+            self.assertNotIn(text, labels)
+        order = ["plan-path", "browse-plan", "start-audit", "audit-result", "download-audit",
+                 "approval-indicator", "start", "stop", "download-logs", "run-status", "run-task", "run-time"]
+        self.assertEqual([HTML.index('id="' + name + '"') for name in order],
+                         sorted(HTML.index('id="' + name + '"') for name in order))
+        self.assertEqual(markup.nodes["stop"][1]["title"], "Stop after current task")
+        self.assertEqual(markup.nodes["audit-result"][1]["aria-live"], "polite")
+        self.assertEqual(markup.nodes["plan-path"][1]["tabindex"], "0")
+        self.assertEqual(markup.nodes["attempts"][1]["type"], "number")
+        self.assertIn("hidden", markup.nodes["configure-error"][1])
 
-    def test_audit_run_hierarchy_and_unwired_actions_fail_closed(self):
-        class Structure(HTMLParser):
-            def __init__(self):
-                super().__init__()
-                self.stack = []
-                self.nodes = {}
+    def test_responsive_accessible_and_safe_text_contract(self):
+        for token in ('width:min(100%,1000px)', 'min-height:555px', 'place-items:center',
+                      'grid-template-columns:repeat(3,minmax(0,1fr))', 'overflow-wrap:anywhere',
+                      ':focus-visible', '@media(max-width:700px)', '@media(max-width:400px)',
+                      'prefers-reduced-motion:reduce', 'showModal()', "addEventListener('cancel'",
+                      'textContent'):
+            self.assertIn(token, HTML)
+        for unsafe in ('innerHTML', 'outerHTML', 'insertAdjacentHTML', '<script src=', 'https://'):
+            self.assertNotIn(unsafe, HTML)
 
-            def handle_starttag(self, tag, attrs):
-                attrs = dict(attrs)
-                if "id" in attrs:
-                    self.assert_unique(attrs["id"])
-                    self.nodes[attrs["id"]] = (attrs, tuple(self.stack))
-                if tag not in {"input", "hr", "meta", "br"}:
-                    self.stack.append(attrs.get("id", tag))
-
-            def assert_unique(self, name):
-                if name in self.nodes:
-                    raise AssertionError("Duplicate ID: " + name)
-
-            def handle_endtag(self, tag):
-                self.stack.pop()
-
-        markup = Structure()
-        markup.feed(HTML)
-        for name in ("start", "start-audit", "stop", "download-audit", "download-logs"):
-            attrs, _ = markup.nodes[name]
-            self.assertIn("disabled", attrs)
-            self.assertIn(attrs["aria-describedby"].split()[0], markup.nodes)
-        self.assertNotIn("advanced", markup.nodes["plan-path"][1])
-        for name in ("github-repo", "github-branch", "resume", "open-run",
-                     "push-approved", "preflight-details", "project-path"):
-            self.assertIn("advanced", markup.nodes[name][1])
-        self.assertNotIn("open", markup.nodes["advanced"][0])
-        self.assertEqual(markup.nodes["audit-result"][0]["class"], "pill muted")
-        self.assertEqual(markup.nodes["audit-result"][0]["aria-live"], "polite")
-        self.assertEqual(markup.nodes["message"][0]["role"], "alert")
-        self.assertLess(HTML.index('id="plan-path"'), HTML.index('<hr class="section-divider">'))
-        self.assertLess(HTML.index('<hr class="section-divider">'), HTML.index('id="start"'))
-        self.assertLess(HTML.index('id="start"'), HTML.index('id="run-status"'))
-        self.assertIn('Time <small>(HH:MM:SS)</small>', HTML)
-        self.assertIn('Elapsed time is unavailable', HTML)
-        self.assertIn('@media(max-width:700px)', HTML)
-
-    def test_actual_ui_buttons_navigation_polling_and_state_transitions(self):
+    def test_actual_ui_buttons_polling_and_state_transitions(self):
         node = shutil.which("node")
         self.assertIsNotNone(node, "Node.js is required for mandatory headless UI interaction checks")
         script = HTML.split("<script>", 1)[1].split("</script>", 1)[0]
@@ -173,7 +116,7 @@ class DesktopUITests(unittest.TestCase):
             result = subprocess.run([node, "-e", RUN_COMMONJS, str(fixture), str(js)], capture_output=True,
                                     text=True, encoding="utf-8", errors="replace", timeout=20)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("Dashboard button, navigation, polling, evidence and state contracts passed", result.stdout)
+        self.assertIn("Dashboard selection, audit, authorization, recovery, export and state contracts passed", result.stdout)
 
     def test_node_launchers_preserve_compilation_commonjs_and_failure_exit(self):
         node = shutil.which("node")
