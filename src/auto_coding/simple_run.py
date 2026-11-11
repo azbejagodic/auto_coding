@@ -197,7 +197,10 @@ def call(argv: list[str], cwd: Path, timeout: int, *, prompt: str | None = None)
                                 encoding="utf-8", errors="surrogateescape" if argv[0] == "git" else "replace",
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 timeout=timeout, check=False, shell=False, env=command_environment(cwd))
-        return _CallResult(result.returncode, result.stdout or "", False, process_started=True)
+        # A normal Windows bounded_run return requires an empty owned Job and
+        # closed output pipes. Carry that proof explicitly to the MXC workspace.
+        return _CallResult(result.returncode, result.stdout or "", False,
+                           True if sys.platform == "win32" else None, process_started=True)
     except subprocess.TimeoutExpired as exc:
         confirmed = getattr(exc, "cleanup_confirmed", False) is True
         if not confirmed:
