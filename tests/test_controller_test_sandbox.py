@@ -28,12 +28,22 @@ class ControllerTestSandboxTests(unittest.TestCase):
         self.toolchain = self.root / "tools" / "runtime"
         self.toolchain.mkdir(parents=True)
         (self.toolchain / "tool.exe").write_text("fixture")
-        self.git = lambda repo, args: str(self.repo / ".git")
+        def git(repo, args):
+            if args == ["ls-files", "--stage", "-v", "-z"]:
+                return "H 100644 " + "a" * 40 + " 0\tproject.py\0"
+            if args[:1] == ["ls-files"]:
+                return "project.py\0"
+            if args == ["rev-parse", "--revs-only", "HEAD"]:
+                return "a" * 40
+            return str(self.repo / ".git")
+        self.git = git
+        (self.repo / "project.py").write_text("# fixture\n")
         self.command = ["python", "-m", "unittest", "test_target"]
         for context in (patch.object(sandbox.sys, "platform", "win32"),
                         patch.dict(os.environ, {"SYSTEMROOT": str(self.windows),
                             "USERPROFILE": str(self.root / "users" / "profile"),
                             "HOME": str(self.root / "users" / "profile"),
+                            "PROGRAMFILES": str(self.root / "Program Files"),
                             "PROGRAMDATA": str(self.root / "programdata")}),
                         patch.object(sandbox.Path, "home", return_value=self.root / "users" / "profile"),
                         patch.object(sandbox.shutil, "which", return_value=str(self.root / "codex.exe"))):
@@ -55,7 +65,7 @@ class ControllerTestSandboxTests(unittest.TestCase):
         spec, marker = self.prepare(); self.addCleanup(spec.cleanup)
         arguments = spec.argv
         self.assertEqual(arguments[arguments.index("sandbox") + 1:arguments.index("--")],
-                         ["-P", self.check_mock.call_args.args[1], "-C", str(self.repo)])
+                         ["-P", self.check_mock.call_args.args[1], "-C", str(spec.workspace)])
         self.assertEqual(json.loads(arguments[-1])[:2], [self.command, marker])
         self.assertNotIn("CODEX_HOME", json.loads(arguments[-1])[2])
         self.assertEqual(arguments[arguments.index("--") + 2:arguments.index("--") + 4], ["-I", "-B"])
@@ -70,7 +80,10 @@ class ControllerTestSandboxTests(unittest.TestCase):
         self.assertEqual(profile["network"], {"enabled": False})
         self.assertEqual(profile["filesystem"], self.check_mock.call_args.kwargs["filesystem"])
         self.assertEqual(profile["filesystem"][":root"], "deny")
-        self.assertEqual(profile["filesystem"][self.repo.as_posix()], "read")
+        self.assertEqual(profile["filesystem"][self.repo.as_posix()], "deny")
+        self.assertEqual((spec.workspace / "project.py").read_bytes(), (self.repo / "project.py").read_bytes())
+        self.assertFalse((spec.workspace / ".git").exists())
+        self.assertEqual(spec.snapshot["head"], "a" * 40)
         self.assertEqual([key for key,value in profile["filesystem"].items() if value == "write"],
                          [spec.scratch.as_posix()])
 
@@ -84,7 +97,7 @@ class ControllerTestSandboxTests(unittest.TestCase):
         for key in ("GITHUB_TOKEN", "CODEX_API_KEY", "PYTHONHOME"):
             self.assertNotIn(key, spec.environment)
         self.assertEqual(spec.environment["PYTHONPATH"].split(os.pathsep),
-                         [str(self.repo), str(self.repo / "src")])
+                         [str(spec.workspace), str(spec.workspace / "src")])
         self.assertEqual([spec.environment[key] for key in ("TEMP", "TMP", "TMPDIR")],
                          [str(spec.scratch / "tmp")] * 3)
         self.assertEqual(Path(spec.environment["CODEX_HOME"]).parent, spec.scratch)
@@ -97,7 +110,7 @@ class ControllerTestSandboxTests(unittest.TestCase):
         filesystem = self.check_mock.call_args.kwargs["filesystem"]
         self.assertEqual(filesystem[self.toolchain.as_posix()], "read")
         self.assertEqual(filesystem[":root"], "deny")
-        self.assertEqual(filesystem[self.repo.as_posix()], "read")
+        self.assertEqual(filesystem[self.repo.as_posix()], "deny")
         self.assertEqual([key for key, value in filesystem.items() if value == "write"], [spec.scratch.as_posix()])
         settings = self.check_mock.call_args.args[0]
         policy = tomllib.loads(settings[1])["permissions"][self.check_mock.call_args.args[1]]
@@ -180,14 +193,19 @@ class ControllerTestSandboxTests(unittest.TestCase):
     def test_actual_test_exit_and_output_preserved_then_scratch_removed(self):
         def launch(argv, repo, timeout):
             self.assertEqual(timeout, 17)
-            self.assertEqual(repo, self.repo)
+            self.assertEqual(repo.name, "workspace")
+            self.assertNotEqual(repo, self.repo)
             self.assertEqual(Path(permissions.command_environment(repo)["TMPDIR"]).name, "tmp")
             marker = json.loads(argv[-1])[1]
-            return runner._CallResult(0, 'test failure\n' + marker + '{"kind":"test","exit_code":3}\n', False)
+            return runner._CallResult(0, 'test failure\n' + marker + '{"kind":"test","exit_code":3}\n', False, True, True)
         result = self.run_test(launch)
         self.assertEqual(result, (3, "test failure", False))
         self.assertTrue(result.cleanup_confirmed)
         self.assertEqual(self.scratch(), [])
+        diagnostic = json.loads(next(self.logs.glob("controller-test-sandbox-*.json")).read_text())
+        self.assertEqual(diagnostic["workspace_cleanup"], "removed")
+        self.assertEqual(diagnostic["snapshot"]["head"], "a" * 40)
+        self.assertEqual(diagnostic["category"], "test_failure")
 
     def test_startup_and_command_environment_failures_stop_without_host_fallback(self):
         for output, code in (("MXC startup failed", 1), ("not a footer", 0), ("", 127)):
@@ -202,7 +220,7 @@ class ControllerTestSandboxTests(unittest.TestCase):
             marker = json.loads(argv[-1])[1]
             return runner._CallResult(0, '\n' + marker + json.dumps({"kind":"environment",
                 "error_type":"PermissionError", "error_text":"denied", "errno":13,
-                "winerror":5, "executable":"compiler"}), False)
+                "winerror":5, "executable":"compiler"}), False, True, True)
         with self.assertRaises(sandbox.ControllerTestEnvironmentError) as caught:
             self.run_test(permission_failure)
         self.assertEqual(caught.exception.classification, "confirmed_environment_blocker")
@@ -231,6 +249,8 @@ class ControllerTestSandboxTests(unittest.TestCase):
         self.assertEqual(caught.exception.classification, "unclassified_execution_problem")
         self.assertNotIn("permission", caught.exception.classification)
         self.assertTrue(caught.exception.output_artifact)
+        diagnostic = json.loads(next(self.logs.glob("controller-test-sandbox-*.json")).read_text())
+        self.assertEqual(diagnostic["category"], "incomplete_execution_evidence")
 
     def test_timeout_cleanup_proof_and_uncertainty_are_preserved(self):
         for confirmed in (True, False):
@@ -249,6 +269,60 @@ class ControllerTestSandboxTests(unittest.TestCase):
         self.assertFalse(result.cleanup_confirmed)
         self.assertEqual(len(self.scratch()), 1)
 
+    def test_success_exit_alone_cannot_prove_tree_cleanup(self):
+        result = self.run_test(Mock(return_value=(0, "parent exited", False)))
+        self.assertFalse(result.cleanup_confirmed)
+        self.assertEqual(len(self.scratch()), 1)
+        diagnostic = json.loads(next(self.logs.glob("controller-test-sandbox-*.json")).read_text())
+        self.assertEqual(diagnostic["category"], "cleanup_uncertain")
+
+    def test_workspace_cleanup_failure_is_retained_and_reported(self):
+        with patch.object(permissions.ReviewPermissions, "cleanup", side_effect=PermissionError("denied")):
+            with self.assertRaises(sandbox.ControllerTestEnvironmentError) as caught:
+                self.run_test(Mock(return_value=runner._CallResult(124, "timeout", True, True, True)))
+        self.assertTrue(caught.exception.cleanup_confirmed)  # Process proof remains distinct.
+        self.assertEqual(caught.exception.details["stage"], "workspace_cleanup")
+        self.assertEqual(len(self.scratch()), 1)
+        diagnostic = json.loads(next(self.logs.glob("controller-test-sandbox-*.json")).read_text())
+        self.assertEqual(diagnostic["workspace_cleanup"], "failed")
+
+    def test_source_change_during_cli_inspection_prevents_launch(self):
+        self.check_mock.side_effect = lambda *args, **kwargs: (self.repo / "project.py").write_text("changed")
+        launch = Mock()
+        with self.assertRaises(sandbox.ControllerTestEnvironmentError) as caught:
+            self.run_test(launch)
+        self.assertTrue(caught.exception.cleanup_confirmed)
+        launch.assert_not_called()
+        self.assertEqual(self.scratch(), [])
+
+    def test_fixed_machine_tool_installations_are_validated_read_only(self):
+        roots = [Path(os.environ["PROGRAMFILES"]) / name for name in ("Git", "nodejs")]
+        for root in roots:
+            root.mkdir(parents=True)
+        spec, _ = self.prepare(); self.addCleanup(spec.cleanup)
+        filesystem = self.check_mock.call_args.kwargs["filesystem"]
+        for root in roots:
+            self.assertEqual(filesystem[root.as_posix()], "read")
+        self.assertNotIn(Path(os.environ["PROGRAMFILES"]).as_posix(), filesystem)
+
+    def test_tool_search_does_not_depend_on_interactive_path(self):
+        git = Path(os.environ["PROGRAMFILES"]) / "Git" / "cmd"
+        node = Path(os.environ["PROGRAMFILES"]) / "nodejs"
+        git.mkdir(parents=True); node.mkdir(parents=True)
+        with patch.dict(os.environ, {"PATH": ""}):
+            spec, _ = self.prepare()
+        self.addCleanup(spec.cleanup)
+        paths = spec.environment["PATH"].split(os.pathsep)
+        self.assertIn(str(git), paths)
+        self.assertIn(str(node), paths)
+        self.assertIn(str(Path(sys.executable).resolve().parent), paths)
+        self.assertNotIn(str(self.repo), paths)
+
+    def test_absolute_project_arguments_are_relocated_to_the_copy(self):
+        self.command.append(str(self.repo / "project.py"))
+        spec, _ = self.prepare(); self.addCleanup(spec.cleanup)
+        self.assertEqual(json.loads(spec.argv[-1])[0][-1], str(spec.workspace / "project.py"))
+
     def test_bootstrap_restores_environment_and_reports_real_exit_or_launch_failure(self):
         environment = os.environ.copy()
         environment.pop("CODEX_HOME", None)
@@ -261,7 +335,9 @@ class ControllerTestSandboxTests(unittest.TestCase):
                                      json.dumps([command, "RESULT:", environment])],
                                     capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0)
-        self.assertEqual(json.loads(result.stdout.split("RESULT:")[1]), {"kind": "test", "exit_code": 3})
+        evidence = json.loads(result.stdout.split("RESULT:")[1])
+        self.assertEqual({key: evidence[key] for key in ("kind", "exit_code")}, {"kind": "test", "exit_code": 3})
+        self.assertEqual(evidence["context"]["environment"]["TEMP"], str(self.logs))
         missing = [str(self.root / "missing-executable")]
         result = subprocess.run([sys.executable, "-I", "-B", "-c", sandbox._BOOTSTRAP,
                                  json.dumps([missing, "RESULT:", environment])],

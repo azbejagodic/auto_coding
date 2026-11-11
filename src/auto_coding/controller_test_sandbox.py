@@ -4,12 +4,14 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import sys
 import uuid
 
 from auto_coding.python_environment import test_environment
+from auto_coding import test_workspace
 from auto_coding.sensitive_paths import is_sensitive_path
 from auto_coding.reviewer_permissions import (
     ReviewerEnvironmentError, activated, check_cli, prepare_review,
@@ -24,7 +26,11 @@ TOOLCHAIN_DIRS_ENV = "AUTOCODING_TEST_TOOLCHAIN_DIRS_JSON"
 def trusted_toolchain_filesystem(repo, logs, runtime, windows):
     raw = os.environ.get(TOOLCHAIN_DIRS_ENV)
     if raw is None:
-        return {}
+        # Discover only fixed machine installation locations. PATH, project
+        # manifests and missing-executable messages never authorize grants.
+        program_files = os.environ.get("ProgramFiles") or os.environ.get("PROGRAMFILES")
+        roots = [Path(program_files) / name for name in ("Git", "nodejs")] if program_files else []
+        raw = json.dumps([str(path) for path in roots if path.is_dir()])
     try:
         if len(raw) > 32768:
             raise ValueError
@@ -103,16 +109,41 @@ class ControllerTestEnvironmentError(ValueError):
 # Trusted stdlib bootstrap ignores target imports (-I). The child receives the
 # sanitized target PYTHONPATH. No guest supervisor: bounded_run owns the MXC tree.
 _BOOTSTRAP = r'''
-import json, os, subprocess, sys
+import errno, json, os, shutil, stat, subprocess, sys, tempfile
 command, marker, environment = json.loads(sys.argv[1])
 os.environ.clear()
 os.environ.update(environment)
+context = {"cwd": os.getcwd(), "tools": {name: shutil.which(name) for name in
+           ("python", "git", "node")}, "executable": shutil.which(command[0]),
+           "environment": {key: environment.get(key) for key in
+           ("PATH", "PYTHONPATH", "TEMP", "TMP", "TMPDIR", "HOME", "USERPROFILE",
+            "APPDATA", "LOCALAPPDATA", "XDG_CACHE_HOME", "PIP_CACHE_DIR", "npm_config_cache")}}
+stage = "temporary_storage"
+context["recovery"] = []
 try:
+    for directory in sorted({environment[key] for key in ("TEMP", "TMP", "TMPDIR") if key in environment}):
+        try:
+            info = os.lstat(directory)
+        except FileNotFoundError:
+            # One controller-designated leaf only; never rerun test code,
+            # recreate a parent, expand grants or fall back to host storage.
+            os.mkdir(directory)
+            context["recovery"].append("recreated_temporary_directory")
+            info = os.lstat(directory)
+        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+            raise PermissionError(errno.EACCES, "Temporary storage is a link or reparse point")
+        if not stat.S_ISDIR(info.st_mode):
+            raise NotADirectoryError(errno.ENOTDIR, "Temporary storage is not a directory")
+        with tempfile.TemporaryFile(dir=directory) as probe:
+            probe.write(b"controller storage probe")
+            probe.flush()
+    stage = "command_launch"
     result = {"exit_code": subprocess.call(command), "kind": "test"}
 except OSError as error:
     result = {"kind": "environment", "error_type": type(error).__name__,
               "error_text": str(error), "errno": error.errno,
-              "winerror": getattr(error, "winerror", None), "executable": command[0]}
+              "winerror": getattr(error, "winerror", None), "executable": command[0], "stage": stage}
+result["context"] = context
 print("\n" + marker + json.dumps(result), flush=True)
 '''
 
@@ -123,6 +154,27 @@ class _TestResult(tuple):
         result.cleanup_confirmed = cleanup_confirmed
         result.process_started = process_started
         return result
+
+
+def _category(evidence, output):
+    if evidence.get("kind") == "environment":
+        if evidence.get("errno") in (1, 13) or evidence.get("winerror") == 5:
+            return "filesystem_permission"
+        if evidence.get("stage") == "temporary_storage":
+            return "temporary_storage_failure"
+        if evidence.get("errno") == 2 or evidence.get("winerror") in (2, 3):
+            return "missing_executable"
+        return "command_launch"
+    if not evidence.get("exit_code"):
+        return "passed"
+    # Output is diagnostic evidence, never authorization for retries or grants.
+    for pattern, category in ((r"ModuleNotFoundError:", "possible_missing_dependency"),
+                              (r"PermissionError:|WinError 5\b", "possible_filesystem_permission"),
+                              (r"FileNotFoundError:|WinError 2\b", "possible_missing_executable_or_file"),
+                              (r"CalledProcessError:", "nested_subprocess_failure")):
+        if re.search(pattern, output):
+            return category
+    return "test_failure"
 
 
 def prepare(command, repo, logs, git):
@@ -141,42 +193,69 @@ def prepare(command, repo, logs, git):
         if any(path == repo or repo.is_relative_to(path) or path.is_relative_to(repo)
                or path == path.parent for path in (runtime, windows)):
             raise ControllerTestEnvironmentError("Unsupported overlapping runtime/checkout paths")
+        workspace = spec.scratch / "workspace"
+        workspace.mkdir()
+        snapshot = test_workspace.capture(repo, git, workspace)
         filesystem = {":root": "deny", windows.as_posix(): "read", runtime.as_posix(): "read",
-                      repo.as_posix(): "read", spec.scratch.as_posix(): "write"}
-        filesystem.update(trusted_toolchain_filesystem(repo, logs, runtime, windows))
+                      repo.as_posix(): "deny", spec.scratch.as_posix(): "write"}
+        tools = trusted_toolchain_filesystem(repo, logs, runtime, windows)
+        filesystem.update(tools)
         name = "auto_coding_tests_" + uuid.uuid4().hex
         policy = 'permissions.' + name + '={extends=":read-only",filesystem={' + ','.join(
             json.dumps(key) + '=' + json.dumps(value) for key, value in filesystem.items()
         ) + '},network={enabled=false}}'
         settings = [f'default_permissions="{name}"', policy, 'windows.sandbox=mxc']
-        environment = test_environment(repo)
-        environment.update({key: str(spec.scratch / "tmp") for key in ("TEMP", "TMP", "TMPDIR")})
+        base = test_environment(repo)
+        search = [runtime, windows / "System32", windows]
+        for root, access in tools.items():
+            if access == "read":
+                search.extend(Path(root) / child for child in ("", "cmd", "bin", "Scripts"))
+        base["PATH"] = os.pathsep.join([*map(str, search), base.get("PATH", "")])
+        base["PATHEXT"] = ".COM;.EXE;.BAT;.CMD"
+        environment = test_workspace.environment(workspace, spec.scratch, base, filesystem, source=repo)
         home = spec.scratch / "codex-home"
         home.mkdir()
         environment.update(CODEX_HOME=str(home), PYTHONDONTWRITEBYTECODE="1")
         executable = check_cli(settings, name, repo, spec.scratch, environment=environment,
                                filesystem=filesystem, backend="mxc")
+        if test_workspace.capture(repo, git) != snapshot:
+            raise ControllerTestEnvironmentError("Source snapshot changed while preparing tests")
+        relocated = []
+        for argument in command:
+            path = Path(argument)
+            if path.is_absolute() and path.is_relative_to(repo):
+                argument = str(workspace / path.relative_to(repo))
+            relocated.append(argument)
+        resolved = test_workspace.resolve_tool(relocated[0], environment)
+        if resolved:
+            relocated[0] = resolved
         marker = "AUTO_CODING_TEST_RESULT_" + uuid.uuid4().hex + ":"
         argv = [executable]
         for setting in settings:
             argv.extend(["-c", setting])
         child_environment = {key: value for key, value in environment.items() if key != "CODEX_HOME"}
-        argv.extend(["sandbox", "-P", name, "-C", str(repo), "--", sys.executable, "-I", "-B",
-                     "-c", _BOOTSTRAP, json.dumps([command, marker, child_environment])])
+        argv.extend(["sandbox", "-P", name, "-C", str(workspace), "--", sys.executable, "-I", "-B",
+                     "-c", _BOOTSTRAP, json.dumps([relocated, marker, child_environment])])
         spec.argv, spec.environment = argv, environment
+        spec.workspace, spec.snapshot = workspace, snapshot
+        spec.tools = {tool: test_workspace.resolve_tool(tool, environment) for tool in ("python", "git", "node")}
         return spec, marker
     except BaseException as exc:
         cleanup = getattr(exc, "cleanup_confirmed", None)
         clean = cleanup is True or (cleanup is None and (
-            isinstance(exc, (ReviewerEnvironmentError, ControllerTestEnvironmentError, KeyError))
+            isinstance(exc, (ReviewerEnvironmentError, ControllerTestEnvironmentError, KeyError, ValueError))
             or getattr(exc, "process_started", None) is False))
+        diagnostic = logs / ("controller-test-preflight-" + uuid.uuid4().hex + ".json")
+        diagnostic.write_text(json.dumps({"stage": "sandbox_preflight", "error_type": type(exc).__name__,
+            "error_text": str(exc)[:2048], "cleanup_confirmed": clean,
+            "workspace_retained": not clean, "scratch": str(spec.scratch)}, indent=2), encoding="utf-8")
         if clean:
             spec.cleanup()
         raise ControllerTestEnvironmentError(
             f"Controller test sandbox preflight failed ({type(exc).__name__}); scratch: {spec.scratch}",
             cleanup_confirmed=clean, process_started=not clean,
             classification=("confirmed_environment_blocker" if isinstance(
-                exc, (ReviewerEnvironmentError, OSError, KeyError))
+                exc, (ReviewerEnvironmentError, OSError, KeyError, ValueError))
                 else "unclassified_execution_problem"),
             details={"stage": "sandbox_preflight", "error_type": type(exc).__name__,
                      "error_text": str(exc)[:2048]}) from exc
@@ -185,12 +264,26 @@ def prepare(command, repo, logs, git):
 def run(command, repo, logs, timeout, *, git, launch):
     spec, marker = prepare(command, repo, logs, git)
     clean = False
+    diagnostic, context = None, None
     try:
         with activated(spec.environment):
-            result = launch(spec.argv, repo, timeout)
+            result = launch(spec.argv, spec.workspace, timeout)
         code, output, timed = result
         cleanup = getattr(result, "cleanup_confirmed", None)
-        clean = cleanup is True or (cleanup is None and not timed and code not in (125, 127))
+        clean = cleanup is True
+        diagnostic = Path(logs) / ("controller-test-sandbox-" + uuid.uuid4().hex)
+        # Controller-owned exports only. Never read a guest-selected output path.
+        diagnostic.with_suffix(".txt").write_text(output, encoding="utf-8")
+        context = {"snapshot": spec.snapshot, "cwd": str(spec.workspace),
+                   "resolved_tools": spec.tools,
+                   "exit_code": code, "timed_out": timed, "cleanup_confirmed": clean,
+                   "workspace_cleanup": "pending" if clean else "retained",
+                   "category": ("cleanup_uncertain" if not clean else "timeout" if timed else
+                                "sandbox_initialization" if output.startswith("Error: failed to prepare MXC sandbox:")
+                                else "incomplete_execution_evidence"),
+                   "environment": {key: spec.environment.get(key) for key in
+                       ("PATH", "PYTHONPATH", "TEMP", "TMP", "TMPDIR", "HOME", "XDG_CACHE_HOME")}}
+        diagnostic.with_suffix(".json").write_text(json.dumps(context, indent=2), encoding="utf-8")
         if not clean or timed:
             # An unknown launch result must never look like a completed legacy
             # tuple to the controller's gate/recovery handling.
@@ -200,26 +293,28 @@ def run(command, repo, logs, timeout, *, git, launch):
             evidence = json.loads(footer) if separator and code == 0 else None
         except ValueError:
             evidence = None
+        if isinstance(evidence, dict):
+            context["guest"] = evidence
+            context["category"] = _category(evidence, prefix)
+            diagnostic.with_suffix(".json").write_text(json.dumps(context, indent=2), encoding="utf-8")
         if isinstance(evidence, dict) and evidence.get("kind") == "environment":
-            diagnostic = Path(logs) / ("controller-test-sandbox-" + uuid.uuid4().hex + ".txt")
-            diagnostic.write_text(prefix or output, encoding="utf-8")
+            artifact = diagnostic.with_suffix(".txt")
             details = {key: evidence.get(key) for key in
                        ("executable", "error_type", "error_text", "errno", "winerror")
                        if evidence.get(key) is not None}
-            details["stage"] = "command_launch"
+            details["stage"] = evidence.get("stage", "command_launch")
             raise ControllerTestEnvironmentError(
                 "Configured test command could not be launched; "
-                f"diagnostics: {diagnostic.name}", cleanup_confirmed=True, process_started=False,
+                f"diagnostics: {artifact.name}", cleanup_confirmed=True, process_started=False,
                 classification="confirmed_environment_blocker", details=details,
-                output=prefix, output_artifact=diagnostic.name)
+                output=prefix, output_artifact=artifact.name)
         if (not isinstance(evidence, dict) or evidence.get("kind") != "test"
                 or type(evidence.get("exit_code")) is not int):
-            diagnostic = Path(logs) / ("controller-test-sandbox-" + uuid.uuid4().hex + ".txt")
-            diagnostic.write_text(output, encoding="utf-8")
+            artifact = diagnostic.with_suffix(".txt")
             raise ControllerTestEnvironmentError(
-                f"Sandbox execution result was incomplete; see {diagnostic}", process_started=True,
+                f"Sandbox execution result was incomplete; see {artifact}", process_started=True,
                 classification="unclassified_execution_problem", output=output,
-                output_artifact=diagnostic.name)
+                output_artifact=artifact.name)
         return _TestResult(evidence["exit_code"], prefix)
     except BaseException as exc:
         if not isinstance(exc, ControllerTestEnvironmentError):
@@ -232,4 +327,17 @@ def run(command, repo, logs, timeout, *, git, launch):
         raise
     finally:
         if clean:
-            spec.cleanup()
+            try:
+                spec.cleanup()
+            except (OSError, ReviewerEnvironmentError) as exc:
+                if context is not None:
+                    context.update(workspace_cleanup="failed", cleanup_error_type=type(exc).__name__)
+                    diagnostic.with_suffix(".json").write_text(json.dumps(context, indent=2), encoding="utf-8")
+                raise ControllerTestEnvironmentError(
+                    "Test processes stopped, but disposable workspace cleanup failed; inspect retained scratch",
+                    cleanup_confirmed=True, process_started=True,
+                    classification="confirmed_environment_blocker",
+                    details={"stage": "workspace_cleanup", "scratch": str(spec.scratch)}) from exc
+            if context is not None:
+                context["workspace_cleanup"] = "removed"
+                diagnostic.with_suffix(".json").write_text(json.dumps(context, indent=2), encoding="utf-8")
