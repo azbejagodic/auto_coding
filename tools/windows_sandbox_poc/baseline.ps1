@@ -1,0 +1,83 @@
+param([string]$RunId, [string]$SandboxId, [string]$SourceCommit,
+    [int]$SuiteTimeoutSeconds, [int]$OverallTimeoutSeconds)
+$ErrorActionPreference = 'Stop'
+. ([scriptblock]::Create([IO.File]::ReadAllText('C:\ACSetup\common.ps1')))
+$started = [DateTime]::UtcNow
+$deadline = $started.AddSeconds($OverallTimeoutSeconds)
+$result = [ordered]@{ runId = $RunId; sandboxId = $SandboxId; sourceCommit = $SourceCommit;
+    disposableCommit = $null; computerName = $env:COMPUTERNAME;
+    account = [Security.Principal.WindowsIdentity]::GetCurrent().Name;
+    startedUtc = $started.ToString('o'); finishedUtc = $null; versions = $null;
+    suites = @(); totalTests = 0; success = $false; operationExitCode = 1; error = $null }
+$workspace = 'C:\AutoCodingTest'
+$python = 'C:\Python313Embed\python.exe'
+$git = 'C:\ACGit\cmd\git.exe'
+$node = 'C:\ACNode\node.exe'
+$env:PATH = "C:\ACGit\cmd;C:\ACNode;C:\Python313Embed;$env:PATH"
+$env:PYTHONPATH = 'C:\AutoCodingTest\src'
+$env:PYTHONIOENCODING = 'utf-8'
+# SYSTEM inherits TEMP with different casing from the on-disk Windows directory.
+# Use a disposable guest-owned directory whose spelling survives Path.resolve().
+$null = [IO.Directory]::CreateDirectory('C:\AutoCodingTemp')
+$env:TEMP = 'C:\AutoCodingTemp'
+$env:TMP = 'C:\AutoCodingTemp'
+$result.environment = [ordered]@{ temp = $env:TEMP; tmp = $env:TMP; pythonPath = $env:PYTHONPATH; path = $env:PATH }
+function Run-Setup([string]$Name, [string]$Exe, [string[]]$Argv) {
+    $remaining = [int][Math]::Floor(($deadline - [DateTime]::UtcNow).TotalSeconds)
+    if ($remaining -le 0) { throw 'Overall guest deadline expired during setup.' }
+    $p = Invoke-BoundedProcess -Executable $Exe -Arguments $Argv -WorkingDirectory $workspace `
+        -LogPrefix "C:\ACResults\setup-$Name" -TimeoutSeconds ([Math]::Min(120, $remaining))
+    if ($p.timedOut -or $p.exitCode -ne 0) { throw "Setup $Name failed: exit=$($p.exitCode), timeout=$($p.timedOut)" }
+    return [IO.File]::ReadAllText($p.stdout).Trim()
+}
+try {
+    Expand-Archive -LiteralPath 'C:\ACSetup\baseline.zip' -DestinationPath $workspace
+    Expand-Archive -LiteralPath 'C:\ACSetup\python.zip' -DestinationPath 'C:\Python313Embed'
+    Rename-Item -LiteralPath 'C:\Python313Embed\python313._pth' -NewName 'python313._pth.bak'
+    $versions = [ordered]@{ git = (Run-Setup 'git-version' $git @('--version'));
+        python = (Run-Setup 'python-version' $python @('--version'));
+        node = (Run-Setup 'node-version' $node @('--version')) }
+    $result.versions = $versions
+    if ($versions.git -cne 'git version 2.53.0.windows.4' -or $versions.python -cne 'Python 3.13.17' -or
+        $versions.node -cne 'v26.13.1') { throw 'Offline tool version mismatch.' }
+    $null = Run-Setup 'init' $git @('init')
+    $null = Run-Setup 'name' $git @('config', '--local', 'user.name', 'Auto-Coding Sandbox')
+    $null = Run-Setup 'email' $git @('config', '--local', 'user.email', 'sandbox@example.invalid')
+    $null = Run-Setup 'add' $git @('add', '.')
+    $null = Run-Setup 'commit' $git @('commit', '-m', 'Disposable baseline for Sandbox tests')
+    $result.disposableCommit = Run-Setup 'head' $git @('rev-parse', 'HEAD')
+    $status = Run-Setup 'status' $git @('status', '--porcelain=v1')
+    if ($status) { throw 'Disposable repository is not initially clean.' }
+    foreach ($file in @('test_desktop_ui.py', 'test_dashboard_acceptance.py', 'test_desktop_bridge.py',
+        'test_desktop_control.py', 'test_plan_audit.py', 'test_isolated_workspace.py')) {
+        $remaining = [int][Math]::Floor(($deadline - [DateTime]::UtcNow).TotalSeconds)
+        if ($remaining -le 0) { throw 'Overall guest deadline expired before suite launch.' }
+        $p = Invoke-BoundedProcess -Executable $python -Arguments @('-m', 'unittest', 'discover', '-s', 'tests', '-p', $file, '-v') `
+            -WorkingDirectory $workspace -LogPrefix "C:\ACResults\$file" `
+            -TimeoutSeconds ([Math]::Min($SuiteTimeoutSeconds, $remaining))
+        $text = [IO.File]::ReadAllText($p.stdout) + "`n" + [IO.File]::ReadAllText($p.stderr)
+        $report = Read-UnittestReport $text
+        $state = if ($p.timedOut) { 'TIMEOUT' } elseif ($p.exitCode -eq 0 -and $report.cleanPass) { 'PASS' } else { 'FAIL' }
+        $suite = [ordered]@{ file = $file; process = $p; tests = $report.tests; failures = $report.failures;
+            errors = $report.errors; skips = $report.skips; status = $state }
+        $result.suites += $suite
+        $result.totalTests += $report.tests
+        $suite | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath "C:\ACResults\$file.suite.json" -Encoding UTF8
+        if ($p.timedOut) { throw "Suite timed out: $file; aborting before further suites." }
+    }
+    $expected = @(4, 7, 39, 37, 40, 18)
+    for ($i = 0; $i -lt 6; $i++) {
+        if ($result.suites[$i].status -ne 'PASS' -or $result.suites[$i].tests -ne $expected[$i]) {
+            throw "Suite did not match clean baseline: $($result.suites[$i].file)"
+        }
+    }
+    $result.success = $true
+    $result.operationExitCode = 0
+} catch {
+    $result.error = $_.Exception.ToString() + "`n" + $_.ScriptStackTrace
+} finally {
+    $result.finishedUtc = [DateTime]::UtcNow.ToString('o')
+    $result | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath 'C:\ACResults\baseline.json.tmp' -Encoding UTF8
+    Move-Item -LiteralPath 'C:\ACResults\baseline.json.tmp' -Destination 'C:\ACResults\baseline.json'
+}
+exit $result.operationExitCode
