@@ -1,5 +1,5 @@
 param([string]$RunId, [string]$SandboxId, [string]$SourceCommit,
-    [int]$SuiteTimeoutSeconds, [int]$OverallTimeoutSeconds)
+    [int]$SuiteTimeoutSeconds, [int]$OverallTimeoutSeconds, [switch]$Session)
 $ErrorActionPreference = 'Stop'
 . ([scriptblock]::Create([IO.File]::ReadAllText('C:\ACSetup\common.ps1')))
 $started = [DateTime]::UtcNow
@@ -13,9 +13,24 @@ $workspace = 'C:\AutoCodingTest'
 $python = 'C:\Python313Embed\python.exe'
 $git = 'C:\ACGit\cmd\git.exe'
 $node = 'C:\ACNode\node.exe'
+if ($Session) {
+    $sessionRequest = Get-Content -LiteralPath 'C:\ACSetup\session.json' -Raw | ConvertFrom-Json
+    $result.sourceBranch = $sessionRequest.sourceBranch
+    $result.policySha256 = $sessionRequest.policySha256
+    $result.suiteIndex = $sessionRequest.suiteIndex
+}
 $env:PATH = "C:\ACGit\cmd;C:\ACNode;C:\Python313Embed;$env:PATH"
 $env:PYTHONPATH = 'C:\AutoCodingTest\src'
 $env:PYTHONIOENCODING = 'utf-8'
+if ($Session) {
+    $allowed = @('CI', 'NO_COLOR', 'PYTHONDONTWRITEBYTECODE', 'PYTHONUTF8', 'PYTHONIOENCODING',
+        'PYTHONHASHSEED', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ', 'TERM', 'PYTHONPATH', 'AUTOCODING_CONFIG_DIR')
+    foreach ($setting in $sessionRequest.environment.PSObject.Properties) {
+        if ($setting.Name -notin $allowed -or $setting.Value -isnot [string]) { throw 'Unsupported guest environment setting.' }
+        [Environment]::SetEnvironmentVariable($setting.Name, $setting.Value, 'Process')
+    }
+    $null = [IO.Directory]::CreateDirectory('C:\AutoCodingConfig')
+}
 # SYSTEM inherits TEMP with different casing from the on-disk Windows directory.
 # Use a disposable guest-owned directory whose spelling survives Path.resolve().
 $null = [IO.Directory]::CreateDirectory('C:\AutoCodingTemp')
@@ -48,15 +63,20 @@ try {
     $result.disposableCommit = Run-Setup 'head' $git @('rev-parse', 'HEAD')
     $status = Run-Setup 'status' $git @('status', '--porcelain=v1')
     if ($status) { throw 'Disposable repository is not initially clean.' }
-    foreach ($file in @('test_desktop_ui.py', 'test_dashboard_acceptance.py', 'test_desktop_bridge.py',
-        'test_desktop_control.py', 'test_plan_audit.py', 'test_isolated_workspace.py')) {
+    $files = @('test_desktop_ui.py', 'test_dashboard_acceptance.py', 'test_desktop_bridge.py',
+        'test_desktop_control.py', 'test_plan_audit.py', 'test_isolated_workspace.py')
+    if ($Session) { $files = @("session-suite-$($sessionRequest.suiteIndex)") }
+    foreach ($file in $files) {
         $remaining = [int][Math]::Floor(($deadline - [DateTime]::UtcNow).TotalSeconds)
         if ($remaining -le 0) { throw 'Overall guest deadline expired before suite launch.' }
-        $p = Invoke-BoundedProcess -Executable $python -Arguments @('-m', 'unittest', 'discover', '-s', 'tests', '-p', $file, '-v') `
+        $exe = $python
+        $argv = @('-m', 'unittest', 'discover', '-s', 'tests', '-p', $file, '-v')
+        if ($Session) { $exe = $sessionRequest.command[0]; $argv = @($sessionRequest.command | Select-Object -Skip 1) }
+        $p = Invoke-BoundedProcess -Executable $exe -Arguments $argv `
             -WorkingDirectory $workspace -LogPrefix "C:\ACResults\$file" `
             -TimeoutSeconds ([Math]::Min($SuiteTimeoutSeconds, $remaining))
         $text = [IO.File]::ReadAllText($p.stdout) + "`n" + [IO.File]::ReadAllText($p.stderr)
-        $report = Read-UnittestReport $text
+        $report = Read-UnittestReport $text -LastSummary:$Session
         $state = if ($p.timedOut) { 'TIMEOUT' } elseif ($p.exitCode -eq 0 -and $report.cleanPass) { 'PASS' } else { 'FAIL' }
         $suite = [ordered]@{ file = $file; process = $p; tests = $report.tests; failures = $report.failures;
             errors = $report.errors; skips = $report.skips; status = $state }
@@ -66,8 +86,9 @@ try {
         if ($p.timedOut) { throw "Suite timed out: $file; aborting before further suites." }
     }
     $expected = @(4, 7, 39, 37, 40, 18)
-    for ($i = 0; $i -lt 6; $i++) {
-        if ($result.suites[$i].status -ne 'PASS' -or $result.suites[$i].tests -ne $expected[$i]) {
+    for ($i = 0; $i -lt $files.Count; $i++) {
+        if ($result.suites[$i].status -ne 'PASS' -or $result.suites[$i].tests -lt 1 -or
+            (!$Session -and $result.suites[$i].tests -ne $expected[$i])) {
             throw "Suite did not match clean baseline: $($result.suites[$i].file)"
         }
     }

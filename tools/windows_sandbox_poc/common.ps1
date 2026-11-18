@@ -1,7 +1,7 @@
 # Shared by host and guest; no dependencies or changes to machine policy.
 function Invoke-BoundedProcess {
     param([string]$Executable, [string[]]$Arguments, [string]$WorkingDirectory,
-        [string]$LogPrefix, [ValidateRange(1, 7200)][int]$TimeoutSeconds)
+        [string]$LogPrefix, [ValidateRange(1, 100000)][int]$TimeoutSeconds)
     # Windows CommandLineToArgvW quoting, including embedded quotes/trailing slashes.
     $quoted = foreach ($argument in $Arguments) {
         '"' + [regex]::Replace([regex]::Replace($argument, '(\\*)"', '$1$1\"'), '(\\+)$', '$1$1') + '"'
@@ -49,9 +49,15 @@ function Invoke-BoundedProcess {
     return [pscustomobject]$record
 }
 
-function Read-UnittestReport([string]$Text) {
+function Read-UnittestReport([string]$Text, [switch]$LastSummary) {
     $runs = [regex]::Matches($Text, '(?m)^Ran (\d+) tests? in [\d.]+s\r?$')
     $footer = [regex]::Matches($Text, '(?m)^(OK|FAILED)(?: \(([^\r\n]*)\))?\r?$')
+    if ($LastSummary -and $runs.Count -gt 0) {
+        $last = $runs[$runs.Count - 1]
+        $runs = @($last)
+        $tail = $Text.Substring($last.Index + $last.Length).TrimStart([char[]]"`r`n")
+        $footer = [regex]::Matches($tail, '\A(OK|FAILED)(?: \(([^\r\n]*)\))?\r?(?:\n|$)')
+    }
     $count = $null; $failures = $null; $errors = $null; $skips = $null
     $complete = ($runs.Count -eq 1 -and $footer.Count -eq 1)
     $ok = $false

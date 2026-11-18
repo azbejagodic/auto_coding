@@ -36,7 +36,7 @@ from auto_coding.launch_preflight import validate_feature_branch, configured_pro
 from auto_coding.sensitive_paths import is_sensitive_path, changed_paths, CHANGE_PATH_OPTIONS
 from auto_coding.final_verification import verification_policy, policy_sha256, unittest_evidence
 from auto_coding import plan_audit
-from auto_coding import controller_test_sandbox, stop_control
+from auto_coding import controller_test_sandbox, windows_sandbox, stop_control
 
 
 MAX_PLAN = 512 * 1024
@@ -1834,11 +1834,21 @@ def bind_verification(state, manifest, requested, controller_tests, *, resume):
         raise PilotError("Verification settings differ from the saved run manifest")
     state.update(final_verification=policy, controller_tests=mode)
     manifest.update(verification_policy_sha256=digest, controller_tests=mode)
+    # Operator-only experimental opt-in. Existing/legacy workflows remain MXC;
+    # a plan or target file cannot select an execution backend or switch on resume.
+    requested_backend = os.environ.get(windows_sandbox.BACKEND_ENV)
+    backend = state.get("final_test_backend", "mxc") if resume else (requested_backend or "mxc")
+    if (backend not in {"mxc", "windows-sandbox"}
+            or requested_backend not in (None, backend)
+            or manifest.get("final_test_backend", backend) != backend):
+        raise PilotError("Final test backend is invalid or differs from the saved run; it is fixed for this workflow")
+    state["final_test_backend"] = manifest["final_test_backend"] = backend
 
 
 def final_evidence_valid(repo, logs, state):
     saved, policy = state.get("final_verification_result"), state["final_verification"]
     if (not isinstance(saved, dict) or saved.get("status") != "passed"
+            or saved.get("backend", "mxc") != state.get("final_test_backend", "mxc")
             or saved.get("head") != head(repo) or saved.get("branch") != state["branch"]
             or saved.get("plan_sha256") != state["plan_sha256"]
             or saved.get("policy_sha256") != policy_sha256(policy)
@@ -1860,6 +1870,15 @@ def final_evidence_valid(repo, logs, state):
         if (len(data) > MAX_CAPTURE_BYTES or hashlib.sha256(data).hexdigest() != item.get("output_sha256")
                 or not summary or not summary["successful"] or summary["skipped"] or summary["tests"] < 1):
             return False
+        if state.get("final_test_backend") == "windows-sandbox":
+            try:
+                original = windows_sandbox.saved_evidence(logs, item.get("windows_sandbox"),
+                    head=saved["head"], branch=state["branch"], policy=policy, index=index,
+                    run_id=state["run_id"], invocation=saved["invocation"])
+                if original != data.decode("utf-8"):
+                    return False
+            except (OSError, ValueError, TypeError, KeyError):
+                return False
         count += summary["tests"]
     return count >= policy["minimum_tests"] and git_clean(repo)
 
@@ -1871,6 +1890,8 @@ def final_verification(repo, logs, state, state_path, events, execute, tasks):
     require_run_branch(repo, state["branch"])
     if state["completed"] != [task["id"] for task in tasks] or not git_clean(repo):
         raise PilotError("Final verification requires every approved checkpoint and a clean worktree")
+    if state.get("final_test_backend") == "windows-sandbox" and head(repo) != expected_run_head(state, state):
+        raise PilotError("Windows Sandbox source must be the final approved session checkpoint")
     previous = state.get("final_verification_result")
     if isinstance(previous, dict) and previous.get("status") == "running":
         stop_uncertain_saved_process(state, "Interrupted final test execution lacks confirmed cleanup; inspect process ownership")
@@ -1885,11 +1906,12 @@ def final_verification(repo, logs, state, state_path, events, execute, tasks):
         raise PilotError("Final verification artifacts exist without matching invocation ownership; inspect before execution")
     snapshot = head(repo)
     saved = {"status": "prepared", "invocation": ordinal, "head": snapshot, "branch": state["branch"],
-             "plan_sha256": state["plan_sha256"], "policy_sha256": policy_sha256(policy), "tests": []}
+             "plan_sha256": state["plan_sha256"], "policy_sha256": policy_sha256(policy), "tests": [],
+             "backend": state.get("final_test_backend", "mxc")}
     state.update(final_verification_result=saved, final_verification_invocations=ordinal, status="stopped")
     save_json(state_path, state)
     events.emit("controller", "final_verification_started", "started", metadata={"head": snapshot, "invocation": ordinal,
-                "timeout_seconds": policy["timeout_seconds"], "minimum_tests": policy["minimum_tests"]})
+                "timeout_seconds": policy["timeout_seconds"], "minimum_tests": policy["minimum_tests"], "backend": saved['backend']})
     count = 0
     def stop(reason):
         saved.update(status="failed", outcome=reason)
@@ -1916,7 +1938,12 @@ def final_verification(repo, logs, state, state_path, events, execute, tasks):
         save_json(state_path, state)
         started = _execution_clock()
         try:
-            result = execute_controller_test(execute, command, repo, logs, policy["timeout_seconds"], child_environment)
+            if saved["backend"] == "windows-sandbox":
+                result = windows_sandbox.run(command, repo, logs, policy["timeout_seconds"], git=git,
+                    expected_head=snapshot, expected_branch=state["branch"], policy=policy, index=index,
+                    session_run_id=state["run_id"], invocation=ordinal, environment=child_environment)
+            else:
+                result = execute_controller_test(execute, command, repo, logs, policy["timeout_seconds"], child_environment)
         except BaseException as exc:
             cleanup = getattr(exc, "cleanup_confirmed", None)
             if cleanup is True or (cleanup is None and getattr(exc, "process_started", None) is False):
@@ -1949,6 +1976,8 @@ def final_verification(repo, logs, state, state_path, events, execute, tasks):
         summary = unittest_evidence(output)
         item = {"index": index, "output": name, "output_sha256": hashlib.sha256((logs / name).read_bytes()).hexdigest(),
                 "exit_code": code, "timed_out": timed, "cleanup_confirmed": not uncertain, "summary": summary}
+        if saved["backend"] == "windows-sandbox":
+            item["windows_sandbox"] = getattr(result, "windows_sandbox", None)
         saved["tests"].append(item)
         save_json(state_path, state)
         events.emit("tests", "test_finished", "cleanup_unverified" if uncertain else (

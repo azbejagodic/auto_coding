@@ -1,9 +1,10 @@
 param(
-    [ValidateSet('Smoke', 'Baseline145')][string]$Mode = 'Smoke',
+    [ValidateSet('Smoke', 'Baseline145', 'Session')][string]$Mode = 'Smoke',
     [ValidateRange(1, 300)][int]$ResultTimeoutSeconds = 60,
-    [ValidateRange(1, 1800)][int]$SuiteTimeoutSeconds = 900,
-    [ValidateRange(1, 5400)][int]$OverallTimeoutSeconds = 3600,
-    [string]$SourceDirectory = $PSScriptRoot
+    [ValidateRange(1, 86400)][int]$SuiteTimeoutSeconds = 900,
+    [ValidateRange(1, 90000)][int]$OverallTimeoutSeconds = 3600,
+    [string]$SourceDirectory = $PSScriptRoot,
+    [string]$RequestPath
 )
 $ErrorActionPreference = 'Stop'
 . ([scriptblock]::Create([IO.File]::ReadAllText((Join-Path $SourceDirectory 'common.ps1'))))
@@ -13,6 +14,22 @@ $runId = [guid]::NewGuid().ToString()
 $requestedId = [guid]::NewGuid().ToString()
 $runsFolder = if ($Mode -eq 'Smoke') { 'Phase2POC' } else { 'Phase3Runs' }
 $root = Join-Path (Join-Path $toolsRoot $runsFolder) $runId
+if ($Mode -eq 'Session') {
+    $request = Get-Content -LiteralPath $RequestPath -Raw | ConvertFrom-Json
+    $runId = ([guid]$request.runId).ToString()
+    $requestedId = ([guid]$request.sandboxId).ToString()
+    if ($runId -cne $request.runId -or $requestedId -cne $request.sandboxId -or
+        $request.sourceCommit -notmatch '^[0-9a-f]{40}([0-9a-f]{24})?$' -or
+        [string]::IsNullOrWhiteSpace($request.sourceBranch) -or $request.policy.timeout_seconds -lt 30 -or
+        $request.policy.timeout_seconds -gt 86400 -or $request.suiteIndex -lt 1 -or
+        $request.suiteIndex -gt @($request.policy.test_commands).Count -or @($request.command).Count -lt 1) {
+        throw 'Invalid controller session request.'
+    }
+    $root = Split-Path -Parent (Resolve-Path -LiteralPath $RequestPath).Path
+    $sourceCommit = $request.sourceCommit
+    $SuiteTimeoutSeconds = [int]$request.policy.timeout_seconds
+    $OverallTimeoutSeconds = $SuiteTimeoutSeconds + 300
+}
 $inputDir = Join-Path $root 'input'
 $resultsDir = Join-Path $root 'results'
 $ownedId = $null
@@ -22,7 +39,10 @@ $cleanupVerified = $false
 $failure = $null
 $checks = @()
 $baseline = $null
-New-Item -ItemType Directory -Path $inputDir, $resultsDir | Out-Null
+if ($Mode -eq 'Session') {
+    if (Test-Path -LiteralPath $resultsDir) { throw 'Session results directory already exists.' }
+    New-Item -ItemType Directory -Path $resultsDir | Out-Null
+} else { New-Item -ItemType Directory -Path $inputDir, $resultsDir | Out-Null }
 Copy-Item -LiteralPath (Join-Path $SourceDirectory 'guest.ps1') -Destination $inputDir
 $wsbExe = (Get-Command wsb -ErrorAction Stop).Source
 
@@ -70,7 +90,7 @@ try {
         $null = Invoke-Wsb "$verb-help" @($verb, '--help') -TextOutput
     }
     $toolMappings = ''
-    if ($Mode -eq 'Baseline145') {
+    if ($Mode -ne 'Smoke') {
         foreach ($name in @('common.ps1', 'baseline.ps1')) {
             Copy-Item -LiteralPath (Join-Path $SourceDirectory $name) -Destination $inputDir
         }
@@ -89,10 +109,18 @@ try {
         }
         $actualHashes | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root 'tool-hashes.json') -Encoding UTF8
         Copy-Item -LiteralPath $pythonZip -Destination (Join-Path $inputDir 'python.zip')
+        if ($Mode -eq 'Baseline145') {
         $archive = Invoke-BoundedProcess -Executable (Get-Command git).Source `
             -Arguments @('archive', '--format=zip', '--output', (Join-Path $inputDir 'baseline.zip'), $sourceCommit) `
             -WorkingDirectory (Split-Path $SourceDirectory | Split-Path) -LogPrefix (Join-Path $root 'source-archive') -TimeoutSeconds 120
         if ($archive.timedOut -or $archive.exitCode -ne 0) { throw 'Baseline git archive failed.' }
+        } else {
+            if (!(Test-Path -LiteralPath (Join-Path $inputDir 'baseline.zip') -PathType Leaf)) { throw 'Missing approved session archive.' }
+            # Only guest-needed fields enter the read-only input mapping.
+            [ordered]@{ sourceBranch = $request.sourceBranch; policySha256 = $request.policySha256;
+                suiteIndex = $request.suiteIndex; command = @($request.command); environment = $request.environment } | ConvertTo-Json -Depth 6 |
+                Set-Content -LiteralPath (Join-Path $inputDir 'session.json') -Encoding UTF8
+        }
         $gitXml = [Security.SecurityElement]::Escape($gitRoot)
         $nodeXml = [Security.SecurityElement]::Escape($nodeRoot)
         $toolMappings = "<MappedFolder><HostFolder>$gitXml</HostFolder><SandboxFolder>C:\ACGit</SandboxFolder><ReadOnly>true</ReadOnly></MappedFolder><MappedFolder><HostFolder>$nodeXml</HostFolder><SandboxFolder>C:\ACNode</SandboxFolder><ReadOnly>true</ReadOnly></MappedFolder>"
@@ -120,6 +148,9 @@ try {
 "@
     $xml | Set-Content -LiteralPath (Join-Path $root 'sandbox.wsb') -Encoding UTF8
     $launchAttempted = $true
+    [ordered]@{ runId = $runId; sandboxId = $requestedId } | ConvertTo-Json |
+        Set-Content -LiteralPath (Join-Path $root 'launch-attempt.json.tmp') -Encoding UTF8
+    Move-Item -LiteralPath (Join-Path $root 'launch-attempt.json.tmp') -Destination (Join-Path $root 'launch-attempt.json')
     $launch = Invoke-Wsb 'start' @('start', '--id', $requestedId, '--config', $xml, '--raw') -TimeoutSeconds 180
     # Parse the actual CLI launch schema rather than inferring an ID from a list.
     if ($launch.Id -cne $requestedId) {
@@ -161,7 +192,8 @@ try {
         Write-Host "Guest $case validated: operation exit $($result.operationExitCode), success=$($result.success)"
     } } else {
         $started = [DateTime]::UtcNow
-        $guestCommand = "& ([scriptblock]::Create([IO.File]::ReadAllText('C:\ACSetup\baseline.ps1'))) -RunId '$runId' -SandboxId '$ownedId' -SourceCommit '$sourceCommit' -SuiteTimeoutSeconds $SuiteTimeoutSeconds -OverallTimeoutSeconds $OverallTimeoutSeconds"
+        $sessionFlag = if ($Mode -eq 'Session') { ' -Session' } else { '' }
+        $guestCommand = "& ([scriptblock]::Create([IO.File]::ReadAllText('C:\ACSetup\baseline.ps1'))) -RunId '$runId' -SandboxId '$ownedId' -SourceCommit '$sourceCommit' -SuiteTimeoutSeconds $SuiteTimeoutSeconds -OverallTimeoutSeconds $OverallTimeoutSeconds$sessionFlag"
         $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($guestCommand))
         $execution = Invoke-Wsb 'exec-baseline' @('exec', '--id', $ownedId, '--run-as', 'System', '--command', "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand $encoded", '--raw') -TimeoutSeconds ($OverallTimeoutSeconds + 30)
         $baseline = Wait-Result 'baseline.json'
@@ -177,10 +209,15 @@ try {
         $files = @('test_desktop_ui.py', 'test_dashboard_acceptance.py', 'test_desktop_bridge.py',
             'test_desktop_control.py', 'test_plan_audit.py', 'test_isolated_workspace.py')
         $counts = @(4, 7, 39, 37, 40, 18)
-        if (@($baseline.suites).Count -ne 6) { throw "Not all six suites executed. Guest error: $($baseline.error)" }
+        if ($Mode -eq 'Session') {
+            $files = @("session-suite-$($request.suiteIndex)")
+            if ($baseline.sourceBranch -cne $request.sourceBranch -or $baseline.policySha256 -cne $request.policySha256 -or
+                $baseline.suiteIndex -ne $request.suiteIndex) { throw 'Guest session identity differs from controller request.' }
+        }
+        if (@($baseline.suites).Count -ne $files.Count) { throw "Required suites missing. Guest error: $($baseline.error)" }
         $total = 0
         $previousFinish = [DateTimeOffset]::Parse($baseline.startedUtc)
-        for ($i = 0; $i -lt 6; $i++) {
+        for ($i = 0; $i -lt $files.Count; $i++) {
             $suite = $baseline.suites[$i]
             $file = $files[$i]
             $stdout = Join-Path $resultsDir "$file.stdout.log"
@@ -188,14 +225,19 @@ try {
             foreach ($required in @($stdout, $stderr, (Join-Path $resultsDir "$file.process.json"), (Join-Path $resultsDir "$file.suite.json"))) {
                 if (!(Test-Path -LiteralPath $required -PathType Leaf)) { throw "Missing suite evidence: $required" }
             }
-            $report = Read-UnittestReport ([IO.File]::ReadAllText($stdout) + "`n" + [IO.File]::ReadAllText($stderr))
+            $report = Read-UnittestReport ([IO.File]::ReadAllText($stdout) + "`n" + [IO.File]::ReadAllText($stderr)) -LastSummary:($Mode -eq 'Session')
             $p = $suite.process
             $metadata = Get-Content -LiteralPath (Join-Path $resultsDir "$file.process.json") -Raw | ConvertFrom-Json
             $savedSuite = Get-Content -LiteralPath (Join-Path $resultsDir "$file.suite.json") -Raw | ConvertFrom-Json
             $expectedArgs = @('-m', 'unittest', 'discover', '-s', 'tests', '-p', $file, '-v')
+            $expectedExe = 'C:\Python313Embed\python.exe'
+            if ($Mode -eq 'Session') {
+                $expectedExe = $request.command[0]
+                $expectedArgs = @($request.command | Select-Object -Skip 1)
+            }
             if (($metadata | ConvertTo-Json -Depth 6 -Compress) -cne ($p | ConvertTo-Json -Depth 6 -Compress) -or
                 ($savedSuite | ConvertTo-Json -Depth 7 -Compress) -cne ($suite | ConvertTo-Json -Depth 7 -Compress) -or
-                $suite.file -cne $file -or $p.executable -cne 'C:\Python313Embed\python.exe' -or
+                $suite.file -cne $file -or $p.executable -cne $expectedExe -or
                 ($p.arguments | ConvertTo-Json -Compress) -cne ($expectedArgs | ConvertTo-Json -Compress) -or
                 $p.workingDirectory -cne 'C:\AutoCodingTest' -or $p.stdout -cne "C:\ACResults\$file.stdout.log" -or
                 $p.stderr -cne "C:\ACResults\$file.stderr.log" -or $p.exitCode -isnot [int] -or $p.exitCode -ne 0 -or
@@ -207,7 +249,7 @@ try {
             foreach ($field in @('tests', 'failures', 'errors', 'skips')) {
                 if ($suite.$field -isnot [int] -or $suite.$field -ne $report.$field) { throw "Contradictory $field for $file" }
             }
-            if ($report.tests -ne $counts[$i] -or $report.failures -ne 0 -or $report.errors -ne 0 -or $report.skips -ne 0) {
+            if (($Mode -eq 'Baseline145' -and $report.tests -ne $counts[$i]) -or $report.tests -lt 1 -or $report.failures -ne 0 -or $report.errors -ne 0 -or $report.skips -ne 0) {
                 throw "Suite count or failure mismatch: $file"
             }
             $previousFinish = [DateTimeOffset]::Parse($p.finishedUtc)
@@ -215,7 +257,7 @@ try {
             $checks += [ordered]@{ file = $file; tests = $report.tests; exitCode = $p.exitCode;
                 failures = $report.failures; errors = $report.errors; skips = $report.skips; status = 'PASS' }
         }
-        if ($total -ne 145 -or $baseline.totalTests -isnot [int] -or $baseline.totalTests -ne $total -or
+        if (($Mode -eq 'Baseline145' -and $total -ne 145) -or $baseline.totalTests -isnot [int] -or $baseline.totalTests -ne $total -or
             $baseline.success -isnot [bool] -or !$baseline.success -or $null -ne $baseline.error -or $execution.ExitCode -ne 0) {
             throw "Baseline failed: $($baseline.error)"
         }

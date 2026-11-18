@@ -91,3 +91,45 @@ apply. After successful reconciliation, an explicitly resumed cooperative stop i
 acknowledged in saved state and the timeline; `stop-request-*.json` remains in the
 external run directory. Resume never repeats the plan audit. Uncertain execution
 or cleanup continues to block resume.
+
+## Experimental Windows Sandbox final verification (Phase 4 Batch 1)
+
+The existing MXC tester remains intact and is the default. An operator may
+explicitly select the experimental Phase 3 Windows Sandbox mechanism for the
+mandatory end-of-session final gate:
+
+```powershell
+$env:AUTOCODING_FINAL_TEST_BACKEND = 'windows-sandbox'
+# Run the normal audit/start workflow with its approved plan and final policy.
+```
+
+This setting is operator-controlled, cannot be supplied by a plan, and is saved
+in state and the run manifest. Resume retains that selection; an explicit attempt
+to change it is rejected. Unset it before creating a new default/MXC workflow.
+The approval, feature-branch, clean-worktree, checkpoint, process-safety, policy,
+coverage, evidence and recovery gates remain required. Focused tests and the old
+tester are unchanged; there is no fallback to MXC or the historical baseline
+when an experimental final test fails.
+
+The final gate packages the current approved session commit from committed Git
+blobs, avoiding working-tree files, credentials, links, submodules, checkout
+filters and export rewriting. Each policy command receives a fresh disposable
+Sandbox, preserving the existing per-suite process gate and fail-fast/resume
+semantics. Original argv and policy are recorded; source-relative absolute paths
+and the controller Python executable are relocated into the guest. Standard
+Python aliases use the verified offline Python. Required tools/dependencies must
+already exist in the source or offline environment; nothing is downloaded.
+
+Original streams, native exit codes, timeouts, source/branch/policy identities,
+owned IDs and verified cleanup are retained in `windows-sandbox-<uuid>` folders
+inside the normal external session logs. Existing final evidence filenames and
+output hashes are preserved. Cached successful Windows Sandbox results also
+require their original receipt and logs to validate again.
+
+This is **not a production cutover**. The guest runs as SYSTEM against a writable
+disposable copy with network disabled and read-only input/tool mappings. Results
+are guest-reported evidence, not attestation; protected SHA-256 before/after
+qualification remains Batch 2. Source-object capture currently has the existing
+16 MiB process-output bound. Fixed offline tool paths are specific to this machine.
+See [runner instructions](tools/windows_sandbox_poc/README.md) for deadlines,
+evidence and interruption limits. No UI03 or dashboard integration is included.

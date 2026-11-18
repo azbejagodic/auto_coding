@@ -1,4 +1,4 @@
-# Windows Sandbox: Smoke and Baseline145
+# Windows Sandbox: Smoke, Baseline145 and controller Session
 
 Run from `C:\Users\HP\Desktop\auto_coding` in host PowerShell:
 
@@ -117,5 +117,58 @@ evidence fails. Exit 0 means the complete proof passed; exit 1 means failure.
 Early failed diagnostic runs are preserved.
 
 Mapped-folder evidence is guest reported, not cryptographic attestation. Forced
-process termination cannot guarantee normal cleanup. This implements only Phase 3:
-no source-integrity feature, UI03, dashboard integration or backend replacement.
+process termination cannot guarantee normal cleanup. Smoke/Baseline145 remain
+standalone regression modes; neither substitutes for testing a session output.
+
+## Phase 4 Batch 1: controller Session mode
+
+The experimental adapter in `src/auto_coding/windows_sandbox.py` invokes this same
+runner as `-Mode Session -RequestPath <external-run-folder>\request.json`.
+Do not hand-author session requests to bypass controller approvals. Select this
+mode through the operator-only `AUTOCODING_FINAL_TEST_BACKEND=windows-sandbox`
+setting before creating a normal approved workflow; MXC remains the default.
+
+The controller's existing final-verification loop supplies the exact approved
+HEAD/branch, full normalized policy, suite index, invocation and session run ID.
+The adapter reads the commit's regular blobs into `input\baseline.zip`; this
+filename is retained for compatibility, but its contents are the session commit.
+Git filters/export attributes cannot change the package. Sensitive names, links,
+submodules, dirty/stale source and unsupported host command paths fail closed.
+The live checkout and Git metadata are never mapped. Session source-object capture
+is bounded by the existing 16 MiB process-output limit. There is no fallback to
+the historical Phase 3 source or to a different backend after failure.
+
+Each required command gets one fresh Sandbox and the same offline setup. This
+preserves per-suite controller events, safety gates, failure handling and resume.
+Commands are argv arrays, never concatenated shell strings. Python aliases and the
+controller interpreter use `C:\Python313Embed\python.exe`; source paths relocate
+to `C:\AutoCodingTest`. Other required commands run with the offline guest PATH;
+missing dependencies/tools fail. Final evidence still requires actual unittest
+summaries. Runtime settings retain the existing non-secret allowlist, source-local
+imports relocate, and config/temp directories are guest-local. Host PATH, home,
+Git configuration, credentials and unrelated directories are never copied.
+
+The existing policy defines per-command timeout and combined minimum coverage,
+not exact per-suite counts. Session mode runs its selected command with that
+timeout (30..86400 seconds), allows 300 additional seconds for guest preparation,
+and bounds CLI exec to that total plus 30 seconds. Other CLI deadlines are as
+above. The adapter has a final outer bound of command timeout plus 1500 seconds,
+covering launch/setup/CLI/cleanup budgets. A killed host wrapper triggers an
+exact-ID stop/list attempt using its host-owned atomic launch marker. Unverified
+guest or host-process cleanup retains the controller's existing uncertainty gate.
+Forced machine or controller termination can still interrupt cleanup.
+
+Request, inputs, original guest stdout/stderr, CLI host exits, CLI-reported guest
+exits, process metadata, `results\baseline.json`, `summary.json`, and adapter
+streams remain under the normal session logs in `windows-sandbox-<uuid>`.
+Host receipts remain outside the writable guest results mapping. Existing
+`final-verification-NNNN-test-N.txt` artifacts and output hashes are retained.
+The Python host reparses suite logs and compares command, source/policy identity,
+counts, timestamps, exits and cleanup; cached results require revalidation too.
+Ordinary test exits, skips, timeouts, launch errors and malformed evidence cannot
+authorize completion. The controller enforces the combined policy minimum only
+after every required suite passes. Overall guest exit and CLI JSON must agree;
+a native host CLI exit of 0 is insufficient.
+
+Batch 1 remains experimental. No protected before/after source manifest, UI03,
+dashboard integration, dependency removal, or production cutover is implemented.
