@@ -36,7 +36,7 @@ from auto_coding.launch_preflight import validate_feature_branch, configured_pro
 from auto_coding.sensitive_paths import is_sensitive_path, changed_paths, CHANGE_PATH_OPTIONS
 from auto_coding.final_verification import verification_policy, policy_sha256, unittest_evidence
 from auto_coding import plan_audit
-from auto_coding import controller_test_sandbox, windows_sandbox, stop_control
+from auto_coding import controller_test_sandbox, windows_sandbox, source_integrity, stop_control
 
 
 MAX_PLAN = 512 * 1024
@@ -1871,10 +1871,12 @@ def final_evidence_valid(repo, logs, state):
                 or not summary or not summary["successful"] or summary["skipped"] or summary["tests"] < 1):
             return False
         if state.get("final_test_backend") == "windows-sandbox":
+            if not source_integrity.valid_verdict(item.get('source_integrity')):
+                return False
             try:
                 original = windows_sandbox.saved_evidence(logs, item.get("windows_sandbox"),
                     head=saved["head"], branch=state["branch"], policy=policy, index=index,
-                    run_id=state["run_id"], invocation=saved["invocation"])
+                    run_id=state["run_id"], invocation=saved["invocation"], integrity_verdict=item['source_integrity'])
                 if original != data.decode("utf-8"):
                     return False
             except (OSError, ValueError, TypeError, KeyError):
@@ -1978,6 +1980,7 @@ def final_verification(repo, logs, state, state_path, events, execute, tasks):
                 "exit_code": code, "timed_out": timed, "cleanup_confirmed": not uncertain, "summary": summary}
         if saved["backend"] == "windows-sandbox":
             item["windows_sandbox"] = getattr(result, "windows_sandbox", None)
+            item['source_integrity'] = getattr(result, 'source_integrity', None)
         saved["tests"].append(item)
         save_json(state_path, state)
         events.emit("tests", "test_finished", "cleanup_unverified" if uncertain else (
@@ -1990,6 +1993,8 @@ def final_verification(repo, logs, state, state_path, events, execute, tasks):
             return False
         if timed or code in (125, 127):
             return stop("infrastructure_timeout" if timed else "infrastructure_process_failure")
+        if saved['backend'] == 'windows-sandbox' and not source_integrity.valid_verdict(item.get('source_integrity')):
+            return stop('source_integrity_failure')
         if code != 0:
             missing_dependency = "ModuleNotFoundError:" in output or "_FailedTest" in output
             return stop("test_failure" if summary and summary["failed"] and not missing_dependency else "infrastructure_failure")

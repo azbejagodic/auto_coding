@@ -22,7 +22,8 @@ if ($Mode -eq 'Session') {
         $request.sourceCommit -notmatch '^[0-9a-f]{40}([0-9a-f]{24})?$' -or
         [string]::IsNullOrWhiteSpace($request.sourceBranch) -or $request.policy.timeout_seconds -lt 30 -or
         $request.policy.timeout_seconds -gt 86400 -or $request.suiteIndex -lt 1 -or
-        $request.suiteIndex -gt @($request.policy.test_commands).Count -or @($request.command).Count -lt 1) {
+        $request.suiteIndex -gt @($request.policy.test_commands).Count -or @($request.command).Count -lt 1 -or
+        $request.sourceIntegrity.schemaVersion -ne 1 -or $request.sourceIntegrity.baselineSha256 -cnotmatch '^[0-9a-f]{64}$') {
         throw 'Invalid controller session request.'
     }
     $root = Split-Path -Parent (Resolve-Path -LiteralPath $RequestPath).Path
@@ -118,7 +119,8 @@ try {
             if (!(Test-Path -LiteralPath (Join-Path $inputDir 'baseline.zip') -PathType Leaf)) { throw 'Missing approved session archive.' }
             # Only guest-needed fields enter the read-only input mapping.
             [ordered]@{ sourceBranch = $request.sourceBranch; policySha256 = $request.policySha256;
-                suiteIndex = $request.suiteIndex; command = @($request.command); environment = $request.environment } | ConvertTo-Json -Depth 6 |
+                suiteIndex = $request.suiteIndex; command = @($request.command); environment = $request.environment;
+                sourceIntegrity = $request.sourceIntegrity } | ConvertTo-Json -Depth 6 |
                 Set-Content -LiteralPath (Join-Path $inputDir 'session.json') -Encoding UTF8
         }
         $gitXml = [Security.SecurityElement]::Escape($gitRoot)
@@ -197,6 +199,12 @@ try {
         $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($guestCommand))
         $execution = Invoke-Wsb 'exec-baseline' @('exec', '--id', $ownedId, '--run-as', 'System', '--command', "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand $encoded", '--raw') -TimeoutSeconds ($OverallTimeoutSeconds + 30)
         $baseline = Wait-Result 'baseline.json'
+        if ($Mode -eq 'Session' -and ($baseline.sourceIntegrity.schemaVersion -ne 1 -or
+            $baseline.sourceIntegrity.baselineSha256 -cne $request.sourceIntegrity.baselineSha256 -or
+            $baseline.sourceIntegrity.pre.complete -ne $true -or $baseline.sourceIntegrity.pre.matchesBaseline -ne $true -or
+            $baseline.sourceIntegrity.post.complete -ne $true -or $baseline.sourceIntegrity.post.matchesBaseline -ne $true)) {
+            throw 'Session pre/post source integrity did not pass.'
+        }
         if ($execution.ExitCode -isnot [int] -or $baseline.operationExitCode -isnot [int] -or
             $execution.ExitCode -ne $baseline.operationExitCode) { throw 'CLI and guest execution status missing or contradictory.' }
         if ($baseline.runId -cne $runId -or $baseline.sandboxId -cne $ownedId -or $baseline.sourceCommit -cne $sourceCommit -or

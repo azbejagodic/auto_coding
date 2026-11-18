@@ -10,9 +10,17 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from auto_coding import simple_run as runner, windows_sandbox as sandbox
+from auto_coding import simple_run as runner, windows_sandbox as sandbox, source_integrity as integrity
 import test_final_verification as fixtures
 from test_final_verification import Executor, POLICY, PASSED
+
+
+def verified_result(code=0, output=PASSED, timed=False, clean=True, started=True):
+    result = runner._CallResult(code, output, timed, clean, started)
+    result.source_integrity = {'schemaVersion':1,'baselineSha256':'a' * 64,'verified':True,'hostPackageVerified':True,
+        'observations':{stage:{'complete':True,'matchesBaseline':True,'fileCount':1,
+            'differences':{'added':[],'deleted':[],'modified':[]}} for stage in ('pre','post')}}
+    return result
 
 
 class ControllerIntegrationTests(unittest.TestCase):
@@ -40,7 +48,7 @@ class ControllerIntegrationTests(unittest.TestCase):
             self.assertEqual(self.state()['history'][0]['review']['decision'], 'APPROVED')
             self.assertEqual(self.state()['completed'], ['one'])
             self.assertEqual(self.git('status', '--porcelain'), '')
-            result = runner._CallResult(0, PASSED, False, True, True)
+            result = verified_result()
             result.windows_sandbox = 'fixture-receipt'
             return result
         fake = Executor()
@@ -56,7 +64,7 @@ class ControllerIntegrationTests(unittest.TestCase):
     def test_all_approved_commands_propagate_with_combined_minimum(self):
         self.document['final_verification'] = POLICY | {'test_commands': [['suite-one'], ['suite-two']], 'minimum_tests': 4}
         self.write_plan()
-        with self.selected(), patch.object(sandbox, 'run', return_value=runner._CallResult(0, PASSED, False, True, True)) as run:
+        with self.selected(), patch.object(sandbox, 'run', return_value=verified_result()) as run:
             self.assertEqual(self.run_fake(Executor()), 0)
         self.assertEqual([call.args[0] for call in run.call_args_list], [['suite-one'], ['suite-two']])
         self.assertEqual([call.kwargs['index'] for call in run.call_args_list], [1, 2])
@@ -91,10 +99,34 @@ class ControllerIntegrationTests(unittest.TestCase):
             self.run_fake(Executor(), resume=True)
 
     def test_saved_windows_evidence_is_required_for_reuse(self):
-        with self.selected(), patch.object(sandbox, 'run', return_value=runner._CallResult(0, PASSED, False, True, True)):
+        with self.selected(), patch.object(sandbox, 'run', return_value=verified_result()):
             self.assertEqual(self.run_fake(Executor()), 0)
         with patch.object(sandbox, 'saved_evidence', side_effect=ValueError('Missing logs')):
             self.assertFalse(runner.final_evidence_valid(self.repo, self.logs, self.state()))
+
+    def test_passing_tests_cannot_override_failed_source_integrity(self):
+        result = verified_result()
+        result.source_integrity['verified'] = False
+        with self.selected(), patch.object(sandbox, 'run', return_value=result):
+            self.assertEqual(self.run_fake(Executor()), 1)
+        final = self.state()['final_verification_result']
+        self.assertEqual(final['outcome'], 'source_integrity_failure')
+        self.assertTrue(final['tests'][0]['summary']['successful'])
+
+    def test_batch1_saved_evidence_without_integrity_cannot_be_reused(self):
+        with self.selected(), patch.object(sandbox, 'run', return_value=verified_result()):
+            self.assertEqual(self.run_fake(Executor()), 0)
+        state = self.state()
+        del state['final_verification_result']['tests'][0]['source_integrity']
+        self.assertFalse(runner.final_evidence_valid(self.repo, self.logs, state))
+
+    def test_failed_tests_cannot_be_overridden_by_passing_integrity(self):
+        result = verified_result(1, fixtures.FAILED)
+        with self.selected(), patch.object(sandbox, 'run', return_value=result):
+            self.assertEqual(self.run_fake(Executor()), 1)
+        final = self.state()['final_verification_result']
+        self.assertEqual(final['outcome'], 'test_failure')
+        self.assertTrue(final['tests'][0]['source_integrity']['verified'])
 
 
 class AdapterTests(unittest.TestCase):
@@ -144,6 +176,33 @@ class AdapterTests(unittest.TestCase):
         result.update(disposableCommit='d' * 40, computerName='GUEST', account='NT AUTHORITY\\SYSTEM',
             versions={'git':'git version 2.53.0.windows.4','python':'Python 3.13.17','node':'v26.13.1'},
             startedUtc=now, finishedUtc=now, suites=[suite], totalTests=2, success=True, operationExitCode=0, error=None)
+        (root / 'input').mkdir(exist_ok=True)
+        manifest_path = root / 'source-baseline.json'
+        if manifest_path.exists():
+            manifest = integrity.load(manifest_path)
+        else:
+            manifest = integrity.baseline(request, [integrity.file_record('app.py', b'VALUE = 2\n')])
+            manifest_path.write_bytes(integrity.canonical(manifest))
+        request['sourceIntegrity'] = {'schemaVersion':1,'baselineSha256':integrity.digest(manifest)}
+        (root / 'input/source-baseline.json').write_bytes(integrity.canonical(manifest))
+        if not (root / 'input/baseline.zip').exists():
+            with sandbox.zipfile.ZipFile(root / 'input/baseline.zip', 'w') as package:
+                package.writestr('app.py', b'VALUE = 2\n')
+        result['sourceIntegrity'] = dict(request['sourceIntegrity'])
+        for stage in ('pre','post'):
+            observation = {'schemaVersion':1,'kind':'source-observation','stage':stage,'identity':manifest['identity'],
+                'baselineSha256':integrity.digest(manifest),'complete':True,'files':manifest['files'],
+                'fileCount':manifest['fileCount'],'totalBytes':manifest['totalBytes'],'excluded':[],
+                'matchesBaseline':True,'differences':{'added':[],'deleted':[],'modified':[]},
+                'startedUtc':now,'finishedUtc':now,'error':None}
+            self.write(root / 'results' / f'integrity-{stage}.json', observation)
+            self.write(root / 'results' / f'integrity-{stage}-hash.process.json', {'exitCode':0,'timedOut':False,
+                'executable':r'C:\Python313Embed\python.exe','arguments':integrity.worker_arguments(stage, integrity.digest(manifest)),
+                'workingDirectory':sandbox.GUEST,'timeoutSeconds':120,'startedUtc':now,'finishedUtc':now,
+                'stdout':rf'C:\ACResults\integrity-{stage}-hash.stdout.log','stderr':rf'C:\ACResults\integrity-{stage}-hash.stderr.log'})
+            for stream in ('stdout','stderr'):
+                (root / 'results' / f'integrity-{stage}-hash.{stream}.log').write_text('')
+            result['sourceIntegrity'][stage] = {'complete':True,'matchesBaseline':True}
         summary = {'outcome':'PASS','mode':'Session','runId':request['runId'],'sandboxId':request['sandboxId'],
             'requestedSandboxId':request['sandboxId'],'baseline':result,'cleanupVerified':True,'failure':None}
         self.write(root / 'request.json', request)
@@ -191,6 +250,14 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(self.git(self.repo, ['status','--porcelain']), '')
         with self.assertRaisesRegex(ValueError, 'hidden working-tree flags'):
             sandbox.package_source(self.repo, self.logs / 'source.zip', self.head, 'feature/session', self.git)
+
+    def test_newly_added_committed_file_has_authoritative_sha256(self):
+        content = b'# newly approved source\n'
+        (self.repo / 'new.py').write_bytes(content)
+        self.commit()
+        head = self.git(self.repo, ['rev-parse','HEAD'])
+        protected = sandbox.package_source(self.repo, self.logs / 'source.zip', head, 'feature/session', self.git)
+        self.assertIn(integrity.file_record('new.py', content), protected)
 
     def test_export_attributes_cannot_omit_approved_source(self):
         (self.repo / '.gitattributes').write_text('app.py export-ignore\n')
@@ -355,6 +422,67 @@ class AdapterTests(unittest.TestCase):
                 self.assertRaises(sandbox.ControllerTestEnvironmentError) as caught:
             self.invoke_adapter(lambda *args, **options: self.fail('Guest must not start'))
         self.assertFalse(caught.exception.cleanup_confirmed)
+
+    def test_missing_pre_or_post_integrity_evidence_rejects_passing_tests(self):
+        for stage in ('pre','post'):
+            self.fixture()
+            (self.logs / 'results' / f'integrity-{stage}.json').unlink()
+            with self.subTest(stage=stage), self.assertRaises(integrity.IntegrityError):
+                sandbox.validate_evidence(self.logs, self.request)
+
+    def test_malformed_and_stale_integrity_records_cannot_pass(self):
+        for change in ('hash','duplicate','truncate','run','unsafe','complete','time'):
+            self.fixture()
+            path = self.logs / 'results/integrity-post.json'
+            value = json.loads(path.read_text())
+            if change == 'hash': value['files'][0]['sha256'] = 'invalid'
+            elif change == 'duplicate': value['files'].append(value['files'][0])
+            elif change == 'truncate': value['files'].clear()
+            elif change == 'run': value['identity']['runId'] = 'older-run'
+            elif change == 'unsafe': value['files'][0]['path'] = '../app.py'
+            elif change == 'complete': value['complete'] = False
+            elif change == 'time': value['startedUtc'] = '2000-01-01T00:00:00Z'
+            self.write(path, value)
+            with self.subTest(change=change), self.assertRaises(integrity.IntegrityError):
+                sandbox.validate_evidence(self.logs, self.request)
+
+    def test_actual_passed_suite_with_post_mutation_returns_failed_integrity(self):
+        summary = self.fixture()
+        path = self.logs / 'results/integrity-post.json'
+        value = json.loads(path.read_text())
+        value['files'][0]['sha256'] = '0' * 64
+        value['matchesBaseline'] = False
+        value['differences']['modified'] = ['app.py']
+        self.write(path, value)
+        worker = self.logs / 'results/integrity-post-hash.process.json'
+        process = json.loads(worker.read_text())
+        process['exitCode'] = 1
+        self.write(worker, process)
+        result = summary['baseline']
+        result.update(success=False, operationExitCode=1, error='Post integrity mismatch')
+        result['sourceIntegrity']['post']['matchesBaseline'] = False
+        summary.update(outcome='FAIL', failure='Post integrity mismatch')
+        self.write(self.logs / 'summary.json', summary)
+        self.write(self.logs / 'results/baseline.json', result)
+        self.write(self.logs / 'exec-baseline.output.txt', {'ExitCode':1})
+        # A guest-selected expected manifest is never consulted.
+        self.write(self.logs / 'results/source-baseline.json', {'files':value['files']})
+        code, output, timed, verdict = sandbox.validate_evidence(self.logs, self.request, require_pass=False)
+        self.assertEqual(code, 0)
+        self.assertIn('OK', output)
+        self.assertFalse(verdict['verified'])
+        with self.assertRaises(ValueError):
+            sandbox.validate_evidence(self.logs, self.request)
+
+    def test_legacy_receipt_and_missing_authoritative_baseline_rejected(self):
+        self.fixture()
+        legacy = copy.deepcopy(self.request)
+        del legacy['sourceIntegrity']
+        with self.assertRaises(integrity.IntegrityError):
+            sandbox.validate_evidence(self.logs, legacy)
+        (self.logs / 'source-baseline.json').unlink()
+        with self.assertRaises(integrity.IntegrityError):
+            sandbox.validate_evidence(self.logs, self.request)
 
 
 if __name__ == '__main__':

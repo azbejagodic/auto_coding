@@ -128,8 +128,37 @@ require their original receipt and logs to validate again.
 
 This is **not a production cutover**. The guest runs as SYSTEM against a writable
 disposable copy with network disabled and read-only input/tool mappings. Results
-are guest-reported evidence, not attestation; protected SHA-256 before/after
-qualification remains Batch 2. Source-object capture currently has the existing
+are guest-reported evidence, not attestation. Batch 2 now requires protected
+host SHA-256 baselines and complete pre/post inventories (see below).
+Source-object capture currently has the existing
 16 MiB process-output bound. Fixed offline tool paths are specific to this machine.
 See [runner instructions](tools/windows_sandbox_poc/README.md) for deadlines,
 evidence and interruption limits. No UI03 or dashboard integration is included.
+
+## Batch 2 source integrity
+
+Windows Sandbox final verification now requires a versioned authoritative
+`source-baseline.json` generated from the approved commit's exact blobs. It stays
+in the host-controlled receipt directory, outside all guest-writable mappings.
+A read-only copy is used by an isolated stdlib hash worker inside the guest.
+The source ZIP is independently compared with the host baseline before launch.
+
+The worker inventories SHA-256, byte size and normalized relative path for every
+protected file before tests and again afterwards. Any changed, added, deleted or
+renamed file, incomplete scan, invalid record, stale identity or missing evidence
+prevents PASS. An initial failure prevents test launch. Passing test output cannot
+override an integrity failure. Only generated root `.git` metadata and untracked,
+CPython-tagged `.pyc` files directly inside `__pycache__` are excluded; tracked files
+are always protected. Other outputs must be written outside the source directory.
+
+The host validates the full inventories against its own baseline and retains
+`integrity-verification.json`; final state records the verdict. Reuse requires
+the baseline, both observations, worker metadata, original suite evidence and the
+matching host verdict. Old Batch 1 receipts without integrity cannot qualify.
+
+The authoritative baseline and package bytes are host-verifiable facts. Post-test
+guest files are not independently exported/rehashed on the host: their inventory,
+timing and process records remain cooperative guest observations. A malicious
+guest can forge those reports. SHA-256 comparison does not provide attestation.
+MXC stays the default; Windows Sandbox remains explicitly selected and experimental.
+Batch 3 qualification and any production-cutover decision remain deferred.

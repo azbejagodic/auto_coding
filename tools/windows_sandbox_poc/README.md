@@ -170,5 +170,76 @@ authorize completion. The controller enforces the combined policy minimum only
 after every required suite passes. Overall guest exit and CLI JSON must agree;
 a native host CLI exit of 0 is insufficient.
 
-Batch 1 remains experimental. No protected before/after source manifest, UI03,
-dashboard integration, dependency removal, or production cutover is implemented.
+Session mode remains experimental. Batch 2 adds the integrity contract below;
+UI03, dashboard integration, dependency removal and production cutover remain excluded.
+
+## Batch 2: protected SHA-256 source inventories
+
+Only integrated Session mode qualifies for this contract. Smoke/Baseline145 remain
+standalone diagnostics; their PASS is not a final-verification integrity result.
+
+The Python adapter builds `source-baseline.json` while packaging exact committed
+Git blobs. This authoritative file is at the receipt root, alongside `request.json`,
+outside the writable `results` mapping. `input/source-baseline.json` is a read-only
+copy; expected hashes are never loaded from a guest-writable results file.
+The host compares every ZIP entry against its baseline before Sandbox launch and
+again when validating the receipt. Archive names and commit comments alone do
+not establish byte identity. No source is read from the live working tree.
+
+Baseline schema v1 has `kind: source-baseline`, `schemaVersion: 1`, `identity`,
+`exclusions`, `files`, `fileCount` and `totalBytes`. Identity binds source commit,
+branch, session run ID, per-Sandbox run/owned ID, invocation, suite index and policy
+SHA-256. Each sorted file record contains exactly `path`, integer `size`, and
+lowercase 64-digit `sha256`. Canonical ASCII JSON with sorted keys determines the
+baseline SHA-256 recorded in the host request. Enumeration order never changes
+the manifest for the same identity. All tracked regular files are included,
+including newly committed source, tests, scripts and configuration. Sensitive
+source paths retain existing packaging restrictions. Traversal, links/reparse
+points, submodules, duplicate/case-aliased paths, non-NFC paths, Windows reserved
+names and file/directory identity conflicts fail closed.
+
+After disposable Git setup, `baseline.ps1` starts the read-only trusted
+`source_integrity.py` using the offline Python with `-I -B`. It cannot import
+target modules via PYTHONPATH. A failed pre-inventory throws before any test
+command. A post-inventory runs in the guest's final cleanup path after testing;
+failure or missing evidence forces overall failure. Each worker has a 120-second
+maximum, capped by the existing guest overall deadline. Existing launch, test,
+transfer, shutdown and outer deadlines still apply. Timeout never implies PASS.
+
+Observation files `results/integrity-pre.json` and `integrity-post.json` contain
+the full sorted inventory, identity, baseline fingerprint, coverage counts,
+explicit exclusions, timestamps, completion/error fields, computed differences
+and matching verdict. Worker commands/exits/raw streams are preserved as
+`integrity-<stage>-hash.process.json`, `.stdout.log` and `.stderr.log`.
+The host reparses records, rejects malformed/truncated/duplicate/stale evidence,
+checks worker execution and stage ordering, and independently recomputes all
+comparisons. `integrity-verification.json` distinguishes the verified host package
+from guest observations. Its verdict is included as `source_integrity` in the
+existing final-test state entry and revalidated on reuse. Legacy Batch 1 receipts
+without this contract cannot authorize a new PASS.
+
+Exclusion policy v1 is fixed, not selected by a plan or guest:
+
+- Root `.git/` metadata created for the disposable repository; links at that root
+  are still rejected. Nested Git directories are not excluded.
+- Untracked `__pycache__/<name>.cpython-<digits>[.opt-<digits>].pyc` files only.
+  A matching file already present in the baseline remains protected.
+
+`.gitignore` rules do not authorize exclusions. Ordinary `.py`, logs, temporary
+files, `.pytest_cache` and other new outputs are unexpected source additions.
+Use the existing guest-local config/temp paths or results mapping for outputs.
+Empty directories are not Git-tracked protected files; inventories protect files.
+
+The guest checks file identity/size/mtime across hashing and ctime within each
+stat API; Windows lstat and fstat expose different ctime semantics. A changing or
+unreadable file fails the scan. A comparison mismatch records added/deleted/
+modified paths. Renames appear as deletion plus addition. Test exit 0 and `OK`
+cannot override a failed integrity verdict: the controller stops with
+`source_integrity_failure`, retains checkpoints and never auto-repairs source.
+
+This is cooperative verification. The host baseline and package are independently
+verifiable; the host cannot independently inspect post-test guest files after
+shutdown. A malicious SYSTEM guest can forge observations or change files after
+the observation point. No attestation or adversarial resistance is claimed.
+Batch 3 must qualify these limits, interruption/recovery and production readiness;
+the old tester remains intact and MXC remains the default.

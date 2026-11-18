@@ -18,6 +18,8 @@ if ($Session) {
     $result.sourceBranch = $sessionRequest.sourceBranch
     $result.policySha256 = $sessionRequest.policySha256
     $result.suiteIndex = $sessionRequest.suiteIndex
+    $result.sourceIntegrity = [ordered]@{ schemaVersion = 1; baselineSha256 = $sessionRequest.sourceIntegrity.baselineSha256;
+        pre = $null; post = $null }
 }
 $env:PATH = "C:\ACGit\cmd;C:\ACNode;C:\Python313Embed;$env:PATH"
 $env:PYTHONPATH = 'C:\AutoCodingTest\src'
@@ -45,6 +47,19 @@ function Run-Setup([string]$Name, [string]$Exe, [string[]]$Argv) {
     if ($p.timedOut -or $p.exitCode -ne 0) { throw "Setup $Name failed: exit=$($p.exitCode), timeout=$($p.timedOut)" }
     return [IO.File]::ReadAllText($p.stdout).Trim()
 }
+function Verify-Source([string]$Stage) {
+    $remaining = [int][Math]::Floor(($deadline - [DateTime]::UtcNow).TotalSeconds)
+    if ($remaining -le 0) { throw 'Overall guest deadline expired before source integrity verification.' }
+    $p = Invoke-BoundedProcess -Executable $python -Arguments @('-I', '-B', 'C:\ACSetup\source_integrity.py',
+        '--root', $workspace, '--baseline', 'C:\ACSetup\source-baseline.json', '--sha256',
+        $sessionRequest.sourceIntegrity.baselineSha256, '--stage', $Stage, '--output', "C:\ACResults\integrity-$Stage.json") `
+        -WorkingDirectory $workspace -LogPrefix "C:\ACResults\integrity-$Stage-hash" -TimeoutSeconds ([Math]::Min(120, $remaining))
+    $observation = Get-Content -LiteralPath "C:\ACResults\integrity-$Stage.json" -Raw | ConvertFrom-Json
+    $result.sourceIntegrity[$Stage] = [ordered]@{ complete = $observation.complete; matchesBaseline = $observation.matchesBaseline }
+    if ($p.timedOut -or $p.exitCode -ne 0 -or $observation.complete -ne $true -or $observation.matchesBaseline -ne $true) {
+        throw "Source integrity $Stage verification failed."
+    }
+}
 try {
     Expand-Archive -LiteralPath 'C:\ACSetup\baseline.zip' -DestinationPath $workspace
     Expand-Archive -LiteralPath 'C:\ACSetup\python.zip' -DestinationPath 'C:\Python313Embed'
@@ -63,6 +78,7 @@ try {
     $result.disposableCommit = Run-Setup 'head' $git @('rev-parse', 'HEAD')
     $status = Run-Setup 'status' $git @('status', '--porcelain=v1')
     if ($status) { throw 'Disposable repository is not initially clean.' }
+    if ($Session) { Verify-Source 'pre' }
     $files = @('test_desktop_ui.py', 'test_dashboard_acceptance.py', 'test_desktop_bridge.py',
         'test_desktop_control.py', 'test_plan_audit.py', 'test_isolated_workspace.py')
     if ($Session) { $files = @("session-suite-$($sessionRequest.suiteIndex)") }
@@ -97,6 +113,13 @@ try {
 } catch {
     $result.error = $_.Exception.ToString() + "`n" + $_.ScriptStackTrace
 } finally {
+    if ($Session -and $result.sourceIntegrity.pre.matchesBaseline -eq $true) {
+        try { Verify-Source 'post' } catch {
+            $result.success = $false
+            $result.operationExitCode = 1
+            $result.error = "$($result.error) Source integrity post verification failed: $($_.Exception.Message)"
+        }
+    }
     $result.finishedUtc = [DateTime]::UtcNow.ToString('o')
     $result | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath 'C:\ACResults\baseline.json.tmp' -Encoding UTF8
     Move-Item -LiteralPath 'C:\ACResults\baseline.json.tmp' -Destination 'C:\ACResults\baseline.json'

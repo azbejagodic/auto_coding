@@ -1,7 +1,7 @@
 """Experimental final-only adapter for the Phase 3 Windows Sandbox runner.
 
-MXC remains the default. No target code runs on the host. Committed Git objects
-qualify packaging only; protected before/after source attestation is not provided.
+MXC remains the default. No target code runs on the host. Host SHA-256 baselines
+qualify packaging and cooperative guest inventories, not malicious-guest attestation.
 """
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ from auto_coding.final_verification import verification_policy, policy_sha256, u
 from auto_coding.process_runner import bounded_run, MAX_CAPTURE_BYTES
 from auto_coding.sensitive_paths import is_sensitive_path
 from auto_coding.python_environment import test_environment
+from auto_coding import source_integrity
 
 
 BACKEND_ENV = "AUTOCODING_FINAL_TEST_BACKEND"
@@ -45,7 +46,7 @@ def _json(path):
     _regular(path)
     if path.stat().st_size > 1024 * 1024:
         raise ValueError("Oversized Sandbox JSON evidence")
-    value = json.loads(path.read_text(encoding="utf-8-sig"))
+    value = json.loads(path.read_text(encoding="utf-8-sig"), object_pairs_hook=source_integrity._pairs)
     if not isinstance(value, dict):
         raise ValueError("Sandbox evidence must be an object")
     return value
@@ -83,12 +84,12 @@ def package_source(repo, destination, head, branch, git):
     """Package committed blobs, bypassing checkout filters and export attributes."""
     _identity(repo, git, head, branch)
     entries = git(repo, ["--no-replace-objects", "ls-tree", "-rz", "--full-tree", head])
-    files, seen = {}, set()
+    files, seen, protected = {}, set(), []
     for entry in entries.rstrip("\0").split("\0"):
         match = re.fullmatch(r"(100644|100755) blob ([0-9a-f]{40,64})\t(.+)", entry)
         if not match:
             raise ValueError("Snapshot requires regular committed files; links/submodules unsupported")
-        name = match[3]
+        name = source_integrity.safe_path(match[3])
         parts = PurePosixPath(name).parts
         if (not parts or name.startswith("/") or "\\" in name or ":" in name
                 or any(ord(c) < 32 for c in name) or is_sensitive_path(name)
@@ -128,9 +129,11 @@ def package_source(repo, destination, head, branch, git):
                 raise ValueError('Incomplete committed source bytes')
             offset += 1
             archive.writestr(name, contents)
+            protected.append(source_integrity.file_record(name, contents))
         if offset != len(data):
             raise ValueError('Unexpected Git object output')
     _identity(repo, git, head, branch)
+    return source_integrity.records(protected)
 
 
 def guest_command(command, repo):
@@ -203,6 +206,7 @@ def validate_evidence(root, request, *, require_pass=True):
         raise ValueError("Owned Sandbox absence was not established")
     if _json(root / "start.output.txt").get("Id") != request["sandboxId"]:
         raise ValueError("Launch did not return the owned Sandbox ID")
+    integrity = source_integrity.verify_receipt(root, request, result, _json)
     if type(result.get('suiteIndex')) is not int:
         raise ValueError('Malformed suite index')
     for key in ("runId", "sourceCommit", "sourceBranch", "policySha256", "suiteIndex", "sandboxId"):
@@ -257,7 +261,7 @@ def validate_evidence(root, request, *, require_pass=True):
     clean_pass = bool(report and report["successful"] and not report["skipped"]
                       and report["tests"] > 0 and verdict == "OK")
     expected_status = "TIMEOUT" if process["timedOut"] else "PASS" if process["exitCode"] == 0 and clean_pass else "FAIL"
-    success = expected_status == "PASS"
+    success = expected_status == "PASS" and integrity['verified']
     if (not report or type(result.get("totalTests")) is not int
             or any(type(suite.get(key)) is not int for key in ("tests", "failures", "errors", "skips"))
             or suite["tests"] != report["tests"] or result.get("totalTests") != report["tests"]
@@ -267,7 +271,7 @@ def validate_evidence(root, request, *, require_pass=True):
             or summary.get("outcome") != ("PASS" if success else "FAIL")
             or (require_pass and (not success or summary.get("failure") is not None or result.get("error") is not None))):
         raise ValueError("Failed, skipped, incomplete or inconsistent unittest evidence")
-    return output if require_pass else (process["exitCode"], output, process["timedOut"])
+    return output if require_pass else (process["exitCode"], output, process["timedOut"], integrity)
 
 
 def _rescue_cleanup(root, request, launch):
@@ -315,7 +319,7 @@ def _confirmed_cleanup(root, request):
         return False
 
 
-def saved_evidence(logs, receipt, *, head, branch, policy, index, run_id, invocation):
+def saved_evidence(logs, receipt, *, head, branch, policy, index, run_id, invocation, integrity_verdict=None):
     if not isinstance(receipt, str) or not re.fullmatch(r"windows-sandbox-[0-9a-f]{32}", receipt):
         raise ValueError("Missing Sandbox evidence receipt")
     root = logs / receipt
@@ -328,7 +332,12 @@ def saved_evidence(logs, receipt, *, head, branch, policy, index, run_id, invoca
             or request.get("invocation") != invocation
             or request.get("approvedCommand") != policy["test_commands"][index - 1]):
         raise ValueError("Sandbox receipt does not belong to this approved final verification")
-    return validate_evidence(root, request)
+    output = validate_evidence(root, request)
+    actual = source_integrity.verify_receipt(root, request, _json(root / 'results/baseline.json'), _json)
+    if (_json(root / 'integrity-verification.json') != actual
+            or (integrity_verdict is not None and integrity_verdict != actual)):
+        raise source_integrity.IntegrityError('Saved host integrity verdict is missing or contradictory')
+    return output
 
 
 def run(command, repo, logs, timeout, *, git, expected_head, expected_branch, policy,
@@ -351,12 +360,24 @@ def run(command, repo, logs, timeout, *, git, expected_head, expected_branch, po
         root = logs / ("windows-sandbox-" + uuid.uuid4().hex)
         root.mkdir()
         (root / "input").mkdir()
-        package_source(repo, root / "input/baseline.zip", expected_head, expected_branch, git)
         request = {"runId": str(uuid.uuid4()), "sandboxId": str(uuid.uuid4()), "sourceCommit": expected_head,
                    "sourceBranch": expected_branch, "policy": policy, "policySha256": policy_sha256(policy),
                    "suiteIndex": index, "command": guest_command(command, repo), "approvedCommand": command,
                    "sessionRunId": session_run_id, "invocation": invocation,
                    "environment": guest_environment(repo, environment if environment is not None else test_environment(repo))}
+        protected = package_source(repo, root / "input/baseline.zip", expected_head, expected_branch, git)
+        manifest = source_integrity.baseline(request, protected)
+        manifest_bytes = source_integrity.canonical(manifest)
+        if len(manifest_bytes) > source_integrity.LIMIT:
+            raise source_integrity.IntegrityError('Host source manifest exceeds evidence size bound')
+        # Neither this authority nor request.json is exposed through writable mappings.
+        with (root / 'source-baseline.json').open('xb') as stream:
+            stream.write(manifest_bytes)
+        with (root / 'input/source-baseline.json').open('xb') as stream:
+            stream.write(manifest_bytes)
+        shutil.copyfile(source_integrity.__file__, root / 'input/source_integrity.py')
+        request['sourceIntegrity'] = {'schemaVersion': 1, 'baselineSha256': source_integrity.digest(manifest)}
+        source_integrity.check_archive(root / 'input/baseline.zip', manifest)
         request_path = root / "request.json"
         request_path.write_text(json.dumps(request, indent=2), encoding="utf-8")
         # Paths are literal single-quoted PowerShell strings; no shell interpolation.
@@ -377,7 +398,7 @@ def run(command, repo, logs, timeout, *, git, expected_head, expected_branch, po
         if not clean:
             clean = _rescue_cleanup(root, request, launch)
         try:
-            code, output, timed = validate_evidence(root, request, require_pass=False)
+            code, output, timed, integrity = validate_evidence(root, request, require_pass=False)
             if process.returncode != (0 if summary.get('outcome') == 'PASS' else 1):
                 raise ValueError("PowerShell runner failed despite passing guest evidence")
             _identity(repo, git, expected_head, expected_branch)
@@ -387,10 +408,15 @@ def run(command, repo, logs, timeout, *, git, expected_head, expected_branch, po
             suites = (summary.get('baseline') or {}).get('suites') or []
             timed = any(isinstance(item, dict) and isinstance(item.get('process'), dict)
                         and item['process'].get('timedOut') is True for item in suites)
-            result = _TestResult(124 if timed else 127, diagnostic, timed, clean, True)
+            code = 124 if timed else 126 if isinstance(exc, source_integrity.IntegrityError) else 127
+            result = _TestResult(code, diagnostic, timed, clean, True)
+            integrity = {'schemaVersion': 1, 'verified': False, 'error': str(exc)}
         else:
             result = _TestResult(code, output, timed, True, True)
         result.windows_sandbox = root.name
+        result.source_integrity = integrity
+        with (root / 'integrity-verification.json').open('x', encoding='utf-8') as stream:
+            json.dump(integrity, stream, indent=2)
         return result
     except BaseException as exc:
         if started:
