@@ -147,6 +147,21 @@ class PlanAuditTests(unittest.TestCase):
             self.do_audit(goal="changed goal")
         self.assertEqual(len(self.calls), 1)
 
+    def test_session_coverage_is_reviewed_and_bound_to_audit_identity(self):
+        from test_windows_sandbox import scoped_policy
+        self.document['final_verification'] = scoped_policy(POLICY)
+        self.plan.write_text(json.dumps(self.document))
+        self.assertEqual(self.do_audit(), 0)
+        original = self.identity()
+        self.assertIn('session_coverage', self.calls[0][3])
+        self.assertIn('minimum_tests_per_suite', self.calls[0][3])
+        self.document['final_verification']['session_coverage']['rules'][0]['reason'] = 'Changed coverage justification'
+        self.plan.write_text(json.dumps(self.document))
+        self.assertNotEqual(self.identity(), original)
+        with self.assertRaises(runner.PilotError):
+            self.start(approved_audit=self.logs)
+        self.assertEqual(len(self.calls), 1)
+
     def test_start_requires_explicit_approval_and_cannot_resume_failed_start(self):
         fake = Executor()
         with self.assertRaisesRegex(runner.PilotError, "require an approved"):

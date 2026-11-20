@@ -2,11 +2,12 @@
 import hashlib
 import json
 import re
+from auto_coding.session_testing import coverage_policy
 
 
 def verification_policy(value):
     if (not isinstance(value, dict) or not {"test_commands", "minimum_tests"} <= set(value)
-            <= {"test_commands", "minimum_tests", "timeout_seconds"}):
+            <= {"test_commands", "minimum_tests", "timeout_seconds", "session_coverage"}):
         raise ValueError("Final verification requires test_commands and minimum_tests; timeout_seconds is optional")
     commands = value["test_commands"]
     if (not isinstance(commands, list) or not 1 <= len(commands) <= 10
@@ -19,8 +20,11 @@ def verification_policy(value):
     minimum = value["minimum_tests"]
     if type(minimum) is not int or not 1 <= minimum <= 1000000:
         raise ValueError("Final verification minimum_tests must be a positive bounded integer")
-    return {"test_commands": [list(cmd) for cmd in commands], "minimum_tests": minimum,
-            "timeout_seconds": timeout}
+    result = {"test_commands": [list(cmd) for cmd in commands], "minimum_tests": minimum,
+              "timeout_seconds": timeout}
+    if 'session_coverage' in value:
+        result['session_coverage'] = coverage_policy(value['session_coverage'], len(commands), minimum)
+    return result
 
 
 def policy_sha256(policy):

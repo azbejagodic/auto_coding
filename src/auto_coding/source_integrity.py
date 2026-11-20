@@ -18,6 +18,9 @@ import unicodedata
 VERSION = 1
 LIMIT = 16 * 1024 * 1024
 MAX_FILES = 50000
+# Python and .NET UTC providers can differ by a Windows clock tick. Process
+# ordering (all .NET observations) remains exact; only cross-provider bounds use it.
+CLOCK_TOLERANCE = dt.timedelta(milliseconds=20)
 IDENTITY_FIELDS = ('sourceCommit', 'sourceBranch', 'sessionRunId', 'runId', 'sandboxId',
                    'invocation', 'suiteIndex', 'policySha256')
 EXCLUSIONS = {'version': 1, 'rootGitMetadata': True, 'untrackedCPythonBytecode': True}
@@ -288,16 +291,19 @@ def verify_receipt(root, request, result, read_json):
                     or process.get('stdout') != rf'C:\ACResults\integrity-{stage}-hash.stdout.log'
                     or process.get('stderr') != rf'C:\ACResults\integrity-{stage}-hash.stderr.log'
                     or not (timestamp(result['startedUtc']) <= timestamp(process['startedUtc'])
-                            <= timestamp(value['startedUtc']) <= timestamp(value['finishedUtc'])
-                            <= timestamp(process['finishedUtc']) <= timestamp(result['finishedUtc']))):
+                            <= timestamp(process['finishedUtc']) <= timestamp(result['finishedUtc']))
+                    or not (timestamp(process['startedUtc']) - CLOCK_TOLERANCE <= timestamp(value['startedUtc'])
+                            <= timestamp(value['finishedUtc']) <= timestamp(process['finishedUtc']) + CLOCK_TOLERANCE)):
                 raise IntegrityError('Incomplete or stale integrity worker metadata')
             for stream in ('stdout', 'stderr'):
                 read(root / 'results' / f'integrity-{stage}-hash.{stream}.log')
             suites = result.get('suites', [])
-            if len(suites) == 1:
-                boundary = suites[0]['process']['startedUtc' if stage == 'pre' else 'finishedUtc']
-                if ((stage == 'pre' and timestamp(process['finishedUtc']) > timestamp(boundary))
-                        or (stage == 'post' and timestamp(process['startedUtc']) < timestamp(boundary))):
+            if suites:
+                boundaries = [timestamp(suite['process']['startedUtc' if stage == 'pre' else 'finishedUtc'])
+                              for suite in suites]
+                boundary = min(boundaries) if stage == 'pre' else max(boundaries)
+                if ((stage == 'pre' and timestamp(process['finishedUtc']) > boundary)
+                        or (stage == 'post' and timestamp(process['startedUtc']) < boundary)):
                     raise IntegrityError('Integrity observation is not before/after the test')
             # The expected hashes are never read from writable results.
             verdict['observations'][stage] = observed

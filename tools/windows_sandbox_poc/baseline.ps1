@@ -18,6 +18,13 @@ if ($Session) {
     $result.sourceBranch = $sessionRequest.sourceBranch
     $result.policySha256 = $sessionRequest.policySha256
     $result.suiteIndex = $sessionRequest.suiteIndex
+    $sessionWide = $sessionRequest.executionScope -ceq 'approved-session-v2'
+    $sessionSpecs = @(Get-SessionSuites $sessionRequest)
+    if ($sessionWide) {
+        $result.executionScope = $sessionRequest.executionScope
+        $result.sourceStartCommit = $sessionRequest.sourceStartCommit
+        $result.selectionSha256 = $sessionRequest.selectionSha256
+    }
     $result.sourceIntegrity = [ordered]@{ schemaVersion = 1; baselineSha256 = $sessionRequest.sourceIntegrity.baselineSha256;
         pre = $null; post = $null }
 }
@@ -81,13 +88,18 @@ try {
     if ($Session) { Verify-Source 'pre' }
     $files = @('test_desktop_ui.py', 'test_dashboard_acceptance.py', 'test_desktop_bridge.py',
         'test_desktop_control.py', 'test_plan_audit.py', 'test_isolated_workspace.py')
-    if ($Session) { $files = @("session-suite-$($sessionRequest.suiteIndex)") }
+    if ($Session) { $files = @($sessionSpecs | ForEach-Object { $_.file }) }
+    $suiteNumber = 0
     foreach ($file in $files) {
+        $suiteNumber++
         $remaining = [int][Math]::Floor(($deadline - [DateTime]::UtcNow).TotalSeconds)
         if ($remaining -le 0) { throw 'Overall guest deadline expired before suite launch.' }
         $exe = $python
         $argv = @('-m', 'unittest', 'discover', '-s', 'tests', '-p', $file, '-v')
-        if ($Session) { $exe = $sessionRequest.command[0]; $argv = @($sessionRequest.command | Select-Object -Skip 1) }
+        if ($Session) {
+            $exe = $sessionSpecs[$suiteNumber - 1].command[0]
+            $argv = @($sessionSpecs[$suiteNumber - 1].command | Select-Object -Skip 1)
+        }
         $p = Invoke-BoundedProcess -Executable $exe -Arguments $argv `
             -WorkingDirectory $workspace -LogPrefix "C:\ACResults\$file" `
             -TimeoutSeconds ([Math]::Min($SuiteTimeoutSeconds, $remaining))
@@ -104,6 +116,7 @@ try {
     $expected = @(4, 7, 39, 37, 40, 18)
     for ($i = 0; $i -lt $files.Count; $i++) {
         if ($result.suites[$i].status -ne 'PASS' -or $result.suites[$i].tests -lt 1 -or
+            ($Session -and $sessionWide -and $result.suites[$i].tests -lt $sessionRequest.minimumTestsPerSuite[$i]) -or
             (!$Session -and $result.suites[$i].tests -ne $expected[$i])) {
             throw "Suite did not match clean baseline: $($result.suites[$i].file)"
         }

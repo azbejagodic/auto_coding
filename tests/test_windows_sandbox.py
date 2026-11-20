@@ -20,11 +20,24 @@ def verified_result(code=0, output=PASSED, timed=False, clean=True, started=True
     result.source_integrity = {'schemaVersion':1,'baselineSha256':'a' * 64,'verified':True,'hostPackageVerified':True,
         'observations':{stage:{'complete':True,'matchesBaseline':True,'fileCount':1,
             'differences':{'added':[],'deleted':[],'modified':[]}} for stage in ('pre','post')}}
+    result.suite_results = [result]
     return result
 
 
+def scoped_policy(policy):
+    count = len(policy["test_commands"])
+    return runner.verification_policy(policy | {"session_coverage": {
+        "rules": [{"id": "approved", "paths": ["*"], "suite_indices": list(range(1, count + 1)),
+                   "reason": "Explicit controlled fixture coverage"}],
+        "minimum_tests_per_suite": [(policy["minimum_tests"] + count - 1) // count] * count,
+        "mandatory_security_suites": []}})
+
+
 class ControllerIntegrationTests(unittest.TestCase):
-    setUp = fixtures.FinalVerificationTests.setUp
+    def setUp(self):
+        fixtures.FinalVerificationTests.setUp(self)
+        self.document['final_verification'] = scoped_policy(POLICY)
+        self.write_plan()
     advance = fixtures.FinalVerificationTests.advance
     git = fixtures.FinalVerificationTests.git
     write_plan = fixtures.FinalVerificationTests.write_plan
@@ -42,8 +55,8 @@ class ControllerIntegrationTests(unittest.TestCase):
             self.assertEqual(options['expected_head'], self.git('rev-parse', 'HEAD'))
             self.assertNotEqual(options['expected_head'], self.initial)
             self.assertEqual(options['expected_branch'], 'feature/verification')
-            self.assertEqual(options['policy'], POLICY)
-            self.assertEqual(command, POLICY['test_commands'][0])
+            self.assertEqual(options['policy'], self.document['final_verification'])
+            self.assertEqual(command, POLICY['test_commands'])
             self.assertEqual(timeout, POLICY['timeout_seconds'])
             self.assertEqual(self.state()['history'][0]['review']['decision'], 'APPROVED')
             self.assertEqual(self.state()['completed'], ['one'])
@@ -52,7 +65,7 @@ class ControllerIntegrationTests(unittest.TestCase):
             result.windows_sandbox = 'fixture-receipt'
             return result
         fake = Executor()
-        with self.selected(), patch.object(sandbox, 'run', side_effect=verify) as verify_call, \
+        with self.selected(), patch.object(sandbox, 'run_session', side_effect=verify) as verify_call, \
                 patch.object(runner.controller_test_sandbox, 'run') as legacy:
             self.assertEqual(self.run_fake(fake), 0)
         self.assertEqual(fake.calls, ['A', 'B'])
@@ -62,23 +75,25 @@ class ControllerIntegrationTests(unittest.TestCase):
         self.assertEqual(self.state()['final_verification_result']['tests'][0]['windows_sandbox'], 'fixture-receipt')
 
     def test_all_approved_commands_propagate_with_combined_minimum(self):
-        self.document['final_verification'] = POLICY | {'test_commands': [['suite-one'], ['suite-two']], 'minimum_tests': 4}
+        self.document['final_verification'] = scoped_policy(POLICY | {'test_commands': [['suite-one'], ['suite-two']], 'minimum_tests': 4})
         self.write_plan()
-        with self.selected(), patch.object(sandbox, 'run', return_value=verified_result()) as run:
+        combined = verified_result()
+        combined.suite_results = [verified_result(), verified_result()]
+        with self.selected(), patch.object(sandbox, 'run_session', return_value=combined) as run:
             self.assertEqual(self.run_fake(Executor()), 0)
-        self.assertEqual([call.args[0] for call in run.call_args_list], [['suite-one'], ['suite-two']])
-        self.assertEqual([call.kwargs['index'] for call in run.call_args_list], [1, 2])
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.args[0], [['suite-one'], ['suite-two']])
         self.assertEqual(self.state()['final_verification_result']['test_count'], 4)
 
     def test_rejected_review_never_launches_final_sandbox(self):
         fake = Executor(reviews=[{'decision': 'REJECTED', 'issues': ['Defect'], 'summary': 'Broken'}] * 10)
-        with self.selected(), patch.object(sandbox, 'run') as run:
+        with self.selected(), patch.object(sandbox, 'run_session') as run:
             self.assertEqual(self.run_fake(fake, attempts=1), 1)
         run.assert_not_called()
         self.assertEqual(self.git('rev-parse', 'HEAD'), self.initial)
 
     def test_confirmed_timeout_stops_and_preserves_approved_commit(self):
-        with self.selected(), patch.object(sandbox, 'run', return_value=runner._CallResult(124, 'TIMEOUT', True, True, True)):
+        with self.selected(), patch.object(sandbox, 'run_session', return_value=runner._CallResult(124, 'TIMEOUT', True, True, True)):
             self.assertEqual(self.run_fake(Executor()), 1)
         state = self.state()
         self.assertEqual(state['status'], 'stopped')
@@ -87,34 +102,34 @@ class ControllerIntegrationTests(unittest.TestCase):
         self.assertEqual(self.git('rev-parse', 'HEAD'), state['history'][0]['commit'])
 
     def test_uncertain_cleanup_keeps_existing_safety_gate(self):
-        with self.selected(), patch.object(sandbox, 'run', return_value=runner._CallResult(127, 'uncertain', False, False, True)):
+        with self.selected(), patch.object(sandbox, 'run_session', return_value=runner._CallResult(127, 'uncertain', False, False, True)):
             self.assertEqual(self.run_fake(Executor()), 1)
         self.assertIn('uncertain_test', self.state())
         self.assertTrue((self.repo / '.git/auto-coding-test-process-uncertain.json').exists())
 
     def test_backend_cannot_switch_on_resume(self):
-        with self.selected(), patch.object(sandbox, 'run', return_value=runner._CallResult(127, 'missing tool', False, True, False)):
+        with self.selected(), patch.object(sandbox, 'run_session', return_value=runner._CallResult(127, 'missing tool', False, True, False)):
             self.assertEqual(self.run_fake(Executor()), 1)
         with patch.dict(os.environ, {sandbox.BACKEND_ENV: 'mxc'}), self.assertRaises(runner.PilotError):
             self.run_fake(Executor(), resume=True)
 
     def test_saved_windows_evidence_is_required_for_reuse(self):
-        with self.selected(), patch.object(sandbox, 'run', return_value=verified_result()):
+        with self.selected(), patch.object(sandbox, 'run_session', return_value=verified_result()):
             self.assertEqual(self.run_fake(Executor()), 0)
-        with patch.object(sandbox, 'saved_evidence', side_effect=ValueError('Missing logs')):
+        with patch.object(sandbox, 'saved_session_evidence', side_effect=ValueError('Missing logs')):
             self.assertFalse(runner.final_evidence_valid(self.repo, self.logs, self.state()))
 
     def test_passing_tests_cannot_override_failed_source_integrity(self):
         result = verified_result()
         result.source_integrity['verified'] = False
-        with self.selected(), patch.object(sandbox, 'run', return_value=result):
+        with self.selected(), patch.object(sandbox, 'run_session', return_value=result):
             self.assertEqual(self.run_fake(Executor()), 1)
         final = self.state()['final_verification_result']
         self.assertEqual(final['outcome'], 'source_integrity_failure')
         self.assertTrue(final['tests'][0]['summary']['successful'])
 
     def test_batch1_saved_evidence_without_integrity_cannot_be_reused(self):
-        with self.selected(), patch.object(sandbox, 'run', return_value=verified_result()):
+        with self.selected(), patch.object(sandbox, 'run_session', return_value=verified_result()):
             self.assertEqual(self.run_fake(Executor()), 0)
         state = self.state()
         del state['final_verification_result']['tests'][0]['source_integrity']
@@ -122,7 +137,7 @@ class ControllerIntegrationTests(unittest.TestCase):
 
     def test_failed_tests_cannot_be_overridden_by_passing_integrity(self):
         result = verified_result(1, fixtures.FAILED)
-        with self.selected(), patch.object(sandbox, 'run', return_value=result):
+        with self.selected(), patch.object(sandbox, 'run_session', return_value=result):
             self.assertEqual(self.run_fake(Executor()), 1)
         final = self.state()['final_verification_result']
         self.assertEqual(final['outcome'], 'test_failure')
@@ -212,7 +227,8 @@ class AdapterTests(unittest.TestCase):
         self.write(root / 'after.output.txt', {'WindowsSandboxEnvironments':[]})
         self.write(root / 'exec-baseline.output.txt', {'ExitCode':0})
         for label in ('start','exec-baseline','stop','after'):
-            self.write(root / (label + '.process.json'), {'exitCode':0,'timedOut':False,'startedUtc':now,'finishedUtc':now})
+            args = ['stop','--id',request['sandboxId'],'--raw'] if label == 'stop' else ['list','--raw']
+            self.write(root / (label + '.process.json'), {'exitCode':0,'timedOut':False,'startedUtc':now,'finishedUtc':now,'arguments':args})
         self.write(root / 'results' / (name + '.process.json'), process)
         self.write(root / 'results' / (name + '.suite.json'), suite)
         (root / 'results' / (name + '.stdout.log')).write_text('', encoding='utf-8')
@@ -359,6 +375,28 @@ class AdapterTests(unittest.TestCase):
         self.assertTrue(result.cleanup_confirmed)
         self.assertEqual(sandbox.saved_evidence(self.logs, result.windows_sandbox, head=self.head,
             branch='feature/session', policy=self.policy, index=1, run_id='session', invocation=1), result[1])
+
+    def test_default_manager_needs_no_wsb_alias_and_uses_its_runner_argv(self):
+        fixture=self
+        expected=['authenticated-system-host','manager-owned-runner-arguments']
+        class Manager:
+            def __init__(self,root,request,repo):self.root=root;self.request=request;self.scripts=sandbox.SCRIPTS
+            def metadata(self):return {'fixture':'no native execution'}
+            def bind(self):pass
+            def preflight(self):pass
+            def runner_argv(self):return list(expected)
+            def run(self,argv,**options):
+                fixture.assertEqual(argv,expected)
+                fixture.fixture(self.request,self.root)
+                return subprocess.CompletedProcess(argv,0,'','')
+        real_which=sandbox.shutil.which
+        with patch.object(sandbox,'WINDOWS',True),patch.object(sandbox.trusted_sandbox_management,'ManagementSession',Manager), \
+                patch.object(sandbox.shutil,'which',side_effect=lambda name: None if name=='wsb' else real_which(name)) as locate:
+            result=sandbox.run(self.policy['test_commands'][0],self.repo,self.logs,30,
+                git=self.git,expected_head=self.head,expected_branch='feature/session',policy=self.policy,
+                index=1,session_run_id='session',invocation=1)
+        self.assertEqual(result[0],0)
+        self.assertNotIn(unittest.mock.call('wsb'),locate.call_args_list)
 
     def test_nonzero_suite_exit_survives_zero_native_cli_exit(self):
         def launch(argv, **options):

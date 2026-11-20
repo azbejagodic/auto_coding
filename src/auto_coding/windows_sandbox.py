@@ -23,13 +23,107 @@ from auto_coding.final_verification import verification_policy, policy_sha256, u
 from auto_coding.process_runner import bounded_run, MAX_CAPTURE_BYTES
 from auto_coding.sensitive_paths import is_sensitive_path
 from auto_coding.python_environment import test_environment
-from auto_coding import source_integrity
+from auto_coding import source_integrity, trusted_sandbox_management
 
 
 BACKEND_ENV = "AUTOCODING_FINAL_TEST_BACKEND"
 SCRIPTS = Path(__file__).resolve().parents[2] / "tools" / "windows_sandbox_poc"
 GUEST = r"C:\AutoCodingTest"
 WINDOWS = sys.platform == "win32"
+SESSION_SCOPE = 'approved-session-v2'
+
+
+class _SessionEvidence(tuple):
+    def __new__(cls, code, output, timed, integrity, suites):
+        value = super().__new__(cls, (code, output, timed, integrity))
+        value.suites = suites
+        return value
+
+
+def _session_request(request, policy):
+    if 'session_coverage' not in policy:
+        raise ValueError('Missing approved session coverage policy')
+    selection = request.get('sessionSelection')
+    commands = request.get('commands')
+    if (request.get('executionScope') != SESSION_SCOPE or type(request.get('suiteIndex')) is not int
+            or request['suiteIndex'] != 1
+            or request.get('policySha256') != policy_sha256(policy)
+            or request.get('approvedCommands') != policy['test_commands']
+            or not isinstance(commands, list) or len(commands) != len(policy['test_commands'])
+            or any(not isinstance(command, list) or not command
+                   or any(not isinstance(arg, str) or not arg for arg in command) for command in commands)
+            or not isinstance(selection, dict)
+            or not isinstance(request.get('sourceStartCommit'), str)
+            or not re.fullmatch('[0-9a-f]{40}|[0-9a-f]{64}', request['sourceStartCommit'])
+            or request.get('selectionSha256') != source_integrity.digest(selection)
+            or selection.get('finalCommit') != request.get('sourceCommit')
+            or selection.get('initialCommit') != request.get('sourceStartCommit')
+            or selection.get('branch') != request.get('sourceBranch')
+            or selection.get('sessionRunId') != request.get('sessionRunId')
+            or selection.get('policySha256') != request.get('policySha256')
+            or selection.get('selectedSuiteIndices') != list(range(1, len(commands) + 1))
+            or selection.get('minimumTestsPerSuite') != policy.get('session_coverage', {}).get('minimum_tests_per_suite')
+            or selection.get('mandatorySecuritySuites') != policy.get('session_coverage', {}).get('mandatory_security_suites')):
+        raise ValueError('Incomplete or unbound approved session selection')
+
+
+def _session_suites(root, request, summary, result, integrity, require_pass):
+    if (result.get('executionScope') != SESSION_SCOPE or result.get('selectionSha256') != request['selectionSha256']
+            or result.get('sourceStartCommit') != request['sourceStartCommit']):
+        raise ValueError('Guest session selection identity differs from the approved request')
+    suites = result.get('suites')
+    if not isinstance(suites, list) or len(suites) != len(request['commands']):
+        raise ValueError('Missing or duplicated mandatory session suites')
+    payloads, total, passed = [], 0, True
+    previous = _timestamp(result['startedUtc'])
+    minimum = request['sessionSelection']['minimumTestsPerSuite']
+    for index, (suite, command) in enumerate(zip(suites, request['commands']), 1):
+        name = f'session-suite-{index}'
+        if not isinstance(suite, dict) or suite.get('file') != name:
+            raise ValueError('Incorrect session suite order or identity')
+        process = _json(root / 'results' / (name + '.process.json'))
+        if (process != suite.get('process') or _json(root / 'results' / (name + '.suite.json')) != suite
+                or [process.get('executable'), *process.get('arguments', [])] != command
+                or process.get('workingDirectory') != GUEST
+                or process.get('stdout') != rf'C:\ACResults\{name}.stdout.log'
+                or process.get('stderr') != rf'C:\ACResults\{name}.stderr.log'
+                or type(process.get('exitCode')) is not int or type(process.get('timedOut')) is not bool
+                or type(process.get('timeoutSeconds')) is not int
+                or not 1 <= process['timeoutSeconds'] <= request['policy']['timeout_seconds']
+                or not (previous <= _timestamp(process['startedUtc']) <= _timestamp(process['finishedUtc'])
+                        <= _timestamp(result['finishedUtc']))):
+            raise ValueError('Malformed or contradictory session suite process')
+        previous = _timestamp(process['finishedUtc'])
+        output = _text(root / 'results' / (name + '.stdout.log')) + '\n' + _text(root / 'results' / (name + '.stderr.log'))
+        report = unittest_evidence(output)
+        matches = list(re.finditer(r'(?m)^Ran ([0-9]{1,7}) tests? in [0-9.]+s\r?$', output))
+        verdict = output[matches[-1].end():].lstrip('\r\n').split('\n', 1)[0].rstrip('\r') if matches else ''
+        counts = {}
+        for field, label in (('failures', 'failures'), ('errors', 'errors'), ('skips', 'skipped')):
+            match = re.search(r'\b' + label + r'=([0-9]+)', verdict)
+            counts[field] = int(match[1]) if match else 0
+        clean = bool(report and report['successful'] and report['tests'] > 0 and verdict == 'OK')
+        status = 'TIMEOUT' if process['timedOut'] else 'PASS' if process['exitCode'] == 0 and clean else 'FAIL'
+        if (not report or any(type(suite.get(key)) is not int for key in ('tests', 'failures', 'errors', 'skips'))
+                or suite['tests'] != report['tests'] or any(suite[key] != counts[key] for key in counts)
+                or suite.get('status') != status):
+            raise ValueError('Incomplete or inconsistent session unittest evidence')
+        total += report['tests']
+        passed = passed and status == 'PASS' and report['tests'] >= minimum[index - 1]
+        payloads.append((process['exitCode'], output, process['timedOut']))
+    passed = passed and total >= request['policy']['minimum_tests'] and integrity['verified']
+    if (type(result.get('totalTests')) is not int or result['totalTests'] != total
+            or result.get('success') is not passed or result['operationExitCode'] != (0 if passed else 1)
+            or summary.get('outcome') != ('PASS' if passed else 'FAIL')
+            or 'failure' not in summary or 'error' not in result
+            or (passed and (summary['failure'] is not None or result['error'] is not None))
+            or (require_pass and not passed)):
+        raise ValueError('Failed, skipped or contradictory complete session evidence')
+    output = '\n'.join(payload[1] for payload in payloads)
+    if len(output.encode('utf-8')) > MAX_CAPTURE_BYTES:
+        raise ValueError('Combined session output exceeds the evidence limit')
+    return output if require_pass else _SessionEvidence(result['operationExitCode'], output,
+        any(payload[2] for payload in payloads), integrity, payloads)
 
 
 def _regular(path):
@@ -194,6 +288,15 @@ def _instances(value):
 
 def validate_evidence(root, request, *, require_pass=True):
     """Reparse controller-selected files; never follow a guest-selected host path."""
+    policy = verification_policy(request['policy'])
+    index = request.get('suiteIndex')
+    whole_session = request.get('executionScope') == SESSION_SCOPE
+    if whole_session:
+        _session_request(request, policy)
+    elif ('executionScope' in request or type(index) is not int or not 1 <= index <= len(policy['test_commands'])
+            or request.get('policySha256') != policy_sha256(policy)
+            or request.get('approvedCommand') != policy['test_commands'][index - 1]):
+        raise ValueError('Receipt does not identify the approved policy command')
     summary = _json(root / "summary.json")
     result = _json(root / "results" / "baseline.json")
     if (summary.get("mode") != "Session" or summary.get("runId") != request["runId"]
@@ -226,10 +329,16 @@ def validate_evidence(root, request, *, require_pass=True):
         process = _json(root / (label + ".process.json"))
         if type(process.get("exitCode")) is not int or process["exitCode"] != 0 or process.get("timedOut") is not False:
             raise ValueError("Host CLI process failed or timed out")
+        if label in {'stop', 'after'}:
+            expected = ['stop','--id',request['sandboxId'],'--raw'] if label == 'stop' else ['list','--raw']
+            if process.get('arguments') != expected:
+                raise ValueError('Cleanup evidence does not target only the owned Sandbox')
         if label == 'exec-baseline' and not (
                 _timestamp(process['startedUtc']) - dt.timedelta(seconds=5) <= _timestamp(result['startedUtc'])
                 <= _timestamp(result['finishedUtc']) <= _timestamp(process['finishedUtc']) + dt.timedelta(seconds=5)):
             raise ValueError('Stale or impossible guest execution timestamps')
+    if whole_session:
+        return _session_suites(root, request, summary, result, integrity, require_pass)
     suites = result.get("suites")
     if not isinstance(suites, list) or len(suites) != 1:
         raise ValueError("Missing or unexpected suite results")
@@ -244,7 +353,8 @@ def validate_evidence(root, request, *, require_pass=True):
             or process.get("stdout") != rf"C:\ACResults\{name}.stdout.log"
             or process.get("stderr") != rf"C:\ACResults\{name}.stderr.log"
             or type(process.get("exitCode")) is not int or type(process.get("timedOut")) is not bool
-            or not 1 <= process.get("timeoutSeconds", 0) <= request["policy"]["timeout_seconds"]
+            or type(process.get('timeoutSeconds')) is not int
+            or not 1 <= process['timeoutSeconds'] <= request["policy"]["timeout_seconds"]
             or not (_timestamp(result["startedUtc"]) <= _timestamp(process["startedUtc"])
                     <= _timestamp(process["finishedUtc"]) <= _timestamp(result["finishedUtc"]))):
         raise ValueError("Malformed or contradictory suite process evidence")
@@ -269,7 +379,9 @@ def validate_evidence(root, request, *, require_pass=True):
             or suite.get("status") != expected_status or result.get("success") is not success
             or cli["ExitCode"] != (0 if success else 1)
             or summary.get("outcome") != ("PASS" if success else "FAIL")
-            or (require_pass and (not success or summary.get("failure") is not None or result.get("error") is not None))):
+            or 'failure' not in summary or 'error' not in result
+            or (success and (summary['failure'] is not None or result['error'] is not None))
+            or (require_pass and not success)):
         raise ValueError("Failed, skipped, incomplete or inconsistent unittest evidence")
     return output if require_pass else (process["exitCode"], output, process["timedOut"], integrity)
 
@@ -283,14 +395,16 @@ def _rescue_cleanup(root, request, launch):
         marker = _json(marker_path)
         if marker != {"runId": request["runId"], "sandboxId": request["sandboxId"]}:
             return False
-        executable = shutil.which("wsb")
+        manager = getattr(launch, '__self__', None)
+        managed = isinstance(manager, trusted_sandbox_management.ManagementSession)
+        executable = manager.cli if managed else shutil.which("wsb")
         if not executable:
             return False
         host_clean = True
         for label, args, timeout in (("rescue-stop", ["stop", "--id", request["sandboxId"], "--raw"], 120),
                                       ("rescue-list", ["list", "--raw"], 30)):
             try:
-                process = launch([executable, *args], cwd=str(SCRIPTS), timeout=timeout, shell=False,
+                process = launch([executable, *args], cwd=str(manager.scripts if managed else SCRIPTS), timeout=timeout, shell=False,
                                  capture_output=True, text=True, encoding="utf-8")
             except (OSError, subprocess.TimeoutExpired) as exc:
                 host_clean = host_clean and (getattr(exc, 'cleanup_confirmed', None) is True
@@ -319,18 +433,21 @@ def _confirmed_cleanup(root, request):
         return False
 
 
-def saved_evidence(logs, receipt, *, head, branch, policy, index, run_id, invocation, integrity_verdict=None):
+def saved_evidence(logs, receipt, *, head, branch, policy, index, run_id, invocation,
+                   integrity_verdict=None, source_repo=None):
     if not isinstance(receipt, str) or not re.fullmatch(r"windows-sandbox-[0-9a-f]{32}", receipt):
         raise ValueError("Missing Sandbox evidence receipt")
     root = logs / receipt
     if root.is_symlink() or root.resolve().parent != logs.resolve():
         raise ValueError("Invalid Sandbox evidence directory")
     request = _json(root / "request.json")
+    source = Path(source_repo).resolve() if source_repo is not None else Path.cwd().resolve()
     if (request.get("sourceCommit") != head or request.get("sourceBranch") != branch
             or request.get("policy") != policy or request.get("policySha256") != policy_sha256(policy)
             or request.get("suiteIndex") != index or request.get("sessionRunId") != run_id
             or request.get("invocation") != invocation
-            or request.get("approvedCommand") != policy["test_commands"][index - 1]):
+            or request.get("approvedCommand") != policy["test_commands"][index - 1]
+            or request.get('command') != guest_command(policy['test_commands'][index - 1], source)):
         raise ValueError("Sandbox receipt does not belong to this approved final verification")
     output = validate_evidence(root, request)
     actual = source_integrity.verify_receipt(root, request, _json(root / 'results/baseline.json'), _json)
@@ -340,31 +457,73 @@ def saved_evidence(logs, receipt, *, head, branch, policy, index, run_id, invoca
     return output
 
 
+def saved_session_evidence(logs, receipt, *, head, branch, policy, run_id, invocation,
+                           selection, source_repo, integrity_verdict):
+    if not isinstance(receipt, str) or not re.fullmatch(r'windows-sandbox-[0-9a-f]{32}', receipt):
+        raise ValueError('Missing complete-session Sandbox receipt')
+    root = logs / receipt
+    if root.is_symlink() or root.resolve().parent != logs.resolve():
+        raise ValueError('Invalid Sandbox evidence directory')
+    request = _json(root / 'request.json')
+    expected_commands = [guest_command(command, Path(source_repo).resolve()) for command in policy['test_commands']]
+    if (request.get('executionScope') != SESSION_SCOPE or request.get('sourceCommit') != head
+            or request.get('sourceBranch') != branch or request.get('policy') != policy
+            or request.get('sessionRunId') != run_id or request.get('invocation') != invocation
+            or request.get('sessionSelection') != selection or request.get('commands') != expected_commands):
+        raise ValueError('Receipt does not belong to this complete approved session')
+    evidence = validate_evidence(root, request, require_pass=False)
+    if evidence[0] != 0 or evidence[2] or not source_integrity.valid_verdict(evidence[3]):
+        raise ValueError('Saved complete session did not pass')
+    if _json(root / 'integrity-verification.json') != evidence[3] or integrity_verdict != evidence[3]:
+        raise source_integrity.IntegrityError('Saved complete-session integrity verdict differs')
+    return [payload[1] for payload in evidence.suites]
+
+
+def run_session(commands, repo, logs, timeout, *, selection, **options):
+    """One owned instance, one package, all bound commands and one pre/post scan."""
+    return run(commands, repo, logs, timeout, index=1, session_selection=selection, **options)
+
+
 def run(command, repo, logs, timeout, *, git, expected_head, expected_branch, policy,
-        index, session_run_id, invocation, environment=None, launch=bounded_run):
+        index, session_run_id, invocation, environment=None, launch=None, session_selection=None):
     started = False
     host_finished = False
     root = None
+    manager = None
     try:
         policy = verification_policy(policy)
-        if command != policy["test_commands"][index - 1] or timeout != policy["timeout_seconds"]:
+        whole_session = session_selection is not None
+        expected = policy['test_commands'] if whole_session else policy['test_commands'][index - 1]
+        if command != expected or timeout != policy["timeout_seconds"]:
             raise ValueError("Final suite differs from the approved policy")
+        budget = timeout * (len(command) if whole_session else 1)
+        if budget > 86400:
+            raise ValueError('Combined session command deadlines exceed the existing bounded runner capacity')
         if not WINDOWS:
             raise ValueError("Windows Sandbox final verification requires Windows")
         repo, logs = Path(repo).resolve(), Path(logs).resolve()
         if logs == repo or logs.is_relative_to(repo):
             raise ValueError("Evidence must be outside the source checkout")
-        powershell = Path(os.environ["SYSTEMROOT"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
-        if not powershell.is_file() or not shutil.which("wsb") or not (SCRIPTS / "run.ps1").is_file():
-            raise ValueError("Installed Windows Sandbox CLI/PowerShell/Phase 3 runner unavailable")
+        if launch is not None:
+            powershell = Path(os.environ["SYSTEMROOT"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+            if not powershell.is_file() or not shutil.which("wsb") or not (SCRIPTS / "run.ps1").is_file():
+                raise ValueError("Installed Windows Sandbox CLI/PowerShell/Phase 3 runner unavailable")
         root = logs / ("windows-sandbox-" + uuid.uuid4().hex)
         root.mkdir()
         (root / "input").mkdir()
         request = {"runId": str(uuid.uuid4()), "sandboxId": str(uuid.uuid4()), "sourceCommit": expected_head,
                    "sourceBranch": expected_branch, "policy": policy, "policySha256": policy_sha256(policy),
-                   "suiteIndex": index, "command": guest_command(command, repo), "approvedCommand": command,
+                   "suiteIndex": index,
                    "sessionRunId": session_run_id, "invocation": invocation,
                    "environment": guest_environment(repo, environment if environment is not None else test_environment(repo))}
+        if whole_session:
+            request.update(executionScope=SESSION_SCOPE, commands=[guest_command(cmd, repo) for cmd in command],
+                           approvedCommands=command, sessionSelection=session_selection,
+                           sourceStartCommit=session_selection['initialCommit'],
+                           selectionSha256=source_integrity.digest(session_selection))
+            _session_request(request, policy)
+        else:
+            request.update(command=guest_command(command, repo), approvedCommand=command)
         protected = package_source(repo, root / "input/baseline.zip", expected_head, expected_branch, git)
         manifest = source_integrity.baseline(request, protected)
         manifest_bytes = source_integrity.canonical(manifest)
@@ -379,15 +538,33 @@ def run(command, repo, logs, timeout, *, git, expected_head, expected_branch, po
         request['sourceIntegrity'] = {'schemaVersion': 1, 'baselineSha256': source_integrity.digest(manifest)}
         source_integrity.check_archive(root / 'input/baseline.zip', manifest)
         request_path = root / "request.json"
-        request_path.write_text(json.dumps(request, indent=2), encoding="utf-8")
-        # Paths are literal single-quoted PowerShell strings; no shell interpolation.
-        quote = lambda path: "'" + str(path).replace("'", "''") + "'"
-        code = (f"& ([scriptblock]::Create([IO.File]::ReadAllText({quote(SCRIPTS / 'run.ps1')}))) "
-                f"-SourceDirectory {quote(SCRIPTS)} -Mode Session -RequestPath {quote(request_path)}")
-        argv = [str(powershell), "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand",
-                base64.b64encode(code.encode("utf-16-le")).decode("ascii")]
+        request_bytes = json.dumps(request, indent=2).encode('utf-8')
+        if len(request_bytes) > 1024 * 1024:
+            raise ValueError('Session request exceeds the bounded JSON evidence size')
+        request_path.write_bytes(request_bytes)
+        script_directory = SCRIPTS
+        if launch is None:
+            manager = trusted_sandbox_management.ManagementSession(root, request, repo)
+            request['trustedManagement'] = manager.metadata()
+            request_bytes = json.dumps(request, indent=2).encode('utf-8')
+            if len(request_bytes) > 1024 * 1024:
+                raise ValueError('Trusted-management request exceeds the JSON evidence limit')
+            request_path.write_bytes(request_bytes)
+            manager.bind()
+            manager.preflight()
+            launch = manager.run
+            script_directory = manager.scripts
+        if manager is not None:
+            argv = manager.runner_argv()
+        else:
+            # Preserve the existing explicitly injected launcher contract.
+            quote = lambda path: "'" + str(path).replace("'", "''") + "'"
+            code = (f"& ([scriptblock]::Create([IO.File]::ReadAllText({quote(script_directory / 'run.ps1')}))) "
+                    f"-SourceDirectory {quote(script_directory)} -Mode Session -RequestPath {quote(request_path)}")
+            argv = [str(powershell), "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand",
+                    base64.b64encode(code.encode("utf-16-le")).decode("ascii")]
         started = True
-        process = launch(argv, cwd=str(SCRIPTS), timeout=timeout + 1500, shell=False,
+        process = launch(argv, cwd=str(script_directory), timeout=budget + 1500, shell=False,
                          capture_output=True, text=True, encoding="utf-8")
         host_finished = True
         (root / "adapter.stdout.log").write_text(process.stdout or "", encoding="utf-8")
@@ -398,7 +575,8 @@ def run(command, repo, logs, timeout, *, git, expected_head, expected_branch, po
         if not clean:
             clean = _rescue_cleanup(root, request, launch)
         try:
-            code, output, timed, integrity = validate_evidence(root, request, require_pass=False)
+            evidence = validate_evidence(root, request, require_pass=False)
+            code, output, timed, integrity = evidence
             if process.returncode != (0 if summary.get('outcome') == 'PASS' else 1):
                 raise ValueError("PowerShell runner failed despite passing guest evidence")
             _identity(repo, git, expected_head, expected_branch)
@@ -412,9 +590,15 @@ def run(command, repo, logs, timeout, *, git, expected_head, expected_branch, po
             result = _TestResult(code, diagnostic, timed, clean, True)
             integrity = {'schemaVersion': 1, 'verified': False, 'error': str(exc)}
         else:
-            result = _TestResult(code, output, timed, True, True)
+            result = _TestResult(code, output, timed, clean, True)
+            if whole_session:
+                result.suite_results = [_TestResult(code, text, timed, clean, True)
+                                        for code, text, timed in evidence.suites]
         result.windows_sandbox = root.name
         result.source_integrity = integrity
+        for suite in getattr(result, 'suite_results', []):
+            suite.windows_sandbox = root.name
+            suite.source_integrity = integrity
         with (root / 'integrity-verification.json').open('x', encoding='utf-8') as stream:
             json.dump(integrity, stream, indent=2)
         return result
@@ -425,7 +609,8 @@ def run(command, repo, logs, timeout, *, git, expected_head, expected_branch, po
         else:
             clean = getattr(exc, 'cleanup_confirmed', None) is not False
         if isinstance(exc, subprocess.TimeoutExpired):
-            result = _TestResult(124, f"Windows Sandbox host execution TIMEOUT; evidence: {root}", True, clean, True)
+            stage = 'host execution' if started else 'management preflight before VM launch'
+            result = _TestResult(124, f"Windows Sandbox {stage} TIMEOUT; evidence: {root}", True, clean, started)
             result.windows_sandbox = root.name if root is not None else None
             return result
         # Never infer Sandbox termination from the host process exit alone.

@@ -16,20 +16,34 @@ $runsFolder = if ($Mode -eq 'Smoke') { 'Phase2POC' } else { 'Phase3Runs' }
 $root = Join-Path (Join-Path $toolsRoot $runsFolder) $runId
 if ($Mode -eq 'Session') {
     $request = Get-Content -LiteralPath $RequestPath -Raw | ConvertFrom-Json
+    $sessionWide = $request.executionScope -ceq 'approved-session-v2'
     $runId = ([guid]$request.runId).ToString()
     $requestedId = ([guid]$request.sandboxId).ToString()
     if ($runId -cne $request.runId -or $requestedId -cne $request.sandboxId -or
         $request.sourceCommit -notmatch '^[0-9a-f]{40}([0-9a-f]{24})?$' -or
         [string]::IsNullOrWhiteSpace($request.sourceBranch) -or $request.policy.timeout_seconds -lt 30 -or
         $request.policy.timeout_seconds -gt 86400 -or $request.suiteIndex -lt 1 -or
-        $request.suiteIndex -gt @($request.policy.test_commands).Count -or @($request.command).Count -lt 1 -or
+        $request.suiteIndex -gt @($request.policy.test_commands).Count -or
+        (!$sessionWide -and @($request.command).Count -lt 1) -or
         $request.sourceIntegrity.schemaVersion -ne 1 -or $request.sourceIntegrity.baselineSha256 -cnotmatch '^[0-9a-f]{64}$') {
         throw 'Invalid controller session request.'
+    }
+    if ($request.executionScope -and !$sessionWide) { throw 'Unsupported session execution scope.' }
+    $sessionSpecs = @(Get-SessionSuites $request)
+    $commandCount = 1
+    if ($sessionWide) {
+        $commandCount = @($request.commands).Count
+        if ($request.suiteIndex -ne 1 -or $commandCount -lt 1 -or $commandCount -gt 10 -or
+            $commandCount -ne @($request.policy.test_commands).Count -or
+            $commandCount -ne @($request.policy.session_coverage.minimum_tests_per_suite).Count -or
+            $request.sourceStartCommit -cnotmatch '^[0-9a-f]{40}([0-9a-f]{24})?$' -or
+            $request.selectionSha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'Invalid complete-session request.' }
     }
     $root = Split-Path -Parent (Resolve-Path -LiteralPath $RequestPath).Path
     $sourceCommit = $request.sourceCommit
     $SuiteTimeoutSeconds = [int]$request.policy.timeout_seconds
-    $OverallTimeoutSeconds = $SuiteTimeoutSeconds + 300
+    if ($SuiteTimeoutSeconds * $commandCount -gt 86400) { throw 'Combined session deadline exceeds runner capacity.' }
+    $OverallTimeoutSeconds = $SuiteTimeoutSeconds * $commandCount + 300
 }
 $inputDir = Join-Path $root 'input'
 $resultsDir = Join-Path $root 'results'
@@ -45,7 +59,15 @@ if ($Mode -eq 'Session') {
     New-Item -ItemType Directory -Path $resultsDir | Out-Null
 } else { New-Item -ItemType Directory -Path $inputDir, $resultsDir | Out-Null }
 Copy-Item -LiteralPath (Join-Path $SourceDirectory 'guest.ps1') -Destination $inputDir
-$wsbExe = (Get-Command wsb -ErrorAction Stop).Source
+if ($Mode -eq 'Session' -and $request.trustedManagement) {
+    $wsbExe = $request.trustedManagement.cli
+    if (!$request.trustedManagement.package.signatureVerified -or
+        !$request.trustedManagement.package.packagePayloadVerified -or
+        $request.trustedManagement.lifetimePolicy -cne 'authenticated-package-broker-only' -or
+        ![IO.Path]::IsPathRooted($wsbExe) -or !(Test-Path -LiteralPath $wsbExe -PathType Leaf)) {
+        throw 'Invalid fixed package management CLI.'
+    }
+} else { $wsbExe = (Get-Command wsb -ErrorAction Stop).Source }
 
 function Invoke-Wsb([string]$Label, [string[]]$Arguments, [int]$TimeoutSeconds = 60, [switch]$TextOutput) {
     [ordered]@{ executable = 'wsb'; arguments = $Arguments } | ConvertTo-Json -Depth 5 |
@@ -118,9 +140,16 @@ try {
         } else {
             if (!(Test-Path -LiteralPath (Join-Path $inputDir 'baseline.zip') -PathType Leaf)) { throw 'Missing approved session archive.' }
             # Only guest-needed fields enter the read-only input mapping.
-            [ordered]@{ sourceBranch = $request.sourceBranch; policySha256 = $request.policySha256;
-                suiteIndex = $request.suiteIndex; command = @($request.command); environment = $request.environment;
-                sourceIntegrity = $request.sourceIntegrity } | ConvertTo-Json -Depth 6 |
+            $sessionInput = [ordered]@{ sourceBranch = $request.sourceBranch; policySha256 = $request.policySha256;
+                suiteIndex = $request.suiteIndex; environment = $request.environment; sourceIntegrity = $request.sourceIntegrity }
+            if ($sessionWide) {
+                $sessionInput.executionScope = $request.executionScope
+                $sessionInput.commands = $request.commands
+                $sessionInput.sourceStartCommit = $request.sourceStartCommit
+                $sessionInput.selectionSha256 = $request.selectionSha256
+                $sessionInput.minimumTestsPerSuite = @($request.policy.session_coverage.minimum_tests_per_suite)
+            } else { $sessionInput.command = @($request.command) }
+            $sessionInput | ConvertTo-Json -Depth 8 |
                 Set-Content -LiteralPath (Join-Path $inputDir 'session.json') -Encoding UTF8
         }
         $gitXml = [Security.SecurityElement]::Escape($gitRoot)
@@ -218,7 +247,12 @@ try {
             'test_desktop_control.py', 'test_plan_audit.py', 'test_isolated_workspace.py')
         $counts = @(4, 7, 39, 37, 40, 18)
         if ($Mode -eq 'Session') {
-            $files = @("session-suite-$($request.suiteIndex)")
+            $files = @($sessionSpecs | ForEach-Object { $_.file })
+            if ($sessionWide) {
+                if ($baseline.executionScope -cne $request.executionScope -or
+                    $baseline.sourceStartCommit -cne $request.sourceStartCommit -or
+                    $baseline.selectionSha256 -cne $request.selectionSha256) { throw 'Guest session selection differs from request.' }
+            }
             if ($baseline.sourceBranch -cne $request.sourceBranch -or $baseline.policySha256 -cne $request.policySha256 -or
                 $baseline.suiteIndex -ne $request.suiteIndex) { throw 'Guest session identity differs from controller request.' }
         }
@@ -240,8 +274,8 @@ try {
             $expectedArgs = @('-m', 'unittest', 'discover', '-s', 'tests', '-p', $file, '-v')
             $expectedExe = 'C:\Python313Embed\python.exe'
             if ($Mode -eq 'Session') {
-                $expectedExe = $request.command[0]
-                $expectedArgs = @($request.command | Select-Object -Skip 1)
+                $expectedExe = $sessionSpecs[$i].command[0]
+                $expectedArgs = @($sessionSpecs[$i].command | Select-Object -Skip 1)
             }
             if (($metadata | ConvertTo-Json -Depth 6 -Compress) -cne ($p | ConvertTo-Json -Depth 6 -Compress) -or
                 ($savedSuite | ConvertTo-Json -Depth 7 -Compress) -cne ($suite | ConvertTo-Json -Depth 7 -Compress) -or
@@ -260,6 +294,10 @@ try {
             if (($Mode -eq 'Baseline145' -and $report.tests -ne $counts[$i]) -or $report.tests -lt 1 -or $report.failures -ne 0 -or $report.errors -ne 0 -or $report.skips -ne 0) {
                 throw "Suite count or failure mismatch: $file"
             }
+            if ($Mode -eq 'Session' -and $sessionWide -and
+                $report.tests -lt $request.policy.session_coverage.minimum_tests_per_suite[$i]) {
+                throw "Approved per-suite coverage minimum not met: $file"
+            }
             $previousFinish = [DateTimeOffset]::Parse($p.finishedUtc)
             $total += $report.tests
             $checks += [ordered]@{ file = $file; tests = $report.tests; exitCode = $p.exitCode;
@@ -268,6 +306,9 @@ try {
         if (($Mode -eq 'Baseline145' -and $total -ne 145) -or $baseline.totalTests -isnot [int] -or $baseline.totalTests -ne $total -or
             $baseline.success -isnot [bool] -or !$baseline.success -or $null -ne $baseline.error -or $execution.ExitCode -ne 0) {
             throw "Baseline failed: $($baseline.error)"
+        }
+        if ($Mode -eq 'Session' -and $sessionWide -and $total -lt $request.policy.minimum_tests) {
+            throw 'Approved combined session coverage minimum not met.'
         }
     }
     $passed = $true

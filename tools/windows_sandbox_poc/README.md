@@ -241,5 +241,239 @@ This is cooperative verification. The host baseline and package are independentl
 verifiable; the host cannot independently inspect post-test guest files after
 shutdown. A malicious SYSTEM guest can forge observations or change files after
 the observation point. No attestation or adversarial resistance is claimed.
-Batch 3 must qualify these limits, interruption/recovery and production readiness;
-the old tester remains intact and MXC remains the default.
+Batch 3 exercised these limits and interruption/recovery. Complete repository CI
+has qualification blockers: the replacement is **NOT QUALIFIED**. The old tester
+remains intact, MXC remains the default, and Windows Sandbox remains experimental.
+
+## Batch 3 hardening and qualification
+
+The controller now binds reused guest argv to the selected approved policy command
+and its source-repository translation. Validation rejects contradictory successful
+receipts containing host/guest errors, boolean deadline metadata, and cleanup
+records whose argv does not stop precisely the requested owned ID and then list
+instances. Deterministic regressions reproduce these acceptance defects.
+
+One real failure fixture exposed Windows clock-provider rounding: a Python hash
+worker's observation finished 0.6903 ms after its enclosing .NET process timestamp.
+Cross-provider observation/worker bounds allow at most 20 ms of rounding. Native
+worker/test ordering and each provider's own start/end ordering remain strict;
+the tolerance does not permit a worker to overlap a test. Regression coverage
+accepts 1 ms and rejects 50 ms. Original failed receipts remain intact, and a
+normal controller resume produced the correct test-failure decision.
+
+Raw process streams permit read sharing for bounded progress inspection. No
+deadline or process-containment check was removed. Real cases verified a 30-second
+guest deadline and an intentional stop of only the fixture's owned Sandbox;
+startup and foreign-instance rescue failure paths used launcher doubles. Hard
+host termination and machine shutdown were not deliberately exercised: either
+can prevent cleanup/receipt completion, requiring recovery of the recorded owned
+ID. Incomplete evidence cannot authorize PASS.
+
+The complete repository CI command used a 3,600-second deadline from the CI policy,
+without removing tests or allowing skips at the controller gate. Two existing
+desktop-reader assertions fail against unchanged dashboard HTML. The final-code
+snapshot discovers 735 tests; focused adapter/integrity/acceptance checks pass
+all 60 cases. Exact full-run counts, failures, cleanup records, matrix and explicit
+real-versus-mocked methods are in the external Phase4Batch3 evidence directory
+identified by `C:\Users\HP\Desktop\AutoCodingSandboxRepro\Phase4Batch3\run-root.txt`.
+This qualification does not claim other OS/Python CI matrix cells or malicious
+guest attestation, and does not authorize old-tester removal or production cutover.
+
+The complete host run finished all 734 cases from its earlier snapshot: 723 passed,
+8 failed, 1 error, 2 skipped; one skip violates the existing CI skip policy. The
+735-case real Sandbox attempt timed out at the original 3,600-second deadline.
+The controller stopped with `infrastructure_timeout`, retained the approved commit
+and confirmed owned cleanup. Guest unittest totals remain unknown without a final
+summary; partial progress does not establish mandatory coverage.
+All 19 owned receipts retain original stop/list cleanup proof. Two later
+independent `wsb list --raw` queries timed out after 30 seconds each, so current
+inventory confirmation is BLOCKED. Host CLI termination is not Sandbox cleanup
+proof. No further stop or recovery action was attempted.
+
+
+## Batch 3 remediation
+
+Remediation is **BLOCKED** by host prerequisites, with historical Batch 3 results
+retained above. The nine previously failing/error tests are corrected: obsolete
+desktop assertions now exercise the existing single-panel UI and explicit log
+export, managed-start fixtures obtain real JSON audit authorization, and native
+confirmation again identifies the managed GitHub repository. No dashboard redesign
+or authorization bypass was introduced. The adjacent spawn-failure test now proves
+that its mocked child launch is actually reached.
+
+Targeted validation passes all six desktop-reader and four managed-start/spawn
+cases. Relevant integrity, controller, process, retained MXC and desktop regressions
+pass all 182 cases without failures, errors or skips. Complete host CI attempt:
+no complete unittest totals; the bounded attempt did not complete; exit 124, original 3,600-second deadline retained.
+
+Real symlink creation fails with WinError 1314 because this token lacks the required
+privilege; both real-link tests remain skipped, without accepting an unexpected
+skip as PASS. A bounded inventory diagnostic finds that the CLI root exits 0, but
+WindowsSandboxServer.exe remains active in its owned Job and prevents quiescence.
+Partial empty-inventory stdout is not accepted. No security policy or containment
+exception was added, and no new Sandbox was launched, stopped or reclaimed.
+
+The original full guest run completed a continuing test prefix before its deadline,
+while host and guest full CI overlapped for about 44.5 minutes. Its retained logs
+cannot establish per-test guest latency or justify a larger deadline. Current host
+per-case timing and a read-only Git measurement are retained separately.
+
+The twelve-part remediation report and exact evidence are in
+`C:\Users\HP\Desktop\AutoCodingSandboxRepro\Phase4Batch3\remediation-b12194e241a2464d85c8f2ce4c28c14b` (`remediation-report.md` and `remediation-report.json`).
+MXC remains default, the old tester remains intact, Windows Sandbox stays
+experimental and opt-in, and no Batch 4 cleanup or production cutover occurred.
+
+## Approved session coverage
+
+The controller's Windows final stage uses `executionScope: approved-session-v2`.
+It calls the existing Session runner once with all commands, starts one owned VM,
+executes the commands sequentially in the same disposable repository, and stops
+that VM once. `suiteIndex: 1` is the legacy integrity schema's execution slot;
+individual results are `session-suite-1` through `session-suite-N`. Older receipts
+remain readable through the legacy API but cannot satisfy a new grouped session.
+
+Example policy fragment for a hypothetical feature (choose actual suites and
+counts for the repository before obtaining approval):
+
+```json
+{
+  "test_commands": [
+    ["python", "-m", "unittest", "discover", "-s", "tests", "-p", "test_feature.py"],
+    ["python", "-m", "unittest", "discover", "-s", "tests", "-p", "test_feature_security.py"]
+  ],
+  "minimum_tests": 7,
+  "timeout_seconds": 300,
+  "session_coverage": {
+    "rules": [
+      {
+        "id": "feature-and-callers",
+        "paths": ["src/feature.py", "src/feature_caller.py", "tests/test_feature.py", "tests/test_feature_security.py"],
+        "suite_indices": [1, 2],
+        "reason": "Feature, affected caller regression, added tests and authorization boundary"
+      }
+    ],
+    "minimum_tests_per_suite": [4, 3],
+    "mandatory_security_suites": [2]
+  }
+}
+```
+
+Rules use case-sensitive `fnmatchcase` patterns on safe repository-relative POSIX
+paths. `*` also matches `/`; these are not Git pathspecs. Prefer exact paths or
+narrow reviewed patterns. Each rule requires a unique id, paths, one-based suite
+indices and a coverage reason. The mapping must explicitly justify changed tests,
+affected dependencies, integration/regression coverage and security coverage where
+applicable. It does not automatically discover dependency relationships.
+
+Every command in `test_commands` is mandatory. Rules never filter that list;
+`mandatory_security_suites` records explicitly required security entries. Each
+suite must meet its own positive minimum and the minima must cover the combined
+minimum. Missing rules for any checkpoint or net-change path stop execution before
+launch. Changing the declaration changes the approved policy/plan identity and
+requires the normal approval process. A previously approved full-CI command is
+retained; there is no automatic full-CI fallback. Manual full CI remains
+`python tests/ci_unittest.py`.
+
+`timeout_seconds` remains the per-command deadline. The overall guest deadline is
+N times that value plus 300 seconds; the host launcher gets N times it plus 1500
+seconds for setup, evidence and cleanup. A combined command budget above 86400
+seconds is rejected before launch, rather than shortened. Existing bounded-process
+containment, offline tool hashes, disabled networking and owned-id cleanup remain.
+
+The canonical `final-verification-NNNN-selection.json` records initial/final commits,
+all approved checkpoint deltas, net changes, matched paths/rules, mandatory suite
+indices and per-suite minima. Its SHA-256 is echoed through the request and guest
+result. All suite outputs reference the same receipt and pre/post integrity proof.
+Reuse rechecks the current approved checkpoint chain, audit identity, selection,
+source/policy identities, every output and owned cleanup. One synthetic launcher
+call in tests proves orchestration only; real VM acceptance still requires a safe
+bounded inventory and a successful real run. Partial inventory stdout never
+satisfies that prerequisite.
+
+For this session-scoped implementation, the strict 30-second inventory attempt
+remained unconfirmed: the root CLI exited 0 but its contained
+`WindowsSandboxServer.exe` child stayed active through the 28-second sample.
+The bounded runner confirmed cleanup of its owned process job; no VM run was
+attempted. No broker exemption or Windows security setting was introduced.
+See `C:\Users\HP\Desktop\AutoCodingSandboxRepro\Phase4SessionScoped-0b808c6d4ecb4daa90aa4a542d39f4f4\session-report.md`
+for focused results, selection/approval proofs, final Git status and limitations.
+
+## Cold-start candidate: blocked, diagnostic only
+
+`broker.ps1` and `auto_coding.sandbox_broker` are an isolated diagnostic candidate,
+not part of automatic final verification. They use registered Microsoft package
+activation with bounded strict Job-owned helper/readiness calls (45/30 seconds).
+No target-selected command, profile or environment enters activation. Package
+identity, protected installation path, Microsoft signature on `AppxSignature.p7x`,
+native `CreateValidatedBlockMapReader` validation, every payload's signed block
+hashes, supported whole-file hashes, and returned PID/package/session are checked.
+The executables are covered by the MSIX signature; they have no individual
+Authenticode signature. `-ValidateOnly` performs no activation.
+
+The actual package-only check passed all 835 payload files. Cold activation
+returned PID 20500; the following strict inventory created a different broker,
+PID 18012, which remained in the CLI's Job through the 30-second sample. Inventory
+timed out with owned-job cleanup confirmed. Partial empty output is retained only
+as incomplete diagnostics. The cause of the activated service's failure to serve
+the CLI has not been established; registered activation alone is insufficient.
+
+No instance was started. The two-task fixture's approved 2-test and 3-test commands
+were selected but not executed. Host packaging matched approved final source;
+guest pre/post SHA evidence does not exist. The unqualified integration was removed
+from the automatic path; existing session-scoped verification and MXC are preserved.
+Full repository CI was not run. No more speculative activation/VM attempts follow
+this failed readiness proof.
+
+Evidence and twelve-part **BLOCKED** report:
+`C:\Users\HP\Desktop\AutoCodingSandboxRepro\Phase4Broker-8dbd484fec7b447498dd87cbd8b8d365\broker-report.txt`.
+
+API contracts: [package activation](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-iapplicationactivationmanager-activateapplication),
+[signed block-map validation](https://learn.microsoft.com/en-us/windows/win32/api/appxpackaging/nf-appxpackaging-iappxfactory-createvalidatedblockmapreader),
+and [Job process ownership](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects).
+
+## Sealed management path: real session acceptance
+
+The current Windows controller uses `trusted_sandbox_management.py` with
+`windows_management_job.py` for host management only. The general-purpose process
+runner and its kill-on-close Jobs are unchanged. The Phase 3 Session runner still
+packages/executes all selected commands in one owned VM and validates its existing
+evidence protocol. The only runner change selects the validated package CLI path
+directly, without depending on a user PATH alias.
+
+Six controller files have explicit reviewed SHA-256 pins: run/common/baseline/guest
+scripts, the read-only package validator, and the integrity worker. UTF-8 BOM/CRLF
+normalization is explicit. A private host snapshot outside the target is checked
+again before each operation, together with the immutable request hash. Only this
+snapshot is used; approved source archives remain guest data. Pin updates require
+reviewed controller deployment, not selection from session output.
+
+The fixed system PowerShell image is resolved through the Windows API and its
+Microsoft signature checked. `broker.ps1 -ValidateOnly` validates the installed
+Microsoft package signature, signature-bound block map and every payload hash;
+it does not call the experimental AppService activation. Command arguments and
+working directories are sealed. Rescue is limited to the marker's owned UUID;
+inventories are read-only and malformed/duplicate IDs are rejected.
+
+The host here inherits Job flags `0x2800` (kill-on-close plus explicit breakaway).
+Only the sealed root uses that existing permission to leave the ancestor, suspended,
+and is attached to a separate tracking Job before resume. No flags on an existing
+Job or machine policy change. The new Job has no descendant-breakaway flags.
+Normal untrusted Jobs (`0x2000`) cannot use this route; a native regression proves
+that denial. Direct command deadlines and complete capture still apply. Broker
+survival is authorized only after exact signed-package/image/hash, package-token,
+retained-handle/creation-time and owned-Job checks. Other survivors reject completion.
+Closing this tracking Job does not terminate the shared broker or foreign VMs.
+Cancellation targets owned command handles, then the existing adapter stops only
+its marked VM and confirms absence. Any uncertainty keeps verification failed.
+
+Cold management preflight completed in 0.76 seconds with a verified persistent
+broker instead of a false 30-second timeout. The first runner exited before VM
+launch because it still queried the alias; this was fixed and tested with alias
+lookup deliberately forbidden. The same approved fixture resumed without agent
+replay and started exactly one instance, `82b8e924-2c54-492e-bf18-d3ec46ce1de9`.
+Both suites passed (2 and 3 tests, exits 0); host/guest exits, five protected source
+files, SHA pre/post scans, stop, after-inventory and fresh independent inventory
+passed. Evidence reuse also passed. This is controlled integration acceptance,
+not broad production qualification or cutover. Full repository CI was not run.
+
+Evidence: `C:\Users\HP\Desktop\AutoCodingSandboxRepro\Phase4Management-d8981e7e838649bb94a25a5de8181b55\management-report.txt`.

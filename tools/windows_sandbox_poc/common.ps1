@@ -1,4 +1,33 @@
 # Shared by host and guest; no dependencies or changes to machine policy.
+function Get-SessionSuites {
+    param($Request)
+    $whole = $Request.executionScope -ceq 'approved-session-v2'
+    if ($Request.executionScope -and !$whole) { throw 'Unsupported session execution scope.' }
+    if ($whole) {
+        $commands = @($Request.commands)
+        $minimum = $Request.minimumTestsPerSuite
+        if ($null -eq $minimum) { $minimum = $Request.policy.session_coverage.minimum_tests_per_suite }
+        $minimum = @($minimum)
+        if ($commands.Count -lt 1 -or $commands.Count -gt 10 -or $minimum.Count -ne $commands.Count) {
+            throw 'Incomplete session command/count inventory.'
+        }
+        for ($i = 0; $i -lt $commands.Count; $i++) {
+            $command = $commands[$i]
+            if ($command -is [string] -or @($command).Count -lt 1 -or @($command).Count -gt 32 -or
+                $minimum[$i] -isnot [int] -or $minimum[$i] -lt 1 -or $minimum[$i] -gt 1000000) {
+                throw 'Malformed session suite.'
+            }
+            foreach ($argument in $command) {
+                if ($argument -isnot [string] -or !$argument -or $argument.Length -gt 4096) { throw 'Malformed session argv.' }
+            }
+            [pscustomobject]@{ file = "session-suite-$($i + 1)"; command = @($command); minimumTests = $minimum[$i] }
+        }
+    } else {
+        if ($Request.suiteIndex -lt 1 -or @($Request.command).Count -lt 1) { throw 'Missing legacy session command.' }
+        [pscustomobject]@{ file = "session-suite-$($Request.suiteIndex)"; command = @($Request.command); minimumTests = 1 }
+    }
+}
+
 function Invoke-BoundedProcess {
     param([string]$Executable, [string[]]$Arguments, [string]$WorkingDirectory,
         [string]$LogPrefix, [ValidateRange(1, 100000)][int]$TimeoutSeconds)
@@ -17,8 +46,9 @@ function Invoke-BoundedProcess {
     $info.RedirectStandardError = $true
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $info
-    $stdout = [IO.File]::Create("$LogPrefix.stdout.log")
-    $stderr = [IO.File]::Create("$LogPrefix.stderr.log")
+    # Preserve raw logs while allowing the host to inspect long-running progress.
+    $stdout = [IO.File]::Open("$LogPrefix.stdout.log", [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+    $stderr = [IO.File]::Open("$LogPrefix.stderr.log", [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::Read)
     $timedOut = $false
     $code = $null
     try {

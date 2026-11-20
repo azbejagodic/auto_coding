@@ -35,7 +35,7 @@ from auto_coding.repository_ownership import assert_process_safe
 from auto_coding.launch_preflight import validate_feature_branch, configured_protected_branches
 from auto_coding.sensitive_paths import is_sensitive_path, changed_paths, CHANGE_PATH_OPTIONS
 from auto_coding.final_verification import verification_policy, policy_sha256, unittest_evidence
-from auto_coding import plan_audit
+from auto_coding import plan_audit, session_testing
 from auto_coding import controller_test_sandbox, windows_sandbox, source_integrity, stop_control
 
 
@@ -1845,6 +1845,26 @@ def bind_verification(state, manifest, requested, controller_tests, *, resume):
     state["final_test_backend"] = manifest["final_test_backend"] = backend
 
 
+def approved_session_selection(repo, logs, state):
+    manifest = source_integrity.load(logs / 'run-manifest.json')
+    if (manifest.get('initial_git_head') != state.get('initial_git_head')
+            or manifest.get('run_id') != state.get('run_id')
+            or manifest.get('target_repo') != str(repo) or state.get('repo') != str(repo)
+            or manifest.get('branch') != state['branch']
+            or manifest.get('plan_sha256') != state['plan_sha256']
+            or manifest.get('task_ids') != state['completed']
+            or manifest.get('verification_policy_sha256') != policy_sha256(state['final_verification'])):
+        raise PilotError('Session boundaries or approved policy differ from the run manifest')
+    tasks = [{'id': ident} for ident in state['completed']]
+    verify_resume_git(repo, state, manifest, tasks)
+    plan_audit.verify_resume(sys.modules[__name__], state, manifest, repo, state['plan_sha256'], tasks)
+    try:
+        return session_testing.select_session(repo, state, head(repo), state['final_verification'],
+                                              policy_sha256(state['final_verification']), git)
+    except ValueError as exc:
+        raise PilotError(str(exc)) from exc
+
+
 def final_evidence_valid(repo, logs, state):
     saved, policy = state.get("final_verification_result"), state["final_verification"]
     if (not isinstance(saved, dict) or saved.get("status") != "passed"
@@ -1855,6 +1875,26 @@ def final_evidence_valid(repo, logs, state):
             or type(saved.get("invocation")) is not int or saved["invocation"] < 1
             or not isinstance(saved.get("tests"), list) or len(saved["tests"]) != len(policy["test_commands"])):
         return False
+    originals = None
+    if state.get('final_test_backend') == 'windows-sandbox':
+        try:
+            selection = approved_session_selection(repo, logs, state)
+            name = f"final-verification-{saved['invocation']:04d}-selection.json"
+            if (saved.get('session_selection_sha256') != source_integrity.digest(selection)
+                    or saved.get('session_selection') != selection or saved.get('selection_output') != name
+                    or source_integrity.read(logs / name) != source_integrity.canonical(selection)):
+                return False
+            first = saved['tests'][0]
+            if not isinstance(first, dict):
+                return False
+            originals = windows_sandbox.saved_session_evidence(logs, first.get('windows_sandbox'),
+                head=saved['head'], branch=state['branch'], policy=policy, run_id=state['run_id'],
+                invocation=saved['invocation'], selection=selection, source_repo=repo,
+                integrity_verdict=first.get('source_integrity'))
+            if len(originals) != len(saved['tests']):
+                return False
+        except (OSError, ValueError, TypeError, KeyError, PilotError):
+            return False
     count = 0
     for index, item in enumerate(saved["tests"], 1):
         name = f"final-verification-{saved['invocation']:04d}-test-{index}.txt"
@@ -1871,18 +1911,111 @@ def final_evidence_valid(repo, logs, state):
                 or not summary or not summary["successful"] or summary["skipped"] or summary["tests"] < 1):
             return False
         if state.get("final_test_backend") == "windows-sandbox":
-            if not source_integrity.valid_verdict(item.get('source_integrity')):
+            if (not source_integrity.valid_verdict(item.get('source_integrity'))
+                    or item.get('source_integrity') != saved['tests'][0].get('source_integrity')
+                    or item.get('windows_sandbox') != saved['tests'][0].get('windows_sandbox')
+                    or summary['tests'] < policy['session_coverage']['minimum_tests_per_suite'][index - 1]):
                 return False
-            try:
-                original = windows_sandbox.saved_evidence(logs, item.get("windows_sandbox"),
-                    head=saved["head"], branch=state["branch"], policy=policy, index=index,
-                    run_id=state["run_id"], invocation=saved["invocation"], integrity_verdict=item['source_integrity'])
-                if original != data.decode("utf-8"):
-                    return False
-            except (OSError, ValueError, TypeError, KeyError):
+            if originals[index - 1] != data.decode('utf-8'):
                 return False
         count += summary["tests"]
     return count >= policy["minimum_tests"] and git_clean(repo)
+
+
+def windows_session_final(repo, logs, state, state_path, events, tasks, saved, selection, stop):
+    """A single process gate owns the whole Sandbox lifecycle, not each suite."""
+    policy, ordinal = state['final_verification'], saved['invocation']
+    execution = events.emit('tests', 'test_started', 'started', task_id=tasks[-1]['id'], attempt=ordinal,
+                            metadata={'index': 1, 'stage': 'final_verification', 'scope': 'session',
+                                      'suite_count': len(policy['test_commands'])})
+    context = {'repo': str(repo), 'logs': str(logs), 'run_id': state['run_id'], 'task': tasks[-1]['id'],
+               'attempt': ordinal, 'index': 1, 'execution_id': execution['seq'], 'stage': 'final_verification'}
+    gate = TestProcessGate(repo, context)
+    saved.update(status='running', execution={'index': 1, 'scope': 'session', 'cleanup_confirmed': None})
+    save_json(state_path, state)
+    started = _execution_clock()
+    try:
+        result = windows_sandbox.run_session(policy['test_commands'], repo, logs, policy['timeout_seconds'],
+            git=git, expected_head=saved['head'], expected_branch=state['branch'], policy=policy,
+            selection=selection, session_run_id=state['run_id'], invocation=ordinal,
+            environment=test_environment(repo))
+    except BaseException as exc:
+        cleanup = getattr(exc, 'cleanup_confirmed', None)
+        if cleanup is True or (cleanup is None and getattr(exc, 'process_started', None) is False):
+            saved.update(status='failed', outcome='infrastructure_exception',
+                         execution={'index': 1, 'scope': 'session', 'cleanup_confirmed': True})
+            save_json(state_path, state)
+            gate.finish_confirmed()
+        else:
+            saved['status'] = 'uncertain'
+            record_test_uncertainty(state, state_path, gate)
+        raise
+    finished = _execution_clock()
+    parts = getattr(result, 'suite_results', None)
+    complete = isinstance(parts, list) and len(parts) == len(policy['test_commands'])
+    uncertain = cleanup_unverified(result) or (isinstance(parts, list) and any(cleanup_unverified(part) for part in parts))
+    saved.update(status='uncertain' if uncertain else 'collecting_evidence',
+                 execution={'index': 1, 'scope': 'session', 'cleanup_confirmed': not uncertain},
+                 windows_sandbox=getattr(result, 'windows_sandbox', None))
+    if uncertain:
+        record_test_uncertainty(state, state_path, gate)
+    else:
+        save_json(state_path, state)
+        gate.finish_confirmed()
+    # Preserve failed/timeout diagnostics even when no complete suite inventory exists.
+    if not complete:
+        parts = [result]
+    for index, part in enumerate(parts, 1):
+        code, output, timed = part
+        if len(output.encode('utf-8')) > MAX_CAPTURE_BYTES:
+            return False if uncertain else stop('infrastructure_output_limit')
+        name = f'final-verification-{ordinal:04d}-test-{index}.txt'
+        write_attempt_evidence(logs / name, output)
+        saved['tests'].append({'index': index, 'output': name,
+            'output_sha256': hashlib.sha256((logs / name).read_bytes()).hexdigest(), 'exit_code': code,
+            'timed_out': timed, 'cleanup_confirmed': not uncertain, 'summary': unittest_evidence(output),
+            'windows_sandbox': getattr(result, 'windows_sandbox', None),
+            'source_integrity': getattr(result, 'source_integrity', None)})
+    save_json(state_path, state)
+    events.emit('tests', 'test_finished', 'cleanup_unverified' if uncertain else
+        'timed_out' if result[2] else 'success' if result[0] == 0 else 'failed',
+        task_id=tasks[-1]['id'], attempt=ordinal,
+        evidence={f'suite_{index}': item['output'] for index, item in enumerate(saved['tests'], 1)},
+        metadata={'index': 1, 'stage': 'final_verification', 'scope': 'session',
+                  'suite_count': len(policy['test_commands']), 'exit_code': result[0],
+                  'timed_out': result[2], 'cleanup_confirmed': not uncertain} |
+                 execution_metadata(result, execution['seq'], started, codex=False, finished=finished))
+    if uncertain:
+        return False
+    if result[2] or result[0] in (125, 127):
+        return stop('infrastructure_timeout' if result[2] else 'infrastructure_process_failure')
+    if not source_integrity.valid_verdict(getattr(result, 'source_integrity', None)):
+        return stop('source_integrity_failure')
+    if not complete:
+        return stop('incomplete_test_evidence')
+    total = 0
+    for index, item in enumerate(saved['tests']):
+        summary = item['summary']
+        if item['timed_out']:
+            return stop('infrastructure_timeout')
+        if item['exit_code'] != 0:
+            missing = 'ModuleNotFoundError:' in parts[index][1] or '_FailedTest' in parts[index][1]
+            return stop('test_failure' if summary and summary['failed'] and not missing else 'infrastructure_failure')
+        if not summary or not summary['successful'] or summary['skipped'] or summary['tests'] < 1:
+            return stop('incomplete_test_evidence')
+        if summary['tests'] < policy['session_coverage']['minimum_tests_per_suite'][index]:
+            return stop('insufficient_test_coverage')
+        total += summary['tests']
+    if result[0] != 0:
+        return stop('infrastructure_failure')
+    if head(repo) != saved['head'] or not git_clean(repo) or require_run_branch(repo, state['branch']) != state['branch']:
+        return stop('snapshot_changed')
+    if total < policy['minimum_tests']:
+        return stop('insufficient_test_coverage')
+    saved.update(status='passed', outcome='passed', test_count=total)
+    save_json(state_path, state)
+    events.emit('controller', 'final_verification_finished', 'success', metadata={'head': saved['head'], 'tests': total})
+    return True
 
 
 def final_verification(repo, logs, state, state_path, events, execute, tasks):
@@ -1900,6 +2033,7 @@ def final_verification(repo, logs, state, state_path, events, execute, tasks):
     if final_evidence_valid(repo, logs, state):
         return True
     policy = state["final_verification"]
+    selection = approved_session_selection(repo, logs, state) if state.get('final_test_backend') == 'windows-sandbox' else None
     ordinal = state.get("final_verification_invocations", 0)
     if type(ordinal) is not int or ordinal < 0:
         raise PilotError("Saved final verification invocation count is invalid")
@@ -1910,6 +2044,12 @@ def final_verification(repo, logs, state, state_path, events, execute, tasks):
     saved = {"status": "prepared", "invocation": ordinal, "head": snapshot, "branch": state["branch"],
              "plan_sha256": state["plan_sha256"], "policy_sha256": policy_sha256(policy), "tests": [],
              "backend": state.get("final_test_backend", "mxc")}
+    if selection is not None:
+        name = f'final-verification-{ordinal:04d}-selection.json'
+        with (logs / name).open('xb') as stream:
+            stream.write(source_integrity.canonical(selection))
+        saved.update(session_selection=selection, session_selection_sha256=source_integrity.digest(selection),
+                     selection_output=name)
     state.update(final_verification_result=saved, final_verification_invocations=ordinal, status="stopped")
     save_json(state_path, state)
     events.emit("controller", "final_verification_started", "started", metadata={"head": snapshot, "invocation": ordinal,
@@ -1924,6 +2064,8 @@ def final_verification(repo, logs, state, state_path, events, execute, tasks):
               "Approved commits are preserved. Resume retries verification only after infrastructure is fixed. "
               "Code changes require an explicitly prepared correction task, fresh independent review and fresh final verification.", flush=True)
         return False
+    if saved['backend'] == 'windows-sandbox':
+        return windows_session_final(repo, logs, state, state_path, events, tasks, saved, selection, stop)
     for index, command in enumerate(policy["test_commands"], 1):
         assert_test_process_safe(repo)
         assert_process_safe(repo)
@@ -1940,12 +2082,7 @@ def final_verification(repo, logs, state, state_path, events, execute, tasks):
         save_json(state_path, state)
         started = _execution_clock()
         try:
-            if saved["backend"] == "windows-sandbox":
-                result = windows_sandbox.run(command, repo, logs, policy["timeout_seconds"], git=git,
-                    expected_head=snapshot, expected_branch=state["branch"], policy=policy, index=index,
-                    session_run_id=state["run_id"], invocation=ordinal, environment=child_environment)
-            else:
-                result = execute_controller_test(execute, command, repo, logs, policy["timeout_seconds"], child_environment)
+            result = execute_controller_test(execute, command, repo, logs, policy["timeout_seconds"], child_environment)
         except BaseException as exc:
             cleanup = getattr(exc, "cleanup_confirmed", None)
             if cleanup is True or (cleanup is None and getattr(exc, "process_started", None) is False):
@@ -1978,9 +2115,6 @@ def final_verification(repo, logs, state, state_path, events, execute, tasks):
         summary = unittest_evidence(output)
         item = {"index": index, "output": name, "output_sha256": hashlib.sha256((logs / name).read_bytes()).hexdigest(),
                 "exit_code": code, "timed_out": timed, "cleanup_confirmed": not uncertain, "summary": summary}
-        if saved["backend"] == "windows-sandbox":
-            item["windows_sandbox"] = getattr(result, "windows_sandbox", None)
-            item['source_integrity'] = getattr(result, 'source_integrity', None)
         saved["tests"].append(item)
         save_json(state_path, state)
         events.emit("tests", "test_finished", "cleanup_unverified" if uncertain else (
@@ -1993,8 +2127,6 @@ def final_verification(repo, logs, state, state_path, events, execute, tasks):
             return False
         if timed or code in (125, 127):
             return stop("infrastructure_timeout" if timed else "infrastructure_process_failure")
-        if saved['backend'] == 'windows-sandbox' and not source_integrity.valid_verdict(item.get('source_integrity')):
-            return stop('source_integrity_failure')
         if code != 0:
             missing_dependency = "ModuleNotFoundError:" in output or "_FailedTest" in output
             return stop("test_failure" if summary and summary["failed"] and not missing_dependency else "infrastructure_failure")

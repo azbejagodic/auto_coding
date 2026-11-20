@@ -161,4 +161,171 @@ guest files are not independently exported/rehashed on the host: their inventory
 timing and process records remain cooperative guest observations. A malicious
 guest can forge those reports. SHA-256 comparison does not provide attestation.
 MXC stays the default; Windows Sandbox remains explicitly selected and experimental.
-Batch 3 qualification and any production-cutover decision remain deferred.
+Batch 3 qualification found blockers in the complete repository CI policy;
+the replacement is **NOT QUALIFIED**. Production cutover remains deferred.
+
+## Batch 3 acceptance evidence
+
+Qualification used the real controller final gate and actual approved fixture
+commits, with only external A/B decisions and audit authorization mocked. Real
+cases covered multiple mandatory suites, assertion failures, test errors, skips,
+insufficient counts, source modification/addition/deletion/rename, missing and
+corrupt inventories, a bounded guest timeout, controlled owned-instance termination,
+and controller resume without A/B replay. Startup-timeout and foreign-instance
+coexistence checks used deterministic launcher doubles, not real hung instances.
+
+The selected production policy was the complete `python tests/ci_unittest.py`
+entrypoint with a 3,600-second command deadline, using the available offline
+Windows Python 3.13.17. The final-code snapshot discovers 735 tests. Existing
+desktop-reader assertions fail against unchanged dashboard HTML; expectations
+and mandatory coverage were retained. Focused adapter, integrity and acceptance
+regressions pass: 60 tests, zero failures, errors or skips.
+
+Complete host CI on the earlier 734-test snapshot finished with 723 passed,
+8 failed, 1 error and 2 skips (one unexpected under CI policy). The real Sandbox
+735-test policy attempt reached its unchanged 3,600-second command deadline;
+the controller reported `infrastructure_timeout`, preserved the checkpoint and
+confirmed owned cleanup. No complete guest unittest totals were produced.
+All 19 owned receipts retain stop/list cleanup proof. Two later independent
+30-second inventory queries timed out; the current inventory is unconfirmed.
+
+Original receipts, exact full-CI results and the acceptance matrix are retained
+under `C:\Users\HP\Desktop\AutoCodingSandboxRepro\Phase4Batch3`; `run-root.txt`
+identifies the qualification directory containing `acceptance-report.md` and
+`acceptance-matrix.json`. Earlier Phase 3 evidence remains separate. MXC and its
+dependencies remain available; no Batch 4 removal or production cutover occurred.
+
+
+## Batch 3 remediation
+
+Remediation is **BLOCKED** by host prerequisites, with historical Batch 3 results
+retained above. The nine previously failing/error tests are corrected: obsolete
+desktop assertions now exercise the existing single-panel UI and explicit log
+export, managed-start fixtures obtain real JSON audit authorization, and native
+confirmation again identifies the managed GitHub repository. No dashboard redesign
+or authorization bypass was introduced. The adjacent spawn-failure test now proves
+that its mocked child launch is actually reached.
+
+Targeted validation passes all six desktop-reader and four managed-start/spawn
+cases. Relevant integrity, controller, process, retained MXC and desktop regressions
+pass all 182 cases without failures, errors or skips. Complete host CI attempt:
+no complete unittest totals; the bounded attempt did not complete; exit 124, original 3,600-second deadline retained.
+
+Real symlink creation fails with WinError 1314 because this token lacks the required
+privilege; both real-link tests remain skipped, without accepting an unexpected
+skip as PASS. A bounded inventory diagnostic finds that the CLI root exits 0, but
+WindowsSandboxServer.exe remains active in its owned Job and prevents quiescence.
+Partial empty-inventory stdout is not accepted. No security policy or containment
+exception was added, and no new Sandbox was launched, stopped or reclaimed.
+
+The original full guest run completed a continuing test prefix before its deadline,
+while host and guest full CI overlapped for about 44.5 minutes. Its retained logs
+cannot establish per-test guest latency or justify a larger deadline. Current host
+per-case timing and a read-only Git measurement are retained separately.
+
+The twelve-part remediation report and exact evidence are in
+`C:\Users\HP\Desktop\AutoCodingSandboxRepro\Phase4Batch3\remediation-b12194e241a2464d85c8f2ce4c28c14b` (`remediation-report.md` and `remediation-report.json`).
+MXC remains default, the old tester remains intact, Windows Sandbox stays
+experimental and opt-in, and no Batch 4 cleanup or production cutover occurred.
+
+## Session-scoped Windows final verification
+
+The experimental Windows backend now submits all approved final test commands to
+one disposable Sandbox after every task, independent review and checkpoint has
+finished. Task-level implementation/review validation is unchanged. MXC remains
+the default, and the existing tester remains available.
+
+Windows sessions require an explicit `session_coverage` declaration inside their
+approved `final_verification` policy. See the [runner documentation](tools/windows_sandbox_poc/README.md#approved-session-coverage)
+for its schema. The plan audit reviews this declaration; its normalized contents
+are included in the existing policy hash and approval/resume identity. Existing
+approved policies are never migrated or narrowed automatically. A Windows policy
+without a coverage declaration stops before launch and requires a freshly
+prepared, audited policy.
+
+The controller inventories the initial manifest commit through the final approved
+checkpoint, including every intervening approved checkpoint delta. Thus additions,
+deletions, both rename paths and changes subsequently reverted remain visible.
+Every path must match an approved rule declaring the relevant tests and affected
+dependency, integration, regression or security coverage. This is a reviewed
+coverage declaration; the controller does not infer semantic dependencies. Missing
+coverage fails closed. All existing mandatory commands remain selected even when
+no changed path names them. Full CI remains available with
+`python tests/ci_unittest.py`; it is included automatically only when an approved
+policy explicitly requires that command.
+
+One run-specific selection artifact binds the session commits, checkpoint changes,
+coverage reasons through the policy, command indices, minimum counts and mandatory
+security suites. One host source package and protected SHA-256 baseline feed one
+VM. A single guest pre-test scan precedes all commands and a single post-test scan
+follows them. PASS also requires every command's raw unittest evidence, counts,
+exit code, complete selection identity and confirmed owned-VM cleanup. Failures
+stop without a coding repair or automatic retry. Resume can reuse only complete
+matching evidence; an explicit resume after a confirmed failure may retry final
+verification. Cooperative guest observations remain evidence, not malicious-guest
+attestation. Production qualification and backend cutover remain separate work.
+
+Real session-wide acceptance remains blocked on this host: the bounded read-only
+inventory query times out because `WindowsSandboxServer.exe` remains active in
+the owned process job after the CLI exits. Partial empty-inventory output is not
+accepted. No VM was launched and no containment/security setting was changed.
+The focused validation and nine-part report are retained in
+`C:\Users\HP\Desktop\AutoCodingSandboxRepro\Phase4SessionScoped-0b808c6d4ecb4daa90aa4a542d39f4f4\session-report.md`.
+
+## Broker cold-start investigation
+
+Automatic cold-start readiness remains **BLOCKED**. An isolated package-activation
+candidate validates the Microsoft MSIX signature, signed block map and all 835
+installed payload files before using `IApplicationActivationManager`. On this host
+it starts an authenticated `AppService` process, but the next CLI inventory starts
+a different persistent broker inside its own Job. The CLI exits 0 with partial
+empty-inventory output; the owned Job remains active until the strict 30-second
+timeout. Package activation therefore does not establish a usable broker lifetime.
+
+The candidate is retained as `sandbox_broker.py` and `broker.ps1` for reproduction;
+it is **not connected to automatic final verification**. The original automatic
+runner, strict process containment, ownership checks, session-scoped policy and
+MXC default remain intact. No broker-name exemption, breakaway, machine-policy
+change, VM launch or foreign-instance cleanup occurred. The real two-task fixture
+completed all approvals/checkpoints but correctly failed final verification before
+VM launch. No real guest test or guest SHA verification is claimed.
+
+The twelve-part report, exact lifecycle trace, package-validation results, focused
+tests and final Git status are in
+`C:\Users\HP\Desktop\AutoCodingSandboxRepro\Phase4Broker-8dbd484fec7b447498dd87cbd8b8d365\broker-report.txt`.
+
+## Trusted Sandbox management boundary
+
+The opt-in Windows backend now uses a sealed management boundary for the existing
+Phase 3 runner. General `bounded_run`, untrusted Windows Jobs and MXC are unchanged.
+Host script hashes are loaded with the controller before coding begins; only those
+reviewed bytes are snapshotted outside the target and used for host/guest setup.
+Session-generated scripts cannot replace them. Legitimate launcher changes require
+an explicit review/update of the pinned controller hashes and a controller restart.
+
+The fixed Microsoft PowerShell host and installed Sandbox package are validated
+before management. A read-only `broker.ps1 -ValidateOnly` checks the MSIX signature,
+signed block map and all payload files; the failed AppService initializer remains
+isolated. The permitted commands are the exact snapshotted Session runner, an
+inventory query, and marker-authorized cleanup of the unique owned instance.
+Guest test argv never becomes host shell code.
+
+Each sealed management root is created suspended and assigned to its own tracking
+Job before execution. If an ancestor Job exists, its existing policy must permit
+explicit separation; strict untrusted Jobs do not, and are rejected. The tracking
+Job forbids descendant breakaway. It intentionally does not kill shared Microsoft
+brokers on close. Completion requires root exit, complete stdout/stderr and no
+survivor except a broker verified by Job membership, retained process handle,
+creation time, exact package identity, protected image path and signed-payload hash.
+Unknown survivors fail closed. Timeouts cancel owned transient commands, preserve
+broker lifetime and require ID-specific VM cleanup; they cannot produce PASS.
+
+Real controlled acceptance passed: two approved task checkpoints, exactly one VM,
+two suites (2 + 3 tests), successful protected SHA-256 pre/post checks, owned shutdown,
+fresh independent empty inventory and reusable controller evidence. A pre-VM alias
+lookup defect was corrected before the single VM start; final verification resumed
+without replaying A/B. No manual broker warmup, AppService activation, guest command,
+full CI, security-policy change or production cutover occurred. MXC remains default.
+
+The twelve-part report and original/corrected evidence are retained in
+`C:\Users\HP\Desktop\AutoCodingSandboxRepro\Phase4Management-d8981e7e838649bb94a25a5de8181b55\management-report.txt`.
