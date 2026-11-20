@@ -1,5 +1,7 @@
 import json
 import hashlib
+import contextlib
+import io
 import os
 import shutil
 from pathlib import Path
@@ -16,6 +18,37 @@ from auto_coding.desktop_app import Bridge
 
 
 class WorkspaceTests(unittest.TestCase):
+    def json_plan(self, name):
+        path = self.root / name
+        path.write_text(json.dumps({"tasks": [{"id": "one", "prompt": "Implement one task",
+            "test_commands": [["fixture-focused"]]}], "final_verification": {
+            "test_commands": [["fixture-final"]], "minimum_tests": 1, "timeout_seconds": 30}}),
+            encoding="utf-8")
+        return path
+
+    def approve_plan(self, controller):
+        """Mock the model response; retain real audit identity, ledger and gates."""
+        from auto_coding import simple_run as runner
+        directory = self.root / "approved-audit"
+        def auditor(argv, cwd, timeout, *, prompt):
+            self.assertEqual(cwd, controller.repo)
+            self.assertIn('--output-schema', argv)
+            report = {"decision": "APPROVE", "summary": "Controlled fixture model response",
+                "overall_risk": "low", "tasks": [{"task_id": "one",
+                "findings": ["Task and final policy are specified"], "recommended_changes": [],
+                "blocking_issues": []}], "recommended_changes": [], "blocking_issues": []}
+            Path(argv[argv.index('--output-last-message') + 1]).write_text(json.dumps(report))
+            return runner._CallResult(0, "Fixture auditor response", False, True, True)
+        self.assertFalse(controller.audit_status()['start_approved'])
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(runner.audit(controller.plan, controller.repo, directory,
+                model='fixture-auditor', controller_tests=False, execute=auditor), 0)
+        controller.logs = directory
+        approval = controller.audit_status()
+        self.assertTrue(approval['start_approved'], approval)
+        self.assertTrue(approval['verified'])
+        return directory
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -428,10 +461,12 @@ class WorkspaceTests(unittest.TestCase):
             (repo / "dirty").write_text("dirty")
             self.assertFalse(bridge.checkout_github_branch("owner/repo", "feature/existing")["ok"])
             (repo / "dirty").unlink()
-            plan = self.root / "task.md"
-            plan.write_text("Implement one task")
+            plan = self.json_plan("task.json")
             self.assertTrue(bridge.select_plan(str(plan))["ok"])
             popen.assert_not_called()
+            self.assertFalse(bridge.start(4)["ok"], "Missing audit must still block launch")
+            dialogs.confirm.assert_not_called()
+            approval = self.approve_plan(controller)
             dialogs.confirm.return_value = False
             self.assertTrue(bridge.start(4)["cancelled"])
             popen.assert_not_called()
@@ -443,6 +478,7 @@ class WorkspaceTests(unittest.TestCase):
             self.assertEqual(argv[argv.index("--repo") + 1], str(repo))
             self.assertEqual(argv[-1], str(plan))
             self.assertEqual(argv[argv.index("--attempts") + 1], "4")
+            self.assertEqual(argv[argv.index("--approved-audit") + 1], str(approval))
             confirmation = dialogs.confirm.call_args.args[0]
             for text in ("owner/repo", "feature/desktop", str(plan), "Attempts: 4", "NO automatic main merge"):
                 self.assertIn(text, confirmation)
@@ -469,11 +505,13 @@ class WorkspaceTests(unittest.TestCase):
             self.assertEqual(self.git(controller.repo, "branch", "--show-current"), "master")
             self.assertTrue(bridge.create_github_branch("owner/repo", "feature/master-base", "master", True)["ok"])
             self.assertEqual(self.git(controller.repo, "rev-parse", "HEAD"), self.git(self.remote, "rev-parse", "master"))
-            plan = self.root / "master-plan.md"
-            plan.write_text("Implement one task", encoding="utf-8")
+            plan = self.json_plan("master-plan.json")
             self.assertTrue(bridge.select_plan(str(plan))["ok"])
-            self.assertTrue(bridge.job_status()["start_ready"])
+            self.assertFalse(bridge.job_status()["start_ready"])
             popen.assert_not_called()
+            self.assertFalse(bridge.start(2)["ok"])
+            self.approve_plan(controller)
+            self.assertTrue(bridge.job_status()["start_ready"])
             popen.return_value = Mock(pid=424242)
             popen.return_value.poll.return_value = None
             self.assertTrue(bridge.start(2)["ok"])
@@ -821,8 +859,8 @@ class WorkspaceTests(unittest.TestCase):
         self.manager.checkout_branch("owner/repo", "feature/existing")
         controller = DesktopController(self.root / "custom-runs")
         controller.repo = repo
-        controller.plan = self.root / "plan.txt"
-        controller.plan.write_text("Implement example task", encoding="utf-8")
+        controller.plan = self.json_plan("plan.json")
+        self.approve_plan(controller)
         # This manager cannot discover custom-runs through its log directories.
         independent = GitHubWorkspaceManager(self.root / "config", run_command=self.command)
         with patch("auto_coding.desktop_control.Popen") as popen:
@@ -851,10 +889,11 @@ class WorkspaceTests(unittest.TestCase):
         self.manager.checkout_branch("owner/repo", "feature/existing")
         controller = DesktopController(self.root / "custom-runs")
         controller.repo = repo
-        controller.plan = self.root / "plan.txt"
-        controller.plan.write_text("Implement example task", encoding="utf-8")
-        with patch("auto_coding.desktop_control.Popen", side_effect=OSError("spawn failed")):
+        controller.plan = self.json_plan("plan.json")
+        self.approve_plan(controller)
+        with patch("auto_coding.desktop_control.Popen", side_effect=OSError("spawn failed")) as popen:
             self.assertFalse(controller.start()["ok"])
+            popen.assert_called_once()
         self.assertFalse(managed_lock(repo, ".job.lock").exists())
         self.manager.create_branch("owner/repo", "feature/new")
 

@@ -159,82 +159,44 @@ class DesktopReaderTests(unittest.TestCase):
             self.assertNotIn("possibly sensitive body", json.dumps(read_run(root)))
             self.assertIn("file.status", HTML)
 
-    def test_browser_render_executes_with_real_log_snapshot_when_node_available(self):
+    def _reader_ui(self, scenario, data=None):
+        from test_desktop_ui import RUN_COMMONJS
         node = shutil.which("node")
-        if node is None:
-            self.skipTest("Node.js is optional; browser JS smoke test unavailable")
-        javascript = HTML.split("<script>", 1)[1].split("</script>", 1)[0]
-        # Minimal DOM stand-in: run actual dashboard JS, rather than only matching strings.
-        fixture = r"""
-const fs = require('node:fs');
-const vm = require('node:vm');
-const assert = require('node:assert/strict');
-class Element {
-  constructor(tag) { this.tag = tag; this.children = []; this._text = ''; this.value = tag === 'attempts' ? '3' : ''; }
-  set textContent(value) { this._text = String(value); this.children = []; }
-  get textContent() { return this._text + this.children.map(child => child.textContent).join(''); }
-  append(...items) { this.children.push(...items); }
-  replaceChildren(...items) { this.children = items; this._text = ''; }
-  setAttribute(name, value) { this[name] = value; }
-  contains(target) { return this === target || this.children.some(child => child.contains?.(target)); }
-}
-const app = new Element('app');
-const evidenceViewer = new Element('evidence-viewer');
-const document = {
-  getElementById: id => id === 'app' ? app : id === 'evidence-viewer' ? evidenceViewer : new Element(id),
-  createElement: tag => new Element(tag),
-  createTextNode: value => ({textContent: String(value)})
-};
-const snapshot = {
-  root: 'mock-run', controller: {logs: 'mock-run', active: false, uncertain: false},
-  exists: true, empty: false, state_error: null,
-  state: {status: 'running', completed: [], current_task: 'desktop-readonly-logs', history: [
-    {task: 'desktop-readonly-logs', attempt: 2, review: {decision: 'REJECTED'}, feedback: 'Fix a real issue'}
-  ]},
-  events: [{ timestamp_utc: '2026-10-25T12:00:00Z', actor: 'Codex B', event: 'review_finished',
-    outcome: 'rejected', task_id: 'desktop-readonly-logs', attempt: 2,
-    _evidence_status: [
-      {label: 'missing', path: 'gone.txt', status: 'missing'},
-      {label: 'available', path: 'log.txt', status: 'available'}
-    ]}],
-  event_errors: ['Line 3: corrupt event']
-};
-const context = { document, window: {addEventListener() {}, pywebview: {api: {
-  snapshot: async () => snapshot, evidence: async () => ({ok: true, text: 'raw log evidence'})
-}}}, setInterval() {} };
-vm.createContext(context);
-vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), context);
-vm.runInContext('render(' + JSON.stringify(snapshot) + ')', context);
-vm.runInContext("navigate('tasks')", context);
-const contents = app.textContent;
-for (const text of ['Current task: desktop-readonly-logs', 'Attempt 2', 'REJECTED',
-  'Fix a real issue', 'Line 3: corrupt event']) {
-  assert(contents.includes(text), 'Missing UI text: ' + text);
-}
-vm.runInContext("navigate('logs')", context);
-assert(app.textContent.includes('gone.txt (missing)'));
-assert(!contents.includes('Raw evidence'), 'Evidence must be opened explicitly');
-const walk = node => [node, ...(node.children || []).flatMap(walk)];
-const available = walk(app).find(node => node.textContent === 'log.txt (available)');
-assert(typeof available.onclick === 'function', 'Available evidence must be selectable');
-const missing = walk(app).find(node => node.textContent === 'gone.txt (missing)');
-assert(missing && typeof missing.onclick !== 'function', 'Missing evidence must not be a working link');
-(async () => {
-  await available.onclick();
-  await new Promise(resolve => setImmediate(resolve));
-  assert(evidenceViewer.textContent.includes('raw log evidence'));
-  vm.runInContext('render(' + JSON.stringify(snapshot) + ')', context);
-  assert(evidenceViewer.textContent.includes('raw log evidence'), 'Refresh cleared selected evidence');
-})().catch(error => {console.error(error); process.exitCode = 1;});
-"""
-        with tempfile.TemporaryDirectory() as td:
-            script_path = Path(td) / "dashboard.js"
-            fixture_path = Path(td) / "smoke.cjs"
-            script_path.write_text(javascript, encoding="utf-8")
-            fixture_path.write_text(fixture, encoding="utf-8")
-            result = subprocess.run([node, str(fixture_path), str(script_path)], capture_output=True,
-                                    text=True, encoding="utf-8", errors="replace", timeout=15)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIsNotNone(node, "Node.js is required for dashboard behavior regressions")
+        if data is None:
+            data = {"root": "fixture-run", "exists": True, "task_count": 1,
+                    "state": {"status": "running", "current_task": "one", "completed": []},
+                    "summary": {"current": 1, "completion_confirmed": False},
+                    "files": [{"path": "log.txt", "status": "available"},
+                              {"path": "gone.txt", "status": "missing"},
+                              {"path": "../secret.txt", "status": "unsafe path"}]}
+        data["controller"] = {"active": False, "uncertain": False, "logs": data["root"],
+                              "plan": "fixture.json", "preflight": {"errors": []}}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            html, snapshot = root / "dashboard.html", root / "snapshot.json"
+            html.write_text(HTML, encoding="utf-8")
+            snapshot.write_text(json.dumps(data), encoding="utf-8")
+            fixture = Path(__file__).with_name("desktop_reader_ui.cjs")
+            result = subprocess.run([node, "-e", RUN_COMMONJS, str(fixture), str(html),
+                                     scenario, str(snapshot)], capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace", timeout=20)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Reader scenario passed: " + scenario, result.stdout)
+
+    def test_browser_render_executes_with_real_log_snapshot_when_node_available(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "state.json").write_text(json.dumps({"status": "running", "completed": [],
+                "current_task": "one", "history": [{"task": "one", "attempt": 2,
+                "review": {"decision": "REJECTED"}, "feedback": "Fix a real issue"}]}))
+            (root / "run-manifest.json").write_text(json.dumps({"task_ids": ["one"]}))
+            (root / "log.txt").write_text("raw log evidence")
+            (root / "events.jsonl").write_text('{"event":"review_finished"}\nnot-json\n')
+            data = read_run(root)
+            self.assertIn("Line 2", data["event_errors"][0])
+            self.assertIn("Line 2", export_run(root)["event_errors"][0])
+            self._reader_ui("snapshot", data)
 
     def test_missing_empty_and_state_only_legacy(self):
         with tempfile.TemporaryDirectory() as td:
@@ -294,25 +256,32 @@ assert(missing && typeof missing.onclick !== 'function', 'Missing evidence must 
             self.assertIn("confined", data["state_error"])
 
     def test_attempt_history_shows_actual_review_and_feedback_fields(self):
-        from auto_coding.desktop_app import HTML
-        self.assertIn("item.review && item.review.decision", HTML)
-        self.assertIn("item.feedback", HTML)
+        # The current dashboard exports selected evidence instead of rendering
+        # the removed task/history tabs. Preserve actual review data end to end.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            history = [{"task": "one", "attempt": 2, "review": {"decision": "REJECTED"},
+                        "feedback": "Fix a real issue"}]
+            (root / "state.json").write_text(json.dumps({"status": "stopped", "history": history}))
+            self.assertEqual(read_run(root)["state"]["history"], history)
+            self.assertNotIn("state.json", export_run(root)["files"])
+            selected = export_file(root, "state.json")
+            self.assertTrue(selected["ok"])
+            approved = {"state.json": hashlib.sha256(selected["text"].encode("utf-8")).hexdigest()}
+            payload = export_run(root, approved)["files"]["state.json"]
+            self.assertTrue(payload["ok"])
+            self.assertEqual(json.loads(payload["text"])["history"], history)
 
     def test_current_task_is_displayed_without_fabricating_completion(self):
-        self.assertIn("state.current_task || 'No task in progress'", HTML)
-        self.assertIn("Current task: ", HTML)
-        self.assertIn("A checkpoint is pending reconciliation", HTML)
+        self._reader_ui("current")
 
     def test_selected_evidence_survives_refresh_and_invalid_links_are_not_clickable(self):
-        self.assertIn("id=\"evidence-viewer\"", HTML)
-        self.assertIn("evidenceViewer.replaceChildren(box)", HTML)
-        self.assertIn("if (available)", HTML)
-        self.assertIn("file.path + ' (' + file.status + ')'", HTML)
+        self._reader_ui("evidence")
 
     def test_no_corrupted_ui_text_and_no_invalid_fallback_operator(self):
-        for bad in ("â", "Â", "v·"):
+        for bad in ("\u00e2", "\u00c2", "v\u00b7"):
             self.assertNotIn(bad, HTML)
-        self.assertIn("value === null || value === undefined", HTML)
+        self._reader_ui("nulls")
 
     def test_embedded_javascript_parses_when_node_available(self):
         node = shutil.which("node")
@@ -340,7 +309,7 @@ assert(missing && typeof missing.onclick !== 'function', 'Missing evidence must 
         self.assertIn("textContent", HTML)
         self.assertNotIn("innerHTML", HTML)
         self.assertNotIn("eval(", HTML)
-        self.assertIn("createTextNode", HTML)
+        self._reader_ui("text")
 
 
 if __name__ == "__main__":

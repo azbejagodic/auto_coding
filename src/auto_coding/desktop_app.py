@@ -555,7 +555,9 @@ class Bridge:
                     if not approval.get("start_approved"):
                         raise ValueError(approval.get("error") or "Start requires verified APPROVE audit evidence.")
                 message = (f"{action.upper()} the local runner?\nRepository: {paths['repo']}"
-                           f"\nBranch: {branch or 'Unknown (launch will be blocked)'}"
+                           + (f"\nManaged GitHub repository: {self._controller.repository}"
+                              if getattr(self._controller, 'repository', None) else "")
+                           + f"\nBranch: {branch or 'Unknown (launch will be blocked)'}"
                            f"\nPlan: {paths['plan']}\nSelected logs: {paths['logs']}"
                            + (f"\nApproved audit: {approval['directory']}"
                               f"\nAudit identity: {json.dumps(approval.get('identity'), sort_keys=True)}"
