@@ -26,8 +26,11 @@ get('audit-result').textContent = 'Not audited';
 get('audit-result').className = 'pill muted';
 const document = {getElementById: get, createElement: tag => new Element(tag),
   createTextNode: text => ({textContent: String(text)})};
+get('configuration').hidden = true;
 let data = {root:'', exists:false, empty:true, state:null, events:[], event_errors:[],
-  controller:{active:false, uncertain:false, repo:null, plan:null, logs:null, resume_ready:false, start_ready:false,
+  controller:{models:[{model:'explicit-auditor', displayName:'Auditor', efforts:['low','high'], default:'high'},
+    {model:'real-fast', displayName:'Fast', efforts:['minimal','medium'], default:'minimal'},
+    {model:'real-reviewer', displayName:'Reviewer', efforts:['high','xhigh'], default:'high'}], active:false, uncertain:false, repo:null, plan:null, logs:null, resume_ready:false, start_ready:false,
     preflight:{branch:'feature/ui', clean:true, errors:[]}}};
 const calls = [];
 let launchResult = {ok:false, cancelled:true};
@@ -37,6 +40,7 @@ let evidenceReads = 0;
 let snapshotReads = 0;
 let pendingSnapshot = null;
 const api = {
+  apply_configuration: async profile => { calls.push(['apply_configuration', profile]); data.controller.configuration_ready = true; data.controller.configuration = profile; return {ok:true}; },
   github_repositories: async () => ({ok:true, available:false, repositories:[], message:'Enter OWNER/REPO manually; Git authentication remains available.'}),
   connect_github: async repository => { calls.push(['connect_github', repository]);
     if (repository === 'bad/repo') return {ok:false, error:'GitHub authentication failed <img onerror=bad()>; authenticate Git and retry.'};
@@ -79,20 +83,25 @@ const click = async id => { await get(id).onclick(); await flush(); };
   data.controller.preflight.errors = ['Select a Git repository root.'];
   await poll();
   assert.equal(get('progress-error').textContent, '');
-  assert(get('configure-error').hidden, 'Fresh launch has only the reference controls');
+  assert(!get('configure-error').hidden, 'Fresh launch provides compact configuration guidance');
+  assert(get('start-audit').disabled);
+  await click('nav-configuration'); assert(!get('configuration').hidden);
+  await click('nav-dashboard'); assert(get('configuration').hidden);
   data.controller.preflight.errors = [];
   // Native Browse and contextual settings; no launch on selection.
   await click('browse-plan');
   assert.equal(calls.at(-1)[0], 'select_plan');
-  assert.equal(get('configuration').open, true);
+  assert.equal(get('configuration').hidden, true, 'Browse never navigates');
+  await click('nav-configuration'); assert(!get('configuration').hidden);
   assert.equal(get('plan-path').textContent, 'C:\\plans\\task.json');
   assert(get('start').disabled);
   await click('browse-project');
   assert.equal(calls.at(-1)[0], 'select_repo');
-  assert.equal(get('project-path').textContent, 'C:\\project with spaces');
+  assert(get('project-path').textContent.includes('C:\\project with spaces'));
+  assert(get('project-path').textContent.includes('Verified branch: feature/ui'));
   await click('open-run'); assert.equal(calls.at(-1)[0], 'open_run');
   assert(get('message').textContent.includes('Cancelled'));
-  await click('configuration-done'); assert.equal(get('configuration').open, false);
+  await click('configuration-done'); assert.equal(get('configuration').hidden, true);
 
   // Keep existing managed checkout and branch operations available contextually.
   await click('list-github'); assert(get('github-repositories').hidden);
@@ -122,6 +131,9 @@ const click = async id => { await get(id).onclick(); await flush(); };
   assert(get('new-branch').disabled && get('select-branch').disabled && get('push-approved').disabled);
   data.controller.preflight.clean = true; data.controller.active = true; await poll();
   assert(get('connect-github').disabled && get('select-branch').disabled);
+  await click('nav-configuration'); assert(!get('configuration').hidden, 'Configuration navigation remains available during execution');
+  assert(get('audit-model').disabled && get('model-a').disabled && get('apply-configuration').disabled);
+  await click('nav-dashboard');
   data.controller.active = false; data.controller.push = {eligible:true, reason:'Approved checkpoints'};
   await poll(); await click('push-approved');
   assert.deepEqual(calls.at(-1), ['push_approved_commits']);
@@ -142,10 +154,22 @@ const click = async id => { await get(id).onclick(); await flush(); };
 
   data.controller.audit_ready = true;
   await poll(); await click('start-audit');
-  assert.equal(get('configuration').open, true, 'Missing model opens configuration');
+  assert(get('start-audit').disabled, 'Missing configuration locks audit');
+  await click('nav-configuration');
   assert(!calls.some(call => call[0] === 'start_audit'));
   get('audit-model').value = 'explicit-auditor'; get('audit-model').oninput();
   get('audit-goal').value = 'Exact goal';
+  get('model-a').value = 'real-fast'; get('model-a').onchange();
+  assert.equal(get('effort-a').value, 'minimal');
+  assert.deepEqual(get('effort-a').children.map(n => n.value), ['minimal','medium']);
+  get('effort-a').value = 'medium'; get('effort-a').onchange();
+  get('model-a').value = 'real-reviewer'; get('model-a').onchange();
+  assert.equal(get('effort-a').value, 'high', 'Changing model resets unsupported effort to real default');
+  get('model-b').value = 'real-reviewer'; get('model-b').onchange();
+  get('effort-b').value = 'xhigh'; get('effort-b').onchange();
+  await click('apply-configuration');
+  assert.equal(data.controller.configuration.effort_b, 'xhigh');
+  assert.equal(data.controller.configuration.model_a, 'real-reviewer');
   await click('configuration-done');
   let releaseAudit;
   api.start_audit = async (...args) => { calls.push(['start_audit', ...args]); await new Promise(resolve => { releaseAudit = resolve; }); return {ok:true}; };
@@ -208,15 +232,16 @@ const click = async id => { await get(id).onclick(); await flush(); };
   const attempts = get('attempts');
   for (const value of ['0','11','2.5','','-1','NaN','3.0','Infinity']) {
     attempts.value = value; attempts.oninput();
-    assert.equal(attempts['aria-invalid'], 'true'); assert(get('start').disabled);
+    assert.equal(attempts['aria-invalid'], 'true'); assert(get('start').disabled && get('start-audit').disabled);
     const before = calls.length; await click('start'); assert.equal(calls.length, before);
   }
   for (const value of ['1','3','5','10']) {
     attempts.value = value; attempts.oninput();
-    assert.equal(attempts['aria-invalid'], 'false'); assert(!get('start').disabled);
+    assert.equal(attempts['aria-invalid'], 'false'); assert(get('start').disabled, 'Editing budget requires Apply');
+    await click('apply-configuration'); assert(!get('start').disabled);
     assert.equal(get('attempts-error').textContent, '');
   }
-  attempts.value = '3'; attempts.oninput();
+  attempts.value = '3'; attempts.oninput(); await click('apply-configuration');
   attempts.focus(); await poll();
   assert.equal(document.activeElement, attempts, 'Polling preserves keyboard focus');
   assert.equal(attempts.value, '3');
@@ -268,8 +293,9 @@ const click = async id => { await get(id).onclick(); await flush(); };
   assert(get('auto-push').disabled);
   const beforeActiveBrowse = calls.length;
   await click('browse-plan');
-  assert.equal(get('configuration').open, true);
-  assert.equal(calls.length, beforeActiveBrowse, 'Active-run Browse opens evidence settings without changing selections');
+  assert.equal(get('configuration').hidden, true, 'Browse never navigates');
+  await click('nav-configuration'); assert(!get('configuration').hidden);
+  assert.equal(calls.length, beforeActiveBrowse, 'Active-run Browse cannot change selections; Configuration remains independently accessible');
   assert(get('browse-project').disabled && get('open-run').disabled);
   await click('configuration-done');
   delete data.controller.stop_identity; await poll(); assert(get('stop').disabled);

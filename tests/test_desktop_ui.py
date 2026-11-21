@@ -31,7 +31,7 @@ entry.loaded = true;
 
 
 class DesktopUITests(unittest.TestCase):
-    def test_single_panel_reference_structure(self):
+    def test_two_page_reference_structure(self):
         class Markup(HTMLParser):
             def __init__(self):
                 super().__init__()
@@ -58,8 +58,8 @@ class DesktopUITests(unittest.TestCase):
         markup = Markup()
         markup.feed(HTML)
         self.assertEqual(markup.tags.count("main"), 1)
-        self.assertEqual(markup.tags.count("h1"), 1)
-        for tag in ("aside", "nav", "details", "h2", "h3", "pre", "table", "progress"):
+        self.assertEqual(markup.tags.count("h1"), 2)
+        for tag in ("aside", "h3", "pre", "table", "progress"):
             self.assertNotIn(tag, markup.tags)
         for obsolete in ("nav-overview", "nav-tasks", "nav-logs", "advanced", "app",
                          "evidence-viewer", "resume", "header-state", "refresh"):
@@ -73,8 +73,17 @@ class DesktopUITests(unittest.TestCase):
         for name in ("browse-project", "open-run", "export-evidence", "include-evidence", "audit-model", "audit-goal", "attempts",
                      "github-branch", "auto-push", "push-approved"):
             self.assertIn("configuration", markup.nodes[name][2])
-        self.assertNotIn("open", markup.nodes["configuration"][1])
-        self.assertEqual(markup.nodes["configuration"][0], "dialog")
+        self.assertEqual(markup.tags.count('nav'), 1)
+        self.assertEqual({name for name, node in markup.nodes.items() if 'nav' in node[2]},
+                         {'nav-dashboard', 'nav-configuration'})
+        self.assertNotIn('dialog', markup.tags)
+        self.assertIn('hidden', markup.nodes['configuration'][1])
+        for name in ('audit-model', 'model-a', 'model-b', 'effort-a', 'effort-b'):
+            self.assertEqual(markup.nodes[name][0], 'select')
+        self.assertNotIn('1000px', HTML)
+        self.assertNotIn('place-items:center', HTML)
+        self.assertNotIn('showModal', HTML)
+        self.assertEqual(markup.nodes["configuration"][0], "section")
         labels = " ".join(markup.text)
         for text in ("Plan Audit", "Selected JSON file", "Browse", "Start Audit", "Download Fix / Log",
                      "Run controls unlock after approved audit", "Start", "Stop", "Download Logs",
@@ -93,10 +102,10 @@ class DesktopUITests(unittest.TestCase):
         self.assertIn("hidden", markup.nodes["configure-error"][1])
 
     def test_responsive_accessible_and_safe_text_contract(self):
-        for token in ('width:min(100%,1000px)', 'min-height:555px', 'place-items:center',
+        for token in ('width:100%', 'height:100vh;display:flex;flex-direction:column', 'padding:16px',
                       'grid-template-columns:repeat(3,minmax(0,1fr))', 'overflow-wrap:anywhere',
                       ':focus-visible', '@media(max-width:700px)', '@media(max-width:400px)',
-                      'prefers-reduced-motion:reduce', 'showModal()', "addEventListener('cancel'",
+                      'prefers-reduced-motion:reduce', "navigate('dashboard')", 'nav-configuration',
                       'textContent'):
             self.assertIn(token, HTML)
         for unsafe in ('innerHTML', 'outerHTML', 'insertAdjacentHTML', '<script src=', 'https://'):

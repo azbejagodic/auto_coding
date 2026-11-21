@@ -394,7 +394,7 @@ def safe_repo(repo: Path, create: bool) -> Path:
     return repo
 
 
-def codex_argv(*, readonly: bool, last_message: Path, schema: Path | None, model: str | None) -> list[str]:
+def codex_argv(*, readonly: bool, last_message: Path, schema: Path | None, model: str | None, reasoning: str | None = None) -> list[str]:
     cmd = ["codex", "--ask-for-approval", "never", "exec", "--sandbox",
            "read-only" if readonly else "workspace-write", "--json",
            "--output-last-message", str(last_message)]
@@ -402,15 +402,20 @@ def codex_argv(*, readonly: bool, last_message: Path, schema: Path | None, model
         cmd.extend(["--output-schema", str(schema)])
     if model:
         cmd.extend(["--model", model])
+    if reasoning is not None:
+        from auto_coding.model_catalog import EFFORT
+        if not isinstance(reasoning, str) or not EFFORT.fullmatch(reasoning):
+            raise PilotError('Invalid reasoning effort')
+        cmd.extend(['-c', 'model_reasoning_effort=' + json.dumps(reasoning)])
     return [*cmd, "-"]
 
 
-def model_request_metadata(model: str | None) -> dict:
+def model_request_metadata(model: str | None, reasoning=None) -> dict:
     """Describe the controller request, never claim an effective CLI setting."""
     recorded = isinstance(model, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}", model) is not None
     metadata = {"requested_model": model if recorded else None,
                 "model_source": "controller_override" if model else "cli_inherited_unverified",
-                "reasoning_effort": "unknown"}
+                "reasoning_effort": reasoning or "unknown"}
     if model and not recorded:
         # Log only bounded identifier spellings, not arbitrary configuration or
         # command text. This does not validate or change the execution argument.
@@ -1346,9 +1351,18 @@ def review_ready_task(repo: Path, logs: Path, state: dict, state_path: Path,
         production = unwrap(execute) is call
         preflight = events.emit("controller", "review_environment_check", "started", task_id=ident, attempt=attempt)
         try:
+            reasoning = state.get('model_profile', {}).get('reasoning_b')
+            if reasoning is not None:
+                from auto_coding.model_catalog import EFFORT
+                if not isinstance(reasoning, str) or not EFFORT.fullmatch(reasoning):
+                    raise PilotError('Invalid reviewer reasoning effort')
             spec = prepare_review(codex_argv(readonly=True, last_message=verdict_path,
                                             schema=schema_path, model=model_b), repo, logs, git,
                                   check=check_cli if production else None)
+            if reasoning is not None:
+                # Apply only the validated model setting after permission preparation,
+                # exactly as the fixed High audit override does. No policy override.
+                spec.argv = [*spec.argv[:-1], '-c', 'model_reasoning_effort=' + json.dumps(reasoning), spec.argv[-1]]
         except BaseException as exc:
             uncertain_preflight = (hasattr(exc, "process_started") and getattr(exc, "process_started", None) is not False
                                    and getattr(exc, "cleanup_confirmed", None) is not True)
@@ -1389,7 +1403,7 @@ def review_ready_task(repo: Path, logs: Path, state: dict, state_path: Path,
                         evidence={"prompt": prompt_name, "diff": f"{base}-diff.txt",
                                   "stream": stream_name, "verdict": verdict_name},
                         metadata={"review_try": ordinal, "review_invocation": ordinal, "scratch": spec.scratch.name}
-                                 | model_request_metadata(model_b))
+                                 | model_request_metadata(model_b, state.get("model_profile", {}).get("reasoning_b")))
         except BaseException:
             cleanup_review_scratch(spec, events, ident, attempt)  # No reviewer was launched.
             raise
@@ -1608,13 +1622,13 @@ def implementation_attempt(repo, logs, state, state_path, events, task, attempt,
         pass
     else:
         raise PilotError("Codex A answer already exists for an unstarted execution; inspect before launch")
-    argv = codex_argv(readonly=False, last_message=answer_path, schema=None, model=model_a)
+    argv = codex_argv(readonly=False, last_message=answer_path, schema=None, model=model_a, reasoning=state.get("model_profile", {}).get("reasoning_a"))
     if (not agent_call_available(state, state_path, events, ident, attempt)
             or not observed_tokens_available(state, state_path, events, ident, attempt)):
         return None
     execution = events.emit("Codex A", "process_started", "started", task_id=ident, attempt=attempt,
         evidence={"prompt": f"{base}-a-prompt.txt", "stream": f"{base}-a-events.jsonl", "answer": answer_path.name},
-        metadata={"attempt_id": pending["id"]} | model_request_metadata(model_a))
+        metadata={"attempt_id": pending["id"]} | model_request_metadata(model_a, state.get("model_profile", {}).get("reasoning_a")))
     pending.update(phase="running", execution_id=execution["seq"])
     state["status"] = "running"
     save_json(state_path, state)
@@ -2166,8 +2180,14 @@ def stop_at_task_boundary(repo, logs, state, state_path, events):
 def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False, attempts=3,
         auto_push=None, retry_review_once=False,
         final_verification_config=None, controller_tests=None,
-        model_a=None, model_b=None, timeout=1800, review_timeout=None,
+        model_a=None, model_b=None, reasoning_a=None, reasoning_b=None, timeout=1800, review_timeout=None,
         execute: Callable = call, approved_audit=None, max_agent_calls=None, max_observed_tokens=None) -> int:
+    model_profile = dict(model_a=model_a, model_b=model_b, reasoning_a=reasoning_a, reasoning_b=reasoning_b)
+    from auto_coding.model_catalog import EFFORT, IDENTIFIER
+    for model, effort in ((model_a, reasoning_a), (model_b, reasoning_b)):
+        if effort is not None and (not isinstance(effort, str) or not EFFORT.fullmatch(effort)
+                                   or not isinstance(model, str) or not IDENTIFIER.fullmatch(model)):
+            raise PilotError('Explicit reasoning requires a valid model ID and reasoning identifier')
     review_timeout = timeout if review_timeout is None else review_timeout
     if max_agent_calls is not None and (type(max_agent_calls) is not int or not 1 <= max_agent_calls <= MAX_AGENT_CALL_LIMIT):
         raise PilotError(f"Agent call budget must be an integer from 1 to {MAX_AGENT_CALL_LIMIT}")
@@ -2219,6 +2239,11 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
             raise PilotError("Process cleanup is unverified in saved state; inspect before resuming.")
         if state.get("plan_sha256") != plan_sha or state.get("repo") != str(repo):
             raise PilotError("Resume plan or repository mismatch")
+        saved_profile = state.get('model_profile')
+        if saved_profile is not None and saved_profile != model_profile:
+            raise PilotError('Resume model/reasoning profile differs from original authorization')
+        if saved_profile is None and (reasoning_a or reasoning_b):
+            raise PilotError('Legacy resume has no authorized reasoning profile')
         if state.get("auto_push") != auto_push:
             raise PilotError("Auto-push settings are fixed for this run; use its original repository and branch options")
         if retry_review_once and not state.get("pending_review"):
@@ -2237,6 +2262,8 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
             if (manifest.get("plan_sha256") != plan_sha or manifest.get("target_repo") != str(repo)
                     or manifest.get("task_ids") != [t["id"] for t in tasks]):
                 raise PilotError("Run manifest does not match resume plan or repository")
+            if manifest.get('model_profile') != state.get('model_profile'):
+                raise PilotError('Saved model profile differs between state and manifest')
             run_id = manifest["run_id"]
         else:
             # A legacy manifest may be absent while a timeline already exists.
@@ -2353,6 +2380,10 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
             if (manifest.get("plan_sha256") != plan_sha or manifest.get("target_repo") != str(repo)
                     or manifest.get("task_ids") != [t["id"] for t in tasks]):
                 raise PilotError("Existing run manifest does not match this plan or repository")
+            if manifest.get('model_profile') not in (None, model_profile):
+                raise PilotError('Initialization model/reasoning differs from the saved manifest')
+            if manifest.get('model_profile') is None and (reasoning_a or reasoning_b):
+                raise PilotError('Initialization manifest has no authorized reasoning profile')
             run_id = manifest["run_id"]
             created = manifest.get("start_time_utc") or created
             if (manifest.get("branch") not in (None, selected_branch)
@@ -2398,6 +2429,7 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
                     "task_ids": [t["id"] for t in tasks], "initial_git_head": initial_head,
                     "start_time_utc": created, "target_repo": str(repo), "branch": selected_branch,
                     "plan_audit": audit_binding}
+        state['model_profile'] = manifest['model_profile'] = model_profile
         bind_verification(state, manifest, requested_policy, controller_tests, resume=False)
         events = EventLog(timeline_path, run_id)
         if not events.seq:
@@ -2634,13 +2666,13 @@ def _run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False,
 
 @managed_job
 def run(plan: Path, repo: Path, logs: Path, *, create_repo=False, resume=False, attempts=3,
-        model_a=None, model_b=None, timeout=1800, review_timeout=None, execute: Callable = call, auto_push=None,
+        model_a=None, model_b=None, reasoning_a=None, reasoning_b=None, timeout=1800, review_timeout=None, execute: Callable = call, auto_push=None,
         retry_review_once=False, final_verification_config=None, controller_tests=None, approved_audit=None,
         max_agent_calls=None, max_observed_tokens=None) -> int:
     """Run while ensuring controlled exceptions after log creation are recorded."""
     try:
         return _run(plan, repo, logs, create_repo=create_repo, resume=resume,
-                    attempts=attempts, model_a=model_a, model_b=model_b,
+                    attempts=attempts, model_a=model_a, model_b=model_b, reasoning_a=reasoning_a, reasoning_b=reasoning_b,
                     timeout=timeout, review_timeout=review_timeout, execute=execute, auto_push=auto_push,
                     retry_review_once=retry_review_once, final_verification_config=final_verification_config,
                     controller_tests=controller_tests, approved_audit=approved_audit, max_agent_calls=max_agent_calls,
@@ -2747,6 +2779,8 @@ def main(argv=None):
                         help="JSON verification policy for TXT/MD or legacy plans; saved for subsequent resume")
     parser.add_argument("--model-a")
     parser.add_argument("--model-b")
+    parser.add_argument("--reasoning-a")
+    parser.add_argument("--reasoning-b")
     parser.add_argument("--approved-audit", type=Path, help="Explicitly authorize starting with this APPROVE report directory")
     parser.add_argument("--audit-model", help="Independent explicit model for the one-shot audit (High reasoning)")
     parser.add_argument("--audit-goal", default="", help="Optional overall goal for the complete plan audit")
@@ -2755,7 +2789,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if action == "audit" and (not args.audit_model or args.resume or args.create_repo or args.approved_audit
                               or args.retry_review_once or args.auto_push_repository or args.auto_push_branch
-                              or args.model_a or args.model_b or args.max_agent_calls is not None
+                              or args.model_a or args.model_b or args.reasoning_a or args.reasoning_b or args.max_agent_calls is not None
                               or args.max_observed_tokens is not None):
         cancel_reservation(args.repo, os.environ.get("AUTOCODING_JOB_RESERVATION"))
         parser.error("audit requires --audit-model and excludes run, resume, publication and A/B model options")
@@ -2799,7 +2833,7 @@ def main(argv=None):
                    max_observed_tokens=args.max_observed_tokens,
                     retry_review_once=args.retry_review_once,
                    final_verification_config=final_config, controller_tests=args.controller_tests,
-                   model_a=args.model_a, model_b=args.model_b, approved_audit=args.approved_audit,
+                   model_a=args.model_a, model_b=args.model_b, reasoning_a=args.reasoning_a, reasoning_b=args.reasoning_b, approved_audit=args.approved_audit,
                    auto_push=({"repository": normalize_repository(args.auto_push_repository)[0],
                                "branch": args.auto_push_branch} if args.auto_push_repository else None))
     except (PilotError, WorkspaceError, OSError, UnicodeError, json.JSONDecodeError) as exc:

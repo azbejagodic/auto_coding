@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -10,6 +11,7 @@ from unittest.mock import Mock, patch
 
 from auto_coding.desktop_app import Bridge, NativeDialogs, main
 from auto_coding.desktop_control import DesktopController
+from test_dashboard_configuration import catalog_fixture, configure_fixture
 
 
 class FakeController:
@@ -207,6 +209,7 @@ class DesktopBridgeTests(unittest.TestCase):
         self.controller.start_audit.assert_called_once()
 
     def setUp(self):
+        self.enterContext(patch('auto_coding.desktop_control.load_catalog', return_value=catalog_fixture()))
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -230,7 +233,11 @@ class DesktopBridgeTests(unittest.TestCase):
         # Repository validation is tested separately; all launch/process calls are mocked.
         controller.repo = self.root / "project"
         controller.repo.mkdir()
+        self.plan = self.root / 'task.json'
+        self.plan.write_text(json.dumps({'tasks':[{'id':'task-1','prompt':'Do test'}]}))
         bridge.select_plan(str(self.plan))
+        configure_fixture(controller, 'fixture-model')
+        approval.return_value['configuration'] = {'model':'fixture-model', 'goal':''}
         self.assertTrue(bridge.job_status()["start_ready"])
         preflight.return_value["clean"] = False
         self.assertFalse(bridge.job_status()["start_ready"])
@@ -356,7 +363,8 @@ class DesktopBridgeTests(unittest.TestCase):
                          {"select_repo", "select_plan", "open_run", "selected_paths",
                           "job_status", "download_audit", "download_logs", "start", "start_audit", "resume", "stop_after_task", "snapshot", "evidence",
                           "connect_github", "github_repositories", "github_branches",
-                          "create_github_branch", "checkout_github_branch", "fetch_github", "push_approved_commits"})
+                          "create_github_branch", "checkout_github_branch", "fetch_github", "push_approved_commits",
+                          "refresh_models", "apply_configuration"})
 
     @patch("auto_coding.desktop_control.Popen")
     def test_real_controller_invalid_selections_and_launch_failure(self, popen):
@@ -535,13 +543,18 @@ class DesktopBridgeTests(unittest.TestCase):
         controller = DesktopController(self.root / "runs")
         repo = self.root / "repo"
         repo.mkdir()
+        self.plan = self.root / 'task.json'
+        self.plan.write_text(json.dumps({'tasks':[{'id':'task-1','prompt':'Do test'}]}))
         controller.repo, controller.plan = repo, self.plan
+        subprocess.run(['git', 'init', '-b', 'feature/test'], cwd=repo, check=True, capture_output=True)
+        configure_fixture(controller, 'fixture-model')
         bridge = Bridge(controller=controller, dialogs=self.dialogs)
         process = Mock(pid=424242)
         process.poll.return_value = None
         popen.return_value = process
         with patch.object(controller, "_validate"), patch.object(controller, "audit_status",
-                return_value={"start_approved":True, "directory":"verified-fixture"}):
+                return_value={"start_approved":True, "directory":"verified-fixture",
+                              "configuration":{"model":"fixture-model", "goal":""}}):
             self.assertTrue(bridge.start()["ok"])
             self.assertIn("already active", bridge.start()["error"])
         self.assertEqual(popen.call_count, 1)
@@ -557,6 +570,8 @@ class DesktopBridgeTests(unittest.TestCase):
         bridge.job_status()
         state = {"status": "stopped", "repo": str(repo),
                  "plan_sha256": hashlib.sha256(self.plan.read_bytes()).hexdigest()}
+        state['model_profile'] = dict(model_a='fixture-a', model_b='fixture-b', reasoning_a='medium', reasoning_b='high')
+        (controller.logs / 'run-manifest.json').write_text(json.dumps({'model_profile':state['model_profile']}))
         (controller.logs / "state.json").write_text(json.dumps(state))
         process.poll.return_value = None
         def git(argv, **kwargs):
@@ -564,7 +579,8 @@ class DesktopBridgeTests(unittest.TestCase):
                 return SimpleNamespace(returncode=1, stdout="", stderr="")
             return SimpleNamespace(returncode=0, stdout="feature/test", stderr="")
         with patch("auto_coding.desktop_control.bounded_run", side_effect=git):
-            self.assertTrue(bridge.resume()["ok"])
+            result = bridge.resume()
+            self.assertTrue(result["ok"], result)
         self.assertEqual(popen.call_count, 2)
         self.assertIn("--resume", popen.call_args.args[0])
 
@@ -574,6 +590,7 @@ class DurableAuditBridgeTests(unittest.TestCase):
     """Real verification/ledger helpers; no model, network, or child launch."""
 
     def setUp(self):
+        self.enterContext(patch('auto_coding.desktop_control.load_catalog', return_value=catalog_fixture()))
         from auto_coding import plan_audit, simple_run
         self.audit, self.engine = plan_audit, simple_run
         temp = tempfile.TemporaryDirectory()
@@ -598,6 +615,7 @@ class DurableAuditBridgeTests(unittest.TestCase):
         patch.object(self.controller, "preflight", side_effect=lambda:dict(self.check)).start()
         self.dialogs = Mock()
         self.dialogs.confirm.return_value = True
+        configure_fixture(self.controller, 'fixture-model')
         self.bridge = Bridge(controller=self.controller, dialogs=self.dialogs)
         self.directory = self.root / "audit"
         self.directory.mkdir()
@@ -661,7 +679,9 @@ class DurableAuditBridgeTests(unittest.TestCase):
         self.plan.write_text(self.plan.read_text() + "\n")
         status = self.bridge.job_status()
         self.assertFalse(status["start_ready"])
-        self.assertTrue(status["audit_ready"], "Corrected bytes get a new one-shot identity")
+        self.assertFalse(status['audit_ready'], 'Changed bytes require configuration revalidation')
+        configure_fixture(self.controller, 'fixture-model')
+        self.assertTrue(self.bridge.job_status()['audit_ready'], 'Revalidated corrected bytes get a new one-shot identity')
 
     def test_missing_forged_incomplete_and_tampered_evidence_cannot_start(self):
         with patch("auto_coding.desktop_control.Popen") as spawn:
@@ -746,6 +766,7 @@ class DurableAuditBridgeTests(unittest.TestCase):
     def test_confirmation_names_approval_and_cancellation_creates_no_run(self):
         evidence = self.save_evidence()
         self.dialogs.confirm.return_value = False
+        self.controller.configuration['attempts'] = 4
         with patch("auto_coding.desktop_control.Popen") as spawn:
             self.assertTrue(self.bridge.start(4)["cancelled"])
             spawn.assert_not_called()

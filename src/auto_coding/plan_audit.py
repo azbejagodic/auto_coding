@@ -162,7 +162,7 @@ def verify_resume(engine, state, manifest, repo, plan_sha, tasks):
 
 def audit_inputs(engine, plan, repo, *, model, timeout=300, goal="", final_verification_config=None,
           controller_tests=None):
-    if not isinstance(model, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", model):
+    if not isinstance(model, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}", model):
         raise engine.PilotError("Provide an explicit supported --audit-model")
     if type(timeout) is not int or not 30 <= timeout <= 1800 or not isinstance(goal, str) or len(goal) > 4000:
         raise engine.PilotError("Audit timeout must be 30..1800 seconds; goal at most 4000 characters")

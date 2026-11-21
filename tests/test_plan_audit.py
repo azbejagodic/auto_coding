@@ -20,6 +20,13 @@ from test_final_verification import CODE_REVIEW_APPROVED, Executor, POLICY
 
 
 class PlanAuditTests(unittest.TestCase):
+    def test_catalog_model_id_with_provider_prefix_keeps_fixed_high_contract(self):
+        _, _, _, configuration = audit.audit_inputs(runner, self.plan, self.repo,
+                                                    model='provider/catalog-model', controller_tests=False)
+        self.assertEqual(configuration['model'], 'provider/catalog-model')
+        self.assertEqual(configuration['reasoning'], 'high')
+        self.assertEqual(self.calls, [])
+
     def test_audit_model_authentication_and_high_capability_are_fail_closed(self):
         from types import SimpleNamespace
         from auto_coding import reviewer_permissions as permissions
@@ -200,7 +207,14 @@ class PlanAuditTests(unittest.TestCase):
         controller.repo, controller.plan = self.repo, self.plan
         dialogs = Mock()
         dialogs.confirm.return_value = True
+        from test_dashboard_configuration import catalog_fixture, configure_fixture
+        models = catalog_fixture() + [dict(model='fake-audit-model', displayName='Audit fixture',
+                                           efforts=['high'], default='high')]
+        self.enterContext(patch('auto_coding.desktop_control.load_catalog', return_value=models))
+        profile = configure_fixture(controller, 'fake-audit-model')
+        profile['attempts'] = 4
         bridge = Bridge(controller=controller, dialogs=dialogs)
+        self.assertTrue(bridge.apply_configuration(profile)['ok'])
         self.assertTrue(bridge.job_status()["start_ready"])
         process = Mock(pid=424242)
         process.poll.return_value = None
@@ -212,7 +226,8 @@ class PlanAuditTests(unittest.TestCase):
         argv = launched["argv"]
         self.assertEqual(argv, [sys.executable, "-B", "-m", "auto_coding.simple_run",
             "--repo", str(self.repo), "--logs", str(controller.logs), "--attempts", "4",
-            "--approved-audit", str(self.logs), str(self.plan)])
+            "--approved-audit", str(self.logs), "--model-a", "fixture-a", "--reasoning-a", "medium",
+            "--model-b", "fixture-b", "--reasoning-b", "high", str(self.plan)])
         executor = Executor()
         original = runner.run
         # Run the exact GUI child command through the same CLI start parser,

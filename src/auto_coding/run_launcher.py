@@ -25,7 +25,7 @@ class LaunchState:
 
 def launch_runner(state, *, repo, plan, logs, attempts, resume=False, publication=None,
                   popen=None, persist_metadata=None, reserve=None, cancel=None, fail=None,
-                  audit_options=None, approved_audit=None) -> dict:
+                  audit_options=None, approved_audit=None, model_options=None) -> dict:
     """Reserve, persist intent, spawn, then persist PID without hiding live children.
 
     The caller owns preflight, existing-run checks and checkout serialization
@@ -60,6 +60,10 @@ def launch_runner(state, *, repo, plan, logs, attempts, resume=False, publicatio
     if publication:
         argv.extend(["--auto-push-repository", publication["repository"],
                      "--auto-push-branch", publication["branch"]])
+    if model_options:
+        for role in ('a', 'b'):
+            argv.extend(['--model-' + role, model_options['model_' + role],
+                         '--reasoning-' + role, model_options['effort_' + role]])
     argv.append(str(plan))
     if audit_options is not None:
         argv = [sys.executable, "-B", "-m", "auto_coding.simple_run", "audit",

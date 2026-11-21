@@ -26,6 +26,9 @@ from auto_coding import run_lifecycle, stop_control
 from auto_coding.run_launcher import launch_runner
 from auto_coding import plan_audit, simple_run
 from auto_coding.reviewer_permissions import check_audit_model
+from auto_coding.model_catalog import load_catalog, validate_profile
+
+MAX_SETTINGS_BYTES = 64 * 1024
 
 
 class DesktopController:
@@ -43,6 +46,114 @@ class DesktopController:
         self._metadata_error = None
         self.process_history = []
         self._lock = threading.Lock()
+        self.configuration = None
+        self.catalog = []
+        self.catalog_error = 'Choose a checkout and refresh Codex models.'
+        self._configuration_identity = None
+
+    def refresh_models(self):
+        try:
+            if self.repo is None:
+                raise ValueError('Choose a verified checkout before refreshing models.')
+            self.catalog = load_catalog(self.repo)
+            self.catalog_error = None
+            return {'ok': True, 'models': self.catalog}
+        except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as exc:
+            if (getattr(exc, 'cleanup_confirmed', None) is False
+                    or (getattr(exc, 'process_started', None) is True
+                        and getattr(exc, 'cleanup_confirmed', None) is not True)):
+                from auto_coding.repository_ownership import preserve_process_uncertainty
+                preserve_process_uncertainty(self.repo, self.logs or self.runs_dir)
+                self._launch_uncertain = True
+            self.catalog = []
+            self.catalog_error = 'Codex catalog unavailable. Check CLI installation, sign-in and configuration; refresh models.'
+            return {'ok': False, 'error': self.catalog_error, 'models': []}
+
+    def configuration_identity(self):
+        check = self.preflight()
+        if self.repo is None or self.plan is None:
+            raise ValueError('Choose a checkout and JSON plan.')
+        _, digest = load_tasks(self.plan)
+        if self.plan.suffix.lower() != '.json' or check.get('errors'):
+            raise ValueError('Choose a valid JSON plan and verified feature branch. ' + ' '.join(check.get('errors', [])))
+        return {'repo': str(self.repo), 'plan': str(self.plan), 'plan_sha256': digest,
+                'branch': check['branch']}
+
+    def configuration_status(self):
+        try:
+            identity = self.configuration_identity()
+            validate_profile(self.configuration, self.catalog)
+            if identity != self._configuration_identity:
+                raise ValueError('Selection changed. Review and apply configuration.')
+            check = self.preflight()
+            if check.get('start_error'):
+                raise ValueError(check['start_error'])
+            if check.get('clean') is not True:
+                raise ValueError('New launches require a clean checkout. Resume preserves saved task work.')
+            return {'ready': True, 'reason': 'Configuration ready; audit approval is checked separately.'}
+        except (OSError, ValueError, PilotError) as exc:
+            return {'ready': False, 'reason': self.catalog_error or str(exc)}
+
+    def apply_configuration(self, profile):
+        try:
+            status = self.job_status()
+            if status['active'] is not False or status.get('uncertain'):
+                raise ValueError('Configuration is locked while execution is active or uncertain.')
+            self._validate()
+            identity = self.configuration_identity()
+            if not self.refresh_models()['ok']:
+                raise ValueError(self.catalog_error)
+            profile = validate_profile(profile, self.catalog)
+            self._validate()
+            if self.configuration_identity() != identity:
+                raise ValueError('Selection changed while checking models. Review and apply again.')
+            # Controller-owned, non-secret storage; never write into the target.
+            path = self.runs_dir.parent / 'desktop-settings.json'
+            if path.resolve().is_relative_to(self.repo):
+                raise ValueError('Settings storage must be outside the target checkout.')
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.is_symlink():
+                raise ValueError('Settings path must be a regular controller-owned file.')
+            content = json.dumps({'identity': identity, 'profile': profile}, ensure_ascii=False)
+            if len(content.encode('utf-8')) > MAX_SETTINGS_BYTES:
+                raise ValueError('Configuration paths and goal exceed the 64 KiB settings limit.')
+            temporary = path.with_name('desktop-settings-' + uuid.uuid4().hex + '.tmp')
+            created = False
+            try:
+                with temporary.open('x', encoding='utf-8') as stream:
+                    created = True
+                    stream.write(content)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                temporary.replace(path)
+            finally:
+                if created:
+                    temporary.unlink(missing_ok=True)
+            self.configuration, self._configuration_identity = profile, identity
+            return {'ok': True, 'message': 'Configuration ready. Return to Dashboard to audit.'}
+        except (OSError, ValueError, PilotError) as exc:
+            return self._fail(str(exc))
+
+    def load_configuration(self):
+        """Restore choices only after the user explicitly selects the same identity."""
+        try:
+            path = self.runs_dir.parent / 'desktop-settings.json'
+            if (self.repo is None or path.resolve().is_relative_to(self.repo)
+                    or path.is_symlink() or path.stat().st_size > MAX_SETTINGS_BYTES):
+                return
+            with path.open('rb') as stream:
+                raw = stream.read(MAX_SETTINGS_BYTES + 1)
+            if len(raw) > MAX_SETTINGS_BYTES:
+                return
+            saved = json.loads(raw.decode('utf-8'))
+            if not isinstance(saved, dict) or not isinstance(saved.get('profile'), dict):
+                return
+            if saved['identity'] == self.configuration_identity():
+                self.configuration = saved['profile']
+                self._configuration_identity = saved['identity']
+                self.refresh_models()
+        except (OSError, ValueError, KeyError, TypeError, PilotError):
+            pass
 
     def checkout_busy(self, repo) -> bool:
         """Fail closed for a matching checkout's active or ambiguous run records."""
@@ -85,6 +196,7 @@ class DesktopController:
             if action == "connect":
                 self.repo = Path(result["path"])
                 self.repository = result["repository"]
+                self.load_configuration()
             return {"ok": True, **result}
         except (OSError, ValueError) as exc:
             return {"ok": False, "error": str(exc), "code": getattr(exc, "code", "workspace")}
@@ -112,6 +224,10 @@ class DesktopController:
             repo = validate_repository_root(path, run_command=bounded_run)
             self.repo = repo
             self.repository = None
+            if self._configuration_identity and self._configuration_identity['repo'] != str(repo):
+                self.catalog = []
+                self.catalog_error = 'Checkout changed. Refresh Codex models and apply configuration.'
+            self.load_configuration()
             self.error = None
             return {"ok": True, "path": str(repo), "error": None}
         except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
@@ -127,6 +243,7 @@ class DesktopController:
                 raise ValueError("Select an existing .json, .txt, or .md plan file.")
             load_tasks(plan)
             self.plan = plan
+            self.load_configuration()
             self.error = None
             return {"ok": True, "path": str(plan), "error": None}
         except (OSError, UnicodeError, ValueError, PilotError, json.JSONDecodeError) as exc:
@@ -432,7 +549,7 @@ class DesktopController:
                 if state.get("plan_sha256") != plan_sha or state.get("repo") != str(self.repo):
                     raise ValueError("Resume plan or repository mismatch; select the original plan and repository.")
                 return self._launch(attempts, True)
-            except (OSError, ValueError, PilotError) as exc:
+            except (OSError, ValueError, KeyError, TypeError, PilotError) as exc:
                 return self._fail(str(exc))
 
     def _launch(self, attempts: int, resume: bool, auto_push: bool = False, approved_audit=None) -> dict:
@@ -441,9 +558,37 @@ class DesktopController:
             config = read_run(self.logs).get("state", {}).get("auto_push")
         elif auto_push:
             config = {"repository": self.repository, "branch": self.preflight()["branch"]}
+        profile = self.saved_model_profile() if resume else self.configuration
+        if profile:
+            if not self.refresh_models()['ok']:
+                raise ValueError(self.catalog_error)
+            validate_profile(profile, self.catalog)
+            if not resume:
+                simple_run.save_json(self.logs / 'desktop-models.json', profile)
         return launch_runner(self, repo=self.repo, plan=self.plan, logs=self.logs, attempts=attempts,
+                             model_options=profile,
                              resume=resume, publication=config, approved_audit=approved_audit, popen=Popen, persist_metadata=self._metadata,
                              reserve=reserve_job, cancel=cancel_reservation, fail=self._fail)
+
+    def saved_model_profile(self):
+        """Compare the launch profile with both durable engine identity records."""
+        profile_path = self.logs / 'desktop-models.json'
+        if not profile_path.exists():
+            original = (read_run(self.logs).get('state') or {}).get('model_profile')
+            if self.configuration or (isinstance(original, dict) and any(original.values())):
+                raise ValueError('Saved run has no authorized model profile; cannot adopt new selections.')
+            return None
+        if profile_path.is_symlink():
+            raise ValueError('Saved model profile must be a regular file.')
+        profile = plan_audit.read_json(profile_path)
+        requested = {key: profile[source] for key, source in
+                     [('model_a', 'model_a'), ('model_b', 'model_b'),
+                      ('reasoning_a', 'effort_a'), ('reasoning_b', 'effort_b')]}
+        state = read_run(self.logs).get('state') or {}
+        manifest = plan_audit.read_json(self.logs / 'run-manifest.json')
+        if state.get('model_profile') != requested or manifest.get('model_profile') != requested:
+            raise ValueError('Saved model profile differs from original run state/manifest authorization.')
+        return profile
 
     def _read_metadata(self):
         value, self._metadata_error = run_lifecycle.read_launch_metadata(self.logs)
@@ -603,5 +748,6 @@ class DesktopController:
                               "The runner may still be active; inspect it before retrying.")
         except (OSError, ValueError, KeyError, TypeError):
             pass
+        self.load_configuration()
         return {"ok": True, "path": str(self.logs), "error": None,
                 "warning": self.error if self._launch_uncertain else None}

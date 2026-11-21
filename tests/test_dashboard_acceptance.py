@@ -20,6 +20,7 @@ from unittest.mock import Mock, patch
 from auto_coding import event_log, plan_audit, run_lifecycle, simple_run as runner
 from auto_coding.desktop_app import Bridge, HTML
 from auto_coding.desktop_control import DesktopController
+from test_dashboard_configuration import catalog_fixture, configure_fixture
 
 
 class Clock(datetime.datetime):
@@ -46,6 +47,7 @@ class Child:
 
 class DashboardAcceptanceTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch('auto_coding.desktop_control.load_catalog', return_value=catalog_fixture()))
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name).resolve()
@@ -84,6 +86,7 @@ class DashboardAcceptanceTests(unittest.TestCase):
                              controller_factory=lambda: DesktopController(self.root / 'runs'))
         self.assertTrue(self.bridge.select_repo(str(self.repo))['ok'])
         self.assertTrue(self.bridge.select_plan(str(self.plan))['ok'])
+        self.assertTrue(self.bridge.apply_configuration(configure_fixture(self.controller, 'fixture-auditor'))['ok'])
         self.calls, self.audits, self.children = [], [], []
         self.decision, self.reject_once, self.stop_on_a = 'APPROVE', False, False
         Clock.elapsed = 0
@@ -131,7 +134,9 @@ class DashboardAcceptanceTests(unittest.TestCase):
 
     def cli_start(self, resume=False):
         return self.cli(['start', '--repo', str(self.repo), '--logs', str(self.run_logs),
-                         *(['--resume'] if resume else ['--approved-audit', str(self.audit_dir)]), str(self.plan)])
+                         *(['--resume'] if resume else ['--approved-audit', str(self.audit_dir)]),
+                         *(['--model-a', 'fixture-a', '--model-b', 'fixture-b', '--reasoning-a', 'medium', '--reasoning-b', 'high']
+                           if resume and (self.run_logs / 'desktop-models.json').exists() else []), str(self.plan)])
 
     def auditor(self, argv, cwd, timeout, *, prompt):
         self.audits.append(argv)
@@ -160,6 +165,11 @@ class DashboardAcceptanceTests(unittest.TestCase):
         answer = Path(argv[argv.index('--output-last-message') + 1])
         index = len(state['completed'])
         self.assertIn(self.ids[index], prompt)
+        role = 'b' if '--output-schema' in argv else 'a'
+        profile = state.get('model_profile') or {}
+        if profile.get('model_' + role):
+            self.assertEqual(argv[argv.index('--model') + 1], profile['model_' + role])
+            self.assertIn('model_reasoning_effort=' + json.dumps(profile['reasoning_' + role]), argv)
         if '--output-schema' in argv:
             self.calls.append('B')
             self.assertIn('Do not execute tests, linting, builds or verification commands', prompt)

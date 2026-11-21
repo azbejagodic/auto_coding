@@ -16,14 +16,14 @@ from auto_coding.simple_run import load_tasks
 
 HTML = r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Auto-Coding</title><style>
 *{box-sizing:border-box}
-body{margin:0;min-height:100vh;display:grid;place-items:center;padding:18px 4px;background:#000;color:#c9c9c9;font:20px/1.5 "Segoe UI",Arial,sans-serif}
+body{margin:0;height:100vh;display:flex;flex-direction:column;padding:16px;background:#000;color:#c9c9c9;font:20px/1.5 "Segoe UI",Arial,sans-serif}
 button,input,select{font:inherit;color:inherit}
-button{border:1px solid #202020;border-radius:999px;padding:10px 24px;background:transparent;font-size:22px;font-weight:600;cursor:pointer;white-space:nowrap}
+button{border:1px solid #202020;border-radius:999px;padding:10px 24px;background:transparent;font-size:22px;font-weight:600;cursor:pointer;white-space:normal;max-width:100%}
 button:hover:enabled{background:#191919}
 button:disabled{color:#aaa;cursor:not-allowed}
 button:focus-visible,input:focus-visible,select:focus-visible,[tabindex]:focus-visible{outline:3px solid #8bbcff;outline-offset:3px}
 [hidden]{display:none!important}
-.dashboard{width:min(100%,1000px);min-height:555px;border:1px solid #292929;border-radius:20px;padding:20px 18px 28px;background:#020202}
+.dashboard{width:100%;flex:1;min-height:0;min-width:0;overflow:auto;border:1px solid #292929;border-radius:20px;padding:20px 18px 28px;background:#020202}
 h1{font-size:25px;line-height:1.5;margin:0 0 14px;color:#ddd}
 .file-row{display:flex;align-items:center;gap:12px}
 .selected-file{display:flex;align-items:center;gap:14px;flex:1;min-width:0;border:1px solid #303030;border-radius:14px;min-height:68px;padding:14px}
@@ -41,17 +41,20 @@ h1{font-size:25px;line-height:1.5;margin:0 0 14px;color:#ddd}
 .run-summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:20px;margin:22px 0 0}
 .run-summary dt{font-size:18px}.run-summary dd{margin:2px 0 0;font-size:25px;font-weight:650;color:#ddd;overflow-wrap:anywhere}
 .notice{font-size:15px;white-space:pre-wrap;overflow-wrap:anywhere;margin:8px 0 0}.notice:empty{display:none}
-.error-link{font-size:14px;padding:2px 10px;margin-top:6px}
-dialog{color:#ccc;background:#0b0b0b;border:1px solid #444;border-radius:16px;width:min(650px,calc(100% - 24px));max-height:85vh;overflow:auto;padding:24px}
-dialog::backdrop{background:#000b}dialog label{display:block;margin-top:12px}dialog input:not([type=checkbox]),dialog select{background:#161616;border:1px solid #555;border-radius:8px;padding:8px;width:100%}dialog button{font-size:15px;padding:8px 14px}dialog p{font-size:14px;overflow-wrap:anywhere}dialog .controls{gap:8px}
-@media(max-width:700px){body{font-size:16px;padding:12px 6px}.dashboard{padding:18px 14px;min-height:0}button{font-size:17px;padding:10px 16px}.pill{font-size:16px}.file-row{gap:8px}.selected-file{min-height:60px;padding:10px;gap:8px}.run-summary{gap:12px}.run-summary dd{font-size:21px}.section-divider{margin:26px 0}.unlock{margin-bottom:20px}}
+.error-link{overflow-wrap:anywhere;font-size:14px;padding:2px 10px;margin-top:6px}
+.configuration-page{color:#ccc;background:#0b0b0b;border:0;border-radius:16px;width:100%;min-height:100%;padding:4px;overflow:visible}
+.configuration-page label{display:block;margin-top:12px}.configuration-page input:not([type=checkbox]),.configuration-page select{background:#161616;border:1px solid #555;border-radius:8px;padding:8px;width:100%}.configuration-page button{font-size:15px;padding:8px 14px}.configuration-page p{font-size:14px;overflow-wrap:anywhere}.configuration-page .controls{gap:8px}
+nav{flex-shrink:0;display:flex;gap:8px;margin-bottom:14px}nav button{font-size:16px;padding:8px 18px}nav [aria-current=page]{background:#202020;border-color:#777}.configuration-page h2{font-size:20px;margin-top:26px}.configuration-page input:not([type=checkbox]),.configuration-page select{max-width:800px}.configuration-page p{max-width:100%;overflow-wrap:anywhere}.model-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px}.model-grid label{margin-top:0}select{min-width:0;max-width:100%}
+@media(max-width:700px){body{font-size:16px;padding:12px}.model-grid{grid-template-columns:1fr}.dashboard{padding:18px 14px;min-height:0}button{font-size:17px;padding:10px 16px}.pill{font-size:16px}.file-row{gap:8px}.selected-file{min-height:60px;padding:10px;gap:8px}.run-summary{gap:12px}.run-summary dd{font-size:21px}.section-divider{margin:26px 0}.unlock{margin-bottom:20px}}
 @media(max-width:400px){.file-row{flex-wrap:wrap}.selected-file{flex-basis:100%}.controls{gap:8px}}
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto}}
 </style></head><body>
-<main class="dashboard" aria-labelledby="audit-title">
+<nav aria-label="App pages"><button id="nav-dashboard" aria-controls="dashboard-page" aria-current="page">Dashboard</button><button id="nav-configuration" aria-controls="configuration">Configuration</button></nav>
+<main id="page-viewport" class="dashboard">
+<div id="dashboard-page" aria-label="Dashboard">
 <section aria-labelledby="audit-title">
 <h1 id="audit-title">Plan Audit</h1>
-<div class="file-row"><div class="selected-file"><svg class="icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M14 2H6a2 2 0 0 0-2 2v16h16V8zM14 2v6h6M10 10l-3 4 3 4m4-8 3 4-3 4"/></svg><div id="plan-path" tabindex="0" role="textbox" aria-readonly="true" aria-label="Selected JSON file">Selected JSON file</div></div><button id="browse-plan" title="Browse JSON plan and configure selections">Browse</button></div>
+<div class="file-row"><div class="selected-file"><svg class="icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M14 2H6a2 2 0 0 0-2 2v16h16V8zM14 2v6h6M10 10l-3 4 3 4m4-8 3 4-3 4"/></svg><div id="plan-path" tabindex="0" role="textbox" aria-readonly="true" aria-label="Selected JSON file">Selected JSON file</div></div><button id="browse-plan" title="Choose a JSON plan">Browse</button></div>
 <div class="controls"><button id="start-audit" class="filled" disabled>Start Audit</button><span id="audit-result" class="pill muted" role="status" aria-live="polite">Idle</span><button id="download-audit" disabled title="Download the verified audit report/log; no fix artifact is generated">Download Fix / Log</button></div>
 <p id="audit-error" class="notice red" role="alert"></p>
 </section>
@@ -65,19 +68,24 @@ dialog::backdrop{background:#000b}dialog label{display:block;margin-top:12px}dia
 </section>
 <p id="message" class="notice" role="status" aria-live="polite"></p>
 <button id="configure-error" class="error-link" hidden>Review configuration</button>
-</main>
-<dialog id="configuration" aria-label="Audit and run configuration">
-<p>Choose a target checkout and feature branch, or select saved run logs. Selection never launches work. Model and reasoning defaults for implementation and review remain in your local Codex CLI configuration.</p>
+</div>
+<section id="configuration" class="configuration-page" aria-label="Configuration" hidden>
+<h1>Configuration</h1><p id="configuration-readiness" class="notice" role="status" aria-live="polite"></p><h2>Project &amp; Git branch</h2>
+<p>Choose a target checkout and feature branch, or select saved run logs. Selection never launches work. Apply your selections before launching. Audit approval is a separate requirement.</p>
 <div class="controls"><button id="browse-project">Choose checkout</button><button id="open-run">Select saved run / audit logs</button></div><p id="project-path"></p><p id="run-folder"></p>
-<label for="export-evidence">Saved evidence to include in Download Logs</label><select id="export-evidence"></select><div class="controls"><button id="include-evidence" disabled>Include selected file in log export</button></div>
-<label for="audit-model">Audit model (High reasoning)</label><input id="audit-model" placeholder="Explicit model ID"><label for="audit-goal">Audit goal</label><input id="audit-goal" maxlength="4000">
-<label for="attempts">Attempts per task (1–10)</label><input id="attempts" type="number" min="1" max="10" step="1" value="3" required aria-describedby="attempts-error"><p id="attempts-error" class="notice red" role="status" aria-live="polite"></p>
-<label for="github-repo">Managed GitHub repository (optional)</label><input id="github-repo" placeholder="OWNER/REPO"><div class="controls"><button id="connect-github">Connect repository</button><button id="list-github">My repositories</button><select id="github-repositories" aria-label="Authenticated repositories" hidden></select></div><p id="github-state"></p>
 <div class="controls"><select id="github-branch" aria-label="Feature branch"></select><button id="select-branch">Select branch</button><button id="new-branch">New branch</button><button id="fetch-github">Fetch branches</button></div>
 <div id="branch-form" hidden><label for="branch-name">New feature branch</label><input id="branch-name"><label for="branch-base">Remote base</label><select id="branch-base"></select><label id="branch-base-confirm-label" hidden><input id="branch-base-confirm" type="checkbox"> I confirm this alternate remote base instead of origin/main.</label><div class="controls"><button id="create-branch">Create branch</button><button id="cancel-branch">Cancel</button></div></div>
+<h2>Models &amp; reasoning</h2><button id="refresh-models">Refresh Codex models</button><p id="catalog-status" role="status"></p>
+<div class="model-grid"><div><label for="audit-model">Plan Audit model</label><select id="audit-model"></select><p>High (required for plan approval)</p></div><div></div>
+<div><label for="model-a">Codex A implementer model</label><select id="model-a"></select><label for="effort-a">A reasoning effort</label><select id="effort-a"></select></div>
+<div><label for="model-b">Codex B reviewer model</label><select id="model-b"></select><label for="effort-b">B reasoning effort</label><select id="effort-b"></select></div></div>
+<h2>Audit goal &amp; retry budget</h2><label for="audit-goal">Audit goal</label><input id="audit-goal" maxlength="4000">
+<label for="attempts">Attempts per task (1–10)</label><input id="attempts" type="number" min="1" max="10" step="1" value="3" required aria-describedby="attempts-error"><p id="attempts-error" class="notice red" role="status" aria-live="polite"></p>
+<h2>Optional GitHub / previous run &amp; evidence</h2><label for="export-evidence">Saved evidence to include in Download Logs</label><select id="export-evidence"></select><div class="controls"><button id="include-evidence" disabled>Include selected file in log export</button></div>
+<label for="github-repo">Managed GitHub repository (optional)</label><input id="github-repo" placeholder="OWNER/REPO"><div class="controls"><button id="connect-github">Connect repository</button><button id="list-github">My repositories</button><select id="github-repositories" aria-label="Authenticated repositories" hidden></select></div><p id="github-state"></p>
 <label><input id="auto-push" type="checkbox"> Automatically push approved tasks</label><p>Off by default for a new Start. Resume preserves the saved authorization. No automatic merge or force-push.</p><div class="controls"><button id="push-approved">Push Approved Commits</button></div><p id="push-reason"></p>
-<p id="configuration-status" class="notice" role="status" aria-live="polite"></p><p>Every launch requires native confirmation. Local Codex CLI authentication is required. Closing this window leaves the runner alive. Download Fix / Log exports the verified audit report/log, not a generated fix.</p><div class="controls"><button id="configuration-done">Done</button></div>
-</dialog>
+<p id="configuration-status" class="notice" role="status" aria-live="polite"></p><p>Every launch requires native confirmation. Local Codex CLI authentication is required. Closing this window leaves the runner alive. Download Fix / Log exports the verified audit report/log, not a generated fix.</p><div class="controls"><button id="apply-configuration">Save / Apply configuration</button><button id="configuration-done">Return to Dashboard</button></div>
+</section></main>
 <script>
 const get = id => document.getElementById(id);
 let latest = null, busy = false, ready = false, refreshing = null, closed = false;
@@ -87,8 +95,48 @@ function message(text, error = false) {
   get('message').className = 'notice ' + (error ? 'red' : 'muted');
   get('configuration-status').textContent = text || '';
 }
-function configure() { if (!busy && ready && !get('configuration').open) get('configuration').showModal(); }
-const controls = ['github-repo','connect-github','list-github','github-repositories','github-branch','select-branch','new-branch','fetch-github','branch-name','branch-base','branch-base-confirm','create-branch','cancel-branch','push-approved','browse-project','browse-plan','open-run','attempts','audit-model','audit-goal','auto-push'];
+let configurationDirty = false, configurationSignature = null;
+function navigate(page) {
+  get('page-viewport').scrollTop = 0;
+  get('dashboard-page').hidden = page !== 'dashboard';
+  get('configuration').hidden = page !== 'configuration';
+  get('nav-dashboard').setAttribute('aria-current', page === 'dashboard' ? 'page' : 'false');
+  get('nav-configuration').setAttribute('aria-current', page === 'configuration' ? 'page' : 'false');
+}
+function configure() { navigate('configuration'); }
+function dirtyConfiguration() { configurationDirty = true; get('configuration-readiness').textContent = 'Unsaved changes. Apply configuration before launching.'; updateControls(); }
+function profile() { return {model_audit:get('audit-model').value, model_a:get('model-a').value,
+  model_b:get('model-b').value, effort_a:get('effort-a').value, effort_b:get('effort-b').value,
+  attempts:Number(get('attempts').value), goal:get('audit-goal').value}; }
+function modelEfforts(role, selected, restoring = false) {
+  const model = (latest?.controller?.models || []).find(m => m.model === get('model-' + role).value);
+  const list = get('effort-' + role); list.replaceChildren();
+  (model?.efforts || []).forEach(e => { const option = el('option', e); option.value = e; list.append(option); });
+  if (restoring && selected && !model?.efforts.includes(selected)) {
+    const unavailable = el('option', 'Unavailable saved effort: ' + selected); unavailable.value = ''; list.append(unavailable); list.value = '';
+  } else list.value = model?.efforts.includes(selected) ? selected : model?.default || '';
+}
+function renderConfiguration(c) {
+  const signature = JSON.stringify([c.models, c.configuration]);
+  if (signature !== configurationSignature) {
+    const p = configurationDirty ? profile() : c.configuration || {};
+    ['audit','a','b'].forEach(role => {
+      const list = get(role === 'audit' ? 'audit-model' : 'model-' + role);
+      const selected = p['model_' + role] || list.value;
+      list.replaceChildren(); const placeholder = el('option', selected ? 'Review selection: ' + selected : 'Choose model'); placeholder.value = ''; list.append(placeholder);
+      (c.models || []).filter(m => role !== 'audit' || m.efforts.includes('high')).forEach(m => {
+        const option = el('option', m.displayName + ' (' + m.model + ')'); option.value = m.model; list.append(option);
+      });
+      list.value = (c.models || []).some(m => m.model === selected && (role !== 'audit' || m.efforts.includes('high'))) ? selected : '';
+    });
+    ['a','b'].forEach(role => modelEfforts(role, p['effort_' + role], true));
+    if (!configurationDirty && c.configuration) { get('attempts').value = String(p.attempts); get('audit-goal').value = p.goal; }
+    configurationSignature = signature;
+  }
+  get('configuration-readiness').textContent = configurationDirty ? 'Unsaved changes. Apply configuration before launching.' : c.configuration_reason || 'Configuration required.';
+  get('catalog-status').textContent = c.catalog_error || ((c.models || []).length ? 'Authenticated CLI capabilities. Availability is revalidated at launch.' : 'Choose checkout, then refresh models. No custom-ID fallback is supported.');
+}
+const controls = ['github-repo','connect-github','list-github','github-repositories','github-branch','select-branch','new-branch','fetch-github','branch-name','branch-base','branch-base-confirm','create-branch','cancel-branch','push-approved','browse-project','browse-plan','open-run','attempts','audit-model','audit-goal','auto-push','model-a','model-b','effort-a','effort-b','refresh-models','apply-configuration'];
 function validateAttempts() {
   const input = get('attempts'), value = input.value.trim(), number = Number(value);
   const valid = /^\d+$/.test(value) && Number.isInteger(number) && number >= 1 && number <= 10;
@@ -106,17 +154,17 @@ function updateControls() {
   const c = latest?.controller || {}, audit = c.audit || {};
   const locked = busy || !ready || c.active !== false || c.uncertain;
   controls.forEach(id => { get(id).disabled = locked; });
-  get('browse-plan').disabled = busy || !ready;
+  get('browse-plan').disabled = locked;
   get('browse-plan').title = c.active !== false || c.uncertain
     ? 'View configuration and saved evidence; selections are locked while running'
-    : 'Browse JSON plan and configure selections';
+    : 'Choose a JSON plan';
   ['github-branch','select-branch','new-branch','fetch-github','branch-base','branch-base-confirm','create-branch'].forEach(id => { get(id).disabled = locked || !c.repository || c.preflight?.clean !== true; });
   const base = get('branch-base').value;
   get('branch-base-confirm-label').hidden = !base || base === 'main';
   get('create-branch').disabled ||= !base || (base !== 'main' && !get('branch-base-confirm').checked);
   get('push-approved').disabled = locked || !c.push?.eligible;
   get('push-reason').textContent = c.push?.reason || 'Select a managed repository to publish approved local checkpoints.';
-  get('start-audit').disabled = locked || (c.plan && !jsonPlan()) || (c.repo && c.plan && !c.audit_ready);
+  get('start-audit').disabled = locked || configurationDirty || !validateAttempts() || !jsonPlan() || c.configuration_ready !== true || c.audit_ready !== true;
   get('download-audit').disabled = busy || !ready || !c.audit_export_available;
   get('download-logs').disabled = busy || !ready || !latest?.exists;
   get('export-evidence').disabled = busy || !ready || !latest?.exists;
@@ -124,9 +172,9 @@ function updateControls() {
   const verified = audit.status === 'APPROVE' && audit.verified === true;
   get('audit-result').textContent = verified ? '\u2713 Approved' : audit.status === 'APPROVE' ? 'Unverified' : audit.status || 'Idle';
   get('audit-result').className = 'pill ' + (verified ? 'green' : ['REVISE','REJECT','BLOCK','Infrastructure error'].includes(audit.status) ? 'red' : ['Running','Unknown'].includes(audit.status) ? 'amber' : 'muted');
-  get('approval-indicator').className = 'indicator' + (!locked && approved() ? ' green' : '');
-  get('audit-error').textContent = audit.error || (['REVISE','REJECT','BLOCK','Infrastructure error'].includes(audit.status) ? c.audit_reason || 'Audit did not approve this plan. Download the report for details.' : '');
-  get('start').disabled = locked || !validateAttempts() || !(resumable() || approved());
+  get('approval-indicator').className = 'indicator' + (!locked && !configurationDirty && c.configuration_ready === true && approved() ? ' green' : '');
+  get('audit-error').textContent = c.audit_selection_error || audit.error || (['REVISE','REJECT','BLOCK','Infrastructure error'].includes(audit.status) ? c.audit_reason || 'Audit did not approve this plan. Download the report for details.' : '');
+  get('start').disabled = locked || !validateAttempts() || !(resumable() || (!configurationDirty && c.configuration_ready === true && approved()));
   get('start-label').textContent = resumable() ? 'Resume' : 'Start';
   get('start-reason').textContent = resumable() ? 'Resume uses persisted authorization and identity checks. Pending publication retries the same approved commit first.' : c.start_reason || 'Start requires verified approval for the exact selected inputs and native authorization.';
   get('start').title = get('start-reason').textContent;
@@ -163,8 +211,9 @@ function updateElapsed(now = Date.now()) {
 function render(data) {
   latest = data;
   const c = data.controller || {};
+  renderConfiguration(c);
   get('plan-path').textContent = c.plan || 'Selected JSON file';
-  get('project-path').textContent = c.repo || 'No checkout selected';
+  get('project-path').textContent = (c.repo || 'No checkout selected') + ' | Verified branch: ' + (c.preflight?.branch || 'Unavailable');
   get('run-folder').textContent = c.logs ? 'Saved run: ' + c.logs : '';
   const evidence = get('export-evidence');
   const available = (data.files || []).filter(file => file.status === 'available');
@@ -228,7 +277,8 @@ function render(data) {
   if (c.logs && data.state_error) errors.push(data.state_error);
   if (c.logs && !data.exists) errors.push('Selected log directory is missing or unavailable.');
   get('progress-error').textContent = [...new Set(errors.filter(Boolean))].join(' ');
-  get('configure-error').hidden = !errors.some(Boolean) && !c.audit?.error;
+  get('configure-error').hidden = c.configuration_ready === true && !configurationDirty && !errors.some(Boolean) && !c.audit?.error;
+  get('configure-error').textContent = c.configuration_ready === true && !configurationDirty ? 'Review configuration' : (configurationDirty ? 'Apply changed configuration' : c.configuration_reason || 'Configuration required') + ' - Configuration';
   if (runPresentation(data).label === 'Completed' && get('message').textContent.startsWith('Launch accepted.')) message('');
   updateControls(); updateElapsed();
 }
@@ -277,6 +327,7 @@ async function workspaceAction(method, args, button) {
   try {
     if (refreshing) await refreshing;
     const result = await window.pywebview.api[method](...args);
+    if (method === 'apply_configuration' && result.ok) configurationDirty = false;
     if (method === 'github_repositories') {
       const list = document.getElementById('github-repositories'); list.replaceChildren();
       const placeholder = el('option', 'Choose repository'); placeholder.value = ''; list.append(placeholder);
@@ -306,17 +357,28 @@ document.getElementById('branch-base-confirm').onchange = updateControls;
 document.getElementById('create-branch').onclick = () => workspaceAction('create_github_branch', [latest?.controller?.repository, document.getElementById('branch-name').value.trim(), document.getElementById('branch-base').value, document.getElementById('branch-base-confirm').checked === true], 'create-branch');
 document.getElementById('push-approved').onclick = () => workspaceAction('push_approved_commits', [], 'push-approved');
 
-get('attempts').oninput = updateControls;
-get('audit-model').oninput = updateControls;
+get('attempts').oninput = dirtyConfiguration;
+get('audit-model').onchange = dirtyConfiguration;
+get('audit-model').oninput = dirtyConfiguration;
+get('audit-goal').oninput = dirtyConfiguration;
+['a','b'].forEach(role => {
+  get('model-' + role).onchange = () => { modelEfforts(role); dirtyConfiguration(); };
+  get('effort-' + role).onchange = dirtyConfiguration;
+});
+get('refresh-models').onclick = () => workspaceAction('refresh_models', [], 'refresh-models');
+get('apply-configuration').onclick = async () => {
+  if (!validateAttempts() || get('apply-configuration').disabled) return;
+  await workspaceAction('apply_configuration', [profile()], 'apply-configuration');
+};
+get('nav-dashboard').onclick = () => navigate('dashboard');
+get('nav-configuration').onclick = configure;
 get('export-evidence').onchange = updateControls;
 get('include-evidence').onclick = () => act('evidence');
-get('configuration-done').onclick = () => { if (!busy && validateAttempts()) get('configuration').close(); };
-get('configuration').addEventListener('cancel', event => { if (busy) event.preventDefault(); });
+get('configuration-done').onclick = () => navigate('dashboard');
 get('configure-error').onclick = configure;
 get('browse-plan').onclick = async () => {
   if (get('browse-plan').disabled) return;
   if (latest?.controller?.active === false && !latest?.controller?.uncertain) await act('select_plan');
-  configure();
 };
 get('start').onclick = () => act(resumable() ? 'resume' : 'start');
 Object.entries({'browse-project':'select_repo','open-run':'open_run',stop:'stop_after_task','start-audit':'start_audit','download-audit':'download_audit','download-logs':'download_logs'}).forEach(([id,method]) => { get(id).onclick = () => act(method); });
@@ -455,6 +517,33 @@ class Bridge:
     def select_plan(self, path=None):
         return self._select("plan", path)
 
+    def refresh_models(self):
+        with self._lock:
+            return self._controller.refresh_models()
+
+    def apply_configuration(self, profile):
+        with self._lock:
+            return self._controller.apply_configuration(profile)
+
+    def _configured(self, *, audit_model=None, goal=None, attempts=None):
+        """The native bridge accepts no client assertion of readiness."""
+        if not hasattr(self._controller, 'configuration_status'):
+            return  # Compatibility with injected non-production controllers.
+        c = self._controller
+        active = c.job_status()
+        if active['active'] is not False or active.get('uncertain'):
+            raise ValueError('A desktop run is already active or uncertain; inspect saved status.')
+        if not c.refresh_models()['ok']:
+            raise ValueError(c.catalog_error)
+        status = c.configuration_status()
+        if not status['ready']:
+            raise ValueError(status['reason'])
+        profile = c.configuration
+        if audit_model is not None and (audit_model != profile['model_audit'] or goal != profile['goal']):
+            raise ValueError('Audit selections changed. Apply configuration before launching.')
+        if attempts is not None and attempts != profile['attempts']:
+            raise ValueError('Retry budget changed. Apply configuration before launching.')
+
     def open_run(self, path=None):
         return self._select("run", path)
 
@@ -498,6 +587,21 @@ class Bridge:
                 audit = status.get("audit", {})
                 status["audit_ready"] = eligible and audit.get("audit_ready") is True
                 status["start_ready"] = eligible and audit.get("start_approved") is True
+                if hasattr(self._controller, 'configuration_status'):
+                    configuration = self._controller.configuration_status()
+                    profile = self._controller.configuration
+                    status.update(configuration_ready=configuration['ready'],
+                                  configuration_reason=configuration['reason'], configuration=profile,
+                                  models=self._controller.catalog, catalog_error=self._controller.catalog_error)
+                    status['audit_ready'] &= configuration['ready']
+                    status['start_ready'] &= configuration['ready']
+                    audit_config = audit.get('configuration', {})
+                    if profile and (audit_config.get('model') != profile.get('model_audit')
+                                    or audit_config.get('goal') != profile.get('goal')):
+                        status['start_ready'] = False
+                        if audit.get('verified'):
+                            status['audit_selection_error'] = ('Audit model or goal changed. Restore the audited settings '
+                                                               'or revise the plan for a new one-shot audit.')
                 unavailable = ("Run busy or child status unknown. Wait, then unchanged approval will be revalidated."
                     if status["active"] is not False or status.get("uncertain")
                     else " ".join(status["preflight"].get("errors", [])) or "Target must be clean and eligible." if not eligible else None)
@@ -516,6 +620,16 @@ class Bridge:
                     and status["active"] is False and not status.get("uncertain")
                     and not status["preflight"].get("errors")
                     and not status["preflight"].get("resume_error"))
+                if status['resume_ready'] and hasattr(self._controller, 'saved_model_profile'):
+                    try:
+                        from auto_coding.model_catalog import validate_profile
+                        original = self._controller.saved_model_profile()
+                        if original:
+                            validate_profile(original, self._controller.catalog)
+                        status['resume_models'] = original
+                    except (OSError, ValueError, KeyError, TypeError) as exc:
+                        status['resume_ready'] = False
+                        status['start_reason'] = 'Resume unavailable: ' + str(exc)
                 status["selection_error"] = self._selection_error
                 repository = getattr(self._controller, "repository", None)
                 status["repository"] = repository
@@ -543,6 +657,8 @@ class Bridge:
             try:
                 if type(attempts) is not int or not 1 <= attempts <= 10:
                     raise ValueError("Attempts must be an integer between 1 and 10.")
+                if action == 'start':
+                    self._configured(attempts=attempts)
                 paths = self._controller.selected_paths()
                 if type(auto_push) is not bool:
                     raise ValueError("Auto-push must be explicitly selected.")
@@ -554,6 +670,20 @@ class Bridge:
                     approval = self._controller.audit_status()
                     if not approval.get("start_approved"):
                         raise ValueError(approval.get("error") or "Start requires verified APPROVE audit evidence.")
+                    if hasattr(self._controller, 'configuration'):
+                        profile = self._controller.configuration
+                        audit_config = approval.get('configuration', {})
+                        if (audit_config.get('model') != profile['model_audit']
+                                or audit_config.get('goal') != profile['goal']):
+                            raise ValueError('Audit model or goal differs from configuration; verified approval required.')
+                requested_models = getattr(self._controller, 'configuration', None)
+                if action == 'resume' and self._controller.logs:
+                    requested_models = (self._controller.saved_model_profile()
+                                        if hasattr(self._controller, 'saved_model_profile') else None)
+                requested_models = dict(requested_models) if requested_models else None
+                model_description = (f"A: {requested_models['model_a']} ({requested_models['effort_a']}); "
+                                     f"B: {requested_models['model_b']} ({requested_models['effort_b']})"
+                                     if requested_models else 'Original CLI settings; no new model overrides.')
                 message = (f"{action.upper()} the local runner?\nRepository: {paths['repo']}"
                            + (f"\nManaged GitHub repository: {self._controller.repository}"
                               if getattr(self._controller, 'repository', None) else "")
@@ -562,6 +692,7 @@ class Bridge:
                            + (f"\nApproved audit: {approval['directory']}"
                               f"\nAudit identity: {json.dumps(approval.get('identity'), sort_keys=True)}"
                               if approval is not None else "\nResume uses this run's persisted authorization and recovery checks.")
+                           + f"\nAuthorized models/reasoning: {model_description}"
                            + f"\nAttempts: {attempts}\nThe runner may modify and commit project files."
                            + ("\nAutomatically push approved tasks: ENABLED for this run to origin/" + str(branch)
                             if auto_push else "\nCheckpoints remain local. No automatic push, merge, force-push or branch creation.")
@@ -579,6 +710,13 @@ class Bridge:
                     if (not current.get("start_approved")
                             or any(current.get(key) != approval.get(key) for key in ("identity", "directory"))):
                         raise ValueError("Approved audit changed during confirmation. Inspect the selected inputs and confirm again.")
+                if action == 'start':
+                    self._configured(attempts=attempts)
+                    if getattr(self._controller, 'configuration', None) != requested_models:
+                        raise ValueError('Model configuration changed during confirmation. Review and confirm again.')
+                elif hasattr(self._controller, 'saved_model_profile'):
+                    if self._controller.saved_model_profile() != requested_models:
+                        raise ValueError('Saved model profile changed during confirmation. Review and confirm again.')
                 options = {"attempts": attempts}
                 if action == "start" and auto_push:
                     options["auto_push"] = True
@@ -602,6 +740,7 @@ class Bridge:
                     raise ValueError("Audit launch requires native confirmation; dialogs are unavailable.")
                 if not isinstance(model, str) or not model.strip():
                     raise ValueError("Configure an explicit audit model supporting High reasoning first.")
+                self._configured(audit_model=model, goal=goal)
                 paths = self._controller.selected_paths()
                 message = (f"Start one read-only plan audit?\nRepository: {paths['repo']}\nPlan: {paths['plan']}"
                            f"\nAudit model: {model}\nReasoning: High\nGoal: {goal}"
@@ -609,6 +748,7 @@ class Bridge:
                            "\nClosing the window leaves the runner alive. Failed or uncertain calls cannot be repeated.")
                 if self._dialogs.confirm(message) is not True:
                     return {"ok": False, "cancelled": True, "error": "Audit launch cancelled."}
+                self._configured(audit_model=model, goal=goal)
                 result = self._controller.start_audit(model=model, goal=goal)
                 if self._controller.logs is not None:
                     self._root = self._controller.logs
